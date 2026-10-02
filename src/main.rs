@@ -44,15 +44,10 @@ mod logging;
 mod terminal;
 mod ui;
 
-use std::sync::OnceLock;
-
 use crossbeam_channel::bounded;
 
 use crate::broker::{Broker, Command, DecoderCmd, SharedState, Status};
-
-/// Write end of the command channel, kept in a static so the console control
-/// handler (which runs on an OS-spawned thread) can inject a `Quit`.
-static CMD_TX: OnceLock<crossbeam_channel::Sender<Command>> = OnceLock::new();
+use crate::ui::CMD_TX;
 
 fn main() {
     logging::init();
@@ -111,6 +106,7 @@ unsafe extern "system" fn on_console_ctrl(ctrl: u32) -> windows::core::BOOL {
         if let Some(tx) = CMD_TX.get() {
             let _ = tx.try_send(Command::Quit);
         }
+        crate::ui::wake_broker();
         true.into()
     } else {
         false.into()

@@ -33,8 +33,7 @@ The application contains no heavy UI framework overhead, no text rendering anima
 Clone the repository and build using Cargo:
 
 ```powershell
-git clone [https://github.com/S4M1TH4/kyouko-player.git](https://github.com/S4M1TH4/kyouko-player.git)
-cd kyouko-player
+git clone https://github.com/S4M1TH4/kyouko-player.git
 cargo build --release
 ```
 
@@ -55,7 +54,7 @@ Pass local file paths directly via command-line arguments:
 Stream audio directly from YouTube URLs:
 
 ```powershell
-.\target\release\kyouko-player.exe "[https://www.youtube.com/watch?v=DdUoGjniJ7s](https://www.youtube.com/watch?v=DdUoGjniJ7s)"
+.\target\release\kyouko-player.exe "https://www.youtube.com/watch?v=DdUoGjniJ7s"
 ```
 
 ### CLI Terminal Commands

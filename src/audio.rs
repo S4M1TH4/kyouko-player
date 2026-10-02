@@ -77,6 +77,7 @@ fn run(
                     source,
                     reason: "audio pipeline not wired yet (step 2)".into(),
                 });
+                crate::ui::wake_status();
             }
             Ok(DecoderCmd::Stop) => log_info!("DECODER", "stop (nothing playing)"),
             Ok(DecoderCmd::Shutdown) | Err(_) => break,

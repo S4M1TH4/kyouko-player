@@ -302,6 +302,20 @@ impl Broker {
         }
     }
 
+    /// Handle to the cross-thread state. The Win32 layer uses it to watch the
+    /// phase for timer management without touching broker internals.
+    pub fn shared(&self) -> Arc<SharedState> {
+        Arc::clone(&self.shared)
+    }
+
+    /// 1 Hz playback tick, delivered by the presentation timer (which only
+    /// exists while `Playing`). Advances the elapsed-time display.
+    pub fn tick(&mut self) {
+        if self.shared.phase() == Phase::Playing {
+            self.refresh();
+        }
+    }
+
     /// Current panel text — read by the Win32 renderer in step 2 (e.g. when
     /// it needs to repaint from scratch after `TaskbarCreated` or a resize).
     #[allow(dead_code)] // consumed in step 2
@@ -531,4 +545,22 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     p.push('\n');
     p.push_str("+------------------------------+");
     p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_reflects_eq_and_volume_changes() {
+        let shared = SharedState::new();
+        let before = render_panel(&shared, None);
+        assert!(before.contains("+0  +0  +0  +0  +0"));
+        shared.set_eq_gain(7, 8.0);
+        shared.set_volume(0.3);
+        let after = render_panel(&shared, None);
+        assert!(after.contains("+8"), "panel should show +8: {after}");
+        assert!(after.contains(" 30%"), "panel should show 30%: {after}");
+        assert!(!after.contains(" 80%"));
+    }
 }

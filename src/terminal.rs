@@ -30,7 +30,11 @@ pub fn spawn(cmd_tx: Sender<Command>) -> JoinHandle<()> {
                         }
                         log_debug!("TERM", "input: {line}");
                         if let Some(cmd) = parse(line) {
-                            if cmd_tx.send(cmd).is_err() {
+                            if cmd_tx.send(cmd).is_ok() {
+                                // Channels carry the data; one posted message
+                                // carries the wake-up.
+                                crate::ui::wake_broker();
+                            } else {
                                 log_warn!("TERM", "broker gone — parking");
                                 park_forever();
                             }
@@ -102,6 +106,11 @@ fn parse(line: &str) -> Option<Command> {
         },
         "eq" => parse_eq(rest),
         "state" | "dump" => Some(Command::DumpState),
+        "icon" => {
+            // Print the procedural tray glyph — see it without a screenshot.
+            println!("{}", crate::ui::glyph::glyph_ascii());
+            None
+        }
         "quit" | "exit" => Some(Command::Quit),
         "help" | "?" => {
             print_help();

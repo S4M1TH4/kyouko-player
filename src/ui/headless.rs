@@ -1,34 +1,14 @@
-//! Presentation layer. Step 1: headless broker loop — the *same* broker the
-//! Win32 module will drive, running on a blocking `select!` so the entire
-//! message broker is testable before a single line of Win32 exists.
-//!
-//! Step 2 swaps this function's body for the real message loop; its shape is
-//! already decided:
-//!
-//! ```text
-//! create 200px layered window + tray icon
-//! loop { GetMessageW }                       // parks in the kernel, zero CPU
-//!   WM_APP_BROKER  → drain cmd_rx with try_recv → broker.handle_command
-//!   WM_APP_STATUS  → drain status_rx           → broker.handle_status
-//!   WM_APP_TRAY    → tray clicks: left = show/hide, right = menu (quit)
-//!   WM_TIMER (1 Hz, ONLY while Playing) → read frames_played → refresh text
-//!   WM_PAINT / redraw  → blit cached panel; only ever on state change
-//! ```
-//!
-//! Producers wake the loop with `PostMessageW(hwnd, WM_APP_*)` after pushing
-//! to a channel — the standard "message-only integrator" pattern: channels
-//! carry data, one posted message carries the wake-up. When paused the timer
-//! is killed, so the main thread parks in GetMessageW with literally zero
-//! scheduled wake-ups.
+//! Cross-platform headless pump — the step-1 event loop, preserved verbatim.
+//! Reached on non-Windows targets and via `KYOUKO_HEADLESS=1` for CI-style
+//! debugging with no window, no tray, no audio device.
 
 use crossbeam_channel::{select, Receiver};
 
 use crate::broker::{Broker, Command, Flow, Status};
-use crate::log_info;
-use crate::log_warn;
+use crate::{log_info, log_warn};
 
 pub fn run(mut broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status>) {
-    log_info!("UI", "headless mode (Win32 window lands in step 2) — panel follows");
+    log_info!("UI", "headless mode — panel follows on every state change");
     loop {
         // Blocks until a command or a status arrives. Thread parks in the
         // kernel between events — this loop *is* the zero-CPU idle state.
