@@ -100,7 +100,7 @@ fn parse(line: &str) -> Option<Command> {
         "toggle" | "p" => Some(Command::TogglePause),
         "stop" => Some(Command::Stop),
         "vol" | "volume" => match rest.parse::<f64>() {
-            Ok(v) if (0.0..=100.0).contains(&v) => Some(Command::Volume((v / 100.0) as f32)),
+            Ok(v) if (0.0..=100.0).contains(&v) => Some(Command::SetVolume((v / 100.0) as f32)),
             Ok(v) => {
                 log_warn!("TERM", "vol {v} out of range (0-100)");
                 None

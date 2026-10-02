@@ -103,7 +103,8 @@ pub enum Command {
     TogglePause,
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
-    Volume(f32),
+    /// Terminal `vol`, tray vol row (+/-10% steps) all land here.
+    SetVolume(f32),
     /// Band gain in dB, clamped to ±12. `None` = all bands.
     EqGain { band: Option<usize>, gain_db: f32 },
     EqEnabled(bool),
@@ -497,7 +498,7 @@ impl Broker {
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "stop");
             }
-            Command::Volume(v) => {
+            Command::SetVolume(v) => {
                 let v = v.clamp(0.0, 1.0);
                 self.shared.set_volume(v);
                 log_info!("BROKER", "volume: {:.0}%", v * 100.0);
@@ -830,7 +831,7 @@ mod tests {
     #[test]
     fn save_triggers_fire_and_snapshot_matches() {
         let (mut broker, sink, _rx) = broker_with_sink();
-        broker.handle_command(Command::Volume(0.25));
+        broker.handle_command(Command::SetVolume(0.25));
         broker.handle_command(Command::EqGain { band: Some(2), gain_db: 4.0 });
         broker.handle_status(Status::Opened {
             source: Source::Youtube { url: "https://youtu.be/x".into(), format: "140".into() },
@@ -839,7 +840,7 @@ mod tests {
             title: None,
             duration: None,
         });
-        broker.handle_command(Command::Volume(0.5));
+        broker.handle_command(Command::SetVolume(0.5));
         let snaps = sink.lock().unwrap();
         // Volume, EqGain, Opened, Volume → 4 saves.
         assert_eq!(snaps.len(), 4);

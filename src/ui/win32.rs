@@ -26,17 +26,22 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Shell::NIN_SELECT;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
-    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, IDC_ARROW, MF_SEPARATOR, MF_STRING, MSG,
-    SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONUP, WM_NCCREATE, WM_NCHITTEST,
-    WM_PAINT, WM_RBUTTONUP, WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer,
+    PostMessageW,
+    LoadCursorW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetMenuInfo, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, ShowWindow,
+    SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
+    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, IDC_ARROW, MF_MENUBREAK, MF_SEPARATOR, MF_STRING,
+    MENUINFO,
+    MENUINFO_MASK, MENUINFO_STYLE, MSG, MIM_STYLE, MNS_NOTIFYBYPOS, SPI_GETWORKAREA,
+    SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
+    TPM_RIGHTBUTTON, WH_GETMESSAGE, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MENUCOMMAND,
+    WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 
 use crate::audio::AudioOut;
 
@@ -44,16 +49,30 @@ use super::render::Renderer;
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Status};
-use crate::{log_error, log_info, log_warn};
+use crate::{log_debug, log_error, log_info, log_warn};
 
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 1000;
-/// Tray menu command ids — each dispatches a `Command` through the channel.
-/// (Play/Pause lives on left-click only, not in this menu.)
-const MENU_LOOP: usize = 1;
-const MENU_EQ: usize = 2;
-const MENU_WINDOW: usize = 3;
-const MENU_QUIT: usize = 4;
+/// Tray menu item POSITIONS. The menu is created with MNS_NOTIFYBYPOS, so
+/// selections arrive as WM_MENUCOMMAND with the position in wParam — that is
+/// what lets the vol row tell a left-click (+10%) from a right-click (-10%).
+/// Positions include separator rows: vol, sep, loop, eq, equalizer, sep,
+/// window, sep, quit.
+const MENU_POS_VOL: usize = 0;
+const MENU_POS_LOOP: usize = 2;
+const MENU_POS_EQ: usize = 3;
+const MENU_POS_EQ_OPEN: usize = 4;
+const MENU_POS_WINDOW: usize = 6;
+const MENU_POS_QUIT: usize = 8;
+
+/// Which popup a WM_MENUCOMMAND belongs to (positions are per-menu).
+const KIND_MAIN: usize = 0;
+const KIND_EQ_BANDS: usize = 1;
+const EQ_BAND_STEP_DB: f32 = 1.0;
+
+/// Strip position -> band index for the 5x2 grid (column-major: 31/1k,
+/// 62/2k, 125/4k, 250/8k, 500/16k).
+const EQ_STRIP_ORDER: [usize; crate::broker::EQ_BANDS] = [0, 5, 1, 6, 2, 7, 3, 8, 4, 9];
 
 struct UiState {
     hwnd: HWND,
@@ -65,6 +84,12 @@ struct UiState {
     tray: Tray,
     /// Owns the cpal stream; mirrors the phase onto WASAPI play/pause.
     audio_out: AudioOut,
+    /// Where the current tray-menu session was opened; sticky re-opens
+    /// rebuild the menu at exactly this point.
+    menu_pt: POINT,
+    /// Which popup the WM_MENUCOMMAND dispatch applies to (positions are
+    /// per-menu, so the handler must know which menu was tracked).
+    menu_kind: usize,
     /// 1 Hz timer only exists while Playing — this is the "render loop sleeps
     /// when paused" guarantee, enforced here.
     timer_on: bool,
@@ -140,6 +165,8 @@ pub fn run(
         renderer,
         tray: Tray::new(),
         audio_out,
+        menu_pt: POINT::default(),
+        menu_kind: KIND_MAIN,
         timer_on: false,
         last_phase: Phase::Stopped,
         hidden: false,
@@ -293,7 +320,14 @@ fn on_tray(s: &mut UiState, lp: LPARAM) {
         // the broker stays the single decision point (NIN_SELECT covers
         // NOTIFYICON_VERSION_4 shells; version 0 delivers WM_LBUTTONUP).
         WM_LBUTTONUP | NIN_SELECT => post_command(Command::TogglePause),
-        WM_RBUTTONUP | WM_CONTEXTMENU => popup_menu(s),
+        WM_RBUTTONUP | WM_CONTEXTMENU => {
+            let mut pt = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut pt);
+            }
+            s.menu_pt = pt;
+            popup_menu(s, pt);
+        }
         _ => {}
     }
 }
@@ -310,6 +344,48 @@ fn toggle_visible(s: &mut UiState) {
     }
 }
 
+/// Set by `menu_message_hook` while the tray menu is open: true when the
+/// mouse traffic flowing through the menu loop was right-button traffic.
+/// A thread-scoped WH_GETMESSAGE hook is the only deterministic way to know
+/// which button selected an item — menus commit right-click selection on
+/// button-UP, so by the time WM_MENUCOMMAND arrives the button is released.
+static MENU_RIGHT_CLICK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static HOOK_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+
+/// Thread hook, installed ONLY for the lifetime of the popup menu (a thread
+/// already blocked in the modal menu loop — zero cost to the audio/CPU
+/// guarantees). It records the button of the last mouse message the menu
+/// loop pulls from the queue, before that message is dispatched.
+unsafe extern "system" fn menu_message_hook(
+    code: i32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> LRESULT {
+    if code >= 0 {
+        if !HOOK_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log_debug!("UI", "menu hook first fire (message pump alive)");
+        }
+        let msg = lp.0 as *const MSG;
+        if !msg.is_null() {
+            // SAFETY: WH_GETMESSAGE hands us a valid MSG pointer for every
+            // HC_ACTION callback; null-guarded regardless.
+            let message = unsafe { (*msg).message };
+            match message {
+                WM_RBUTTONDOWN | WM_RBUTTONUP => {
+                    MENU_RIGHT_CLICK.store(true, std::sync::atomic::Ordering::Relaxed)
+                }
+                WM_LBUTTONDOWN | WM_LBUTTONUP => {
+                    MENU_RIGHT_CLICK.store(false, std::sync::atomic::Ordering::Relaxed)
+                }
+                _ => {}
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wp, lp) }
+}
+
 /// Tray menu selections travel through the same command channel as the
 /// terminal — the menu is a producer, the broker stays the single decision
 /// point (one posted wake per selection; no polling anywhere).
@@ -320,47 +396,201 @@ fn post_command(cmd: Command) {
     wake_broker();
 }
 
-fn popup_menu(s: &mut UiState) {
+/// Ask the pump to re-open a menu at the recorded position — `KIND_MAIN` or
+/// `KIND_EQ_BANDS`. Posted AFTER the selection's command, so queue order
+/// guarantees the reopened menu renders fresh labels.
+fn reopen_menu(s: &mut UiState, kind: usize) {
+    unsafe {
+        let _ = PostMessageW(Some(s.hwnd), WM_APP_MENU_REOPEN, WPARAM(kind as _), LPARAM(0));
+    }
+}
+
+/// Re-open the popup at the recorded position. Posted — not called — so the
+/// pump processes the selection's command FIRST and the reopened menu always
+/// renders the fresh state (e.g. the new `vol N`).
+const WM_APP_MENU_REOPEN: u32 = 0x8004; // WM_APP + 4
+
+/// Record of where the current menu session was opened; sticky re-opens
+/// rebuild the menu at exactly this point so the vol row stays under the
+/// cursor between clicks.
+///
+/// One modal pass: build the menu from live state, run `TrackPopupMenu` at
+/// `pt`, tear it down. Sticky selections (vol/loop/eq) re-open via
+/// `WM_APP_MENU_REOPEN`; dismissal (ESC / outside click) and closing
+/// selections (window/quit) simply are not re-opened.
+fn popup_menu(s: &mut UiState, pt: POINT) {
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
     };
-    // Query every state RIGHT HERE: labels are built fresh each time the
-    // menu opens, so they always reflect the live loop/EQ. (Play/Pause is
-    // NOT a menu item — left-click on the icon toggles it.)
+    // Labels built fresh from live state each pass. (Play/Pause is NOT a
+    // menu item — left-click on the icon toggles it.)
+    let vol_label: Vec<u16> = format!("vol {}", (s.shared.volume() * 100.0).round() as i32)
+        .encode_utf16()
+        .chain([0])
+        .collect();
     let loop_label = if s.shared.loop_enabled() { w!("Loop: ON") } else { w!("Loop: OFF") };
     let eq_label = if s.shared.eq_enabled() { w!("EQ: ON") } else { w!("EQ: OFF") };
     let window_label = if s.hidden { w!("Show Echo") } else { w!("Hide Echo") };
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, MENU_LOOP, loop_label);
-        let _ = AppendMenuW(menu, MF_STRING, MENU_EQ, eq_label);
+        let _ =
+            AppendMenuW(menu, MF_STRING, MENU_POS_VOL, windows::core::PCWSTR(vol_label.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, MENU_WINDOW, window_label);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_LOOP, loop_label);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_EQ, eq_label);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_EQ_OPEN, w!("Equalizer"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("quit"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_WINDOW, window_label);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_QUIT, w!("quit"));
+        // Selections arrive as WM_MENUCOMMAND (position in wParam) — that is
+        // what lets the vol row tell a left-click (+10%) from a right (-10%).
+        let info = MENUINFO {
+            cbSize: std::mem::size_of::<MENUINFO>() as u32,
+            fMask: MENUINFO_MASK(MIM_STYLE.0),
+            dwStyle: MENUINFO_STYLE(MNS_NOTIFYBYPOS.0),
+            ..Default::default()
+        };
+        let _ = SetMenuInfo(menu, &info);
         // KB135788: the menu's owner must be foreground or it won't dismiss.
         let _ = SetForegroundWindow(s.hwnd);
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let choice = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-            pt.x,
-            pt.y,
+        // TPM_RIGHTBUTTON is required so the vol row can be right-clicked.
+        MENU_RIGHT_CLICK.store(false, std::sync::atomic::Ordering::Relaxed);
+        s.menu_kind = KIND_MAIN;
+        let hook = SetWindowsHookExW(
+            WH_GETMESSAGE,
+            Some(menu_message_hook),
             None,
-            s.hwnd,
-            None,
+            GetCurrentThreadId(),
         );
+        if let Err(e) = &hook {
+            log_error!("UI", "menu hook install failed: {e}");
+        }
+        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, None, s.hwnd, None);
+        if let Ok(h) = hook {
+            let _ = UnhookWindowsHookEx(h);
+        }
         let _ = DestroyMenu(menu);
-        match choice.0 as usize {
-            MENU_LOOP => post_command(Command::ToggleLoop),
-            MENU_EQ => post_command(Command::ToggleEq),
-            MENU_WINDOW => post_command(Command::ToggleWindow),
-            MENU_QUIT => {
+    }
+}
+
+/// The 10-band strip as a 5 x 2 grid: menus flow top-to-bottom, so
+/// `EQ_STRIP_ORDER` emits column-major pairs (31/1k, 62/2k, 125/4k, 250/8k,
+/// 500/16k) and MF_MENUBREAK opens a new column before each odd top row.
+/// Labels are the bare abbreviated frequency — deliberately narrow so the
+/// grid stays ~250 logical px; live gains live in the echo panel and the
+/// debug log. Tracked directly at `pt` — visually it replaces the main
+/// menu, keeping the sticky re-open mechanics identical to the volume row.
+fn eq_popup(s: &mut UiState, pt: POINT) {
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+    unsafe {
+        for (pos, &band) in EQ_STRIP_ORDER.iter().enumerate() {
+            let hz = crate::broker::EQ_BAND_HZ[band];
+            let text: Vec<u16> = if hz >= 1000 {
+                format!("{}k", hz / 1000)
+            } else {
+                format!("{hz}")
+            }
+            .encode_utf16()
+            .chain([0])
+            .collect();
+            // A new column starts before 62, 125, 250, 500 — each column
+            // then stacks exactly two rows.
+            let flags =
+                if pos > 0 && pos % 2 == 0 { MF_STRING | MF_MENUBREAK } else { MF_STRING };
+            let _ = AppendMenuW(menu, flags, pos, windows::core::PCWSTR(text.as_ptr()));
+        }
+        let info = MENUINFO {
+            cbSize: std::mem::size_of::<MENUINFO>() as u32,
+            fMask: MENUINFO_MASK(MIM_STYLE.0),
+            dwStyle: MENUINFO_STYLE(MNS_NOTIFYBYPOS.0),
+            ..Default::default()
+        };
+        let _ = SetMenuInfo(menu, &info);
+        let _ = SetForegroundWindow(s.hwnd);
+        MENU_RIGHT_CLICK.store(false, std::sync::atomic::Ordering::Relaxed);
+        s.menu_kind = KIND_EQ_BANDS;
+        let hook = SetWindowsHookExW(
+            WH_GETMESSAGE,
+            Some(menu_message_hook),
+            None,
+            GetCurrentThreadId(),
+        );
+        if let Err(e) = &hook {
+            log_error!("UI", "menu hook install failed: {e}");
+        }
+        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, None, s.hwnd, None);
+        if let Ok(h) = hook {
+            let _ = UnhookWindowsHookEx(h);
+        }
+        let _ = DestroyMenu(menu);
+    }
+}
+
+/// MNS_NOTIFYBYPOS dispatch: wParam = item position. NOTE: on current shells
+/// this message arrives AFTER `TrackPopupMenu` has already returned and
+/// closed the menu — which is why sticky items re-open via
+/// `WM_APP_MENU_REOPEN`: posted after the command, so the pump processes the
+/// volume change first and the reopened menu renders the fresh label.
+fn on_menu_command(s: &mut UiState, wp: WPARAM) {
+    use std::sync::atomic::Ordering;
+    let right_clicked = MENU_RIGHT_CLICK.load(Ordering::Relaxed);
+    match s.menu_kind {
+        KIND_EQ_BANDS => {
+            // Position maps through EQ_STRIP_ORDER to the band index.
+            // Left-click +1 dB, right-click -1 dB, clamped by SharedState.
+            // Sticky: reopen the strip with fresh labels.
+            let pos = wp.0 as usize;
+            if pos >= crate::broker::EQ_BANDS {
+                return;
+            }
+            let band = EQ_STRIP_ORDER[pos];
+            let delta = if right_clicked { -EQ_BAND_STEP_DB } else { EQ_BAND_STEP_DB };
+            let old = s.shared.eq_gain_db(band);
+            let new = old + delta;
+            log_info!(
+                "UI",
+                "tray eq[{}Hz]: {old:+.1} -> {new:+.1} dB ({})",
+                crate::broker::EQ_BAND_HZ[band],
+                if right_clicked { "right" } else { "left" }
+            );
+            post_command(Command::EqGain { band: Some(band), gain_db: new });
+            reopen_menu(s, KIND_EQ_BANDS);
+        }
+        _ => match wp.0 as usize {
+            MENU_POS_VOL => {
+                let old = s.shared.volume();
+                let new = (old + if right_clicked { -0.1 } else { 0.1 }).clamp(0.0, 1.0);
+                log_info!(
+                    "UI",
+                    "tray volume: {}% -> {}% ({})",
+                    (old * 100.0).round() as i32,
+                    (new * 100.0).round() as i32,
+                    if right_clicked { "right" } else { "left" }
+                );
+                post_command(Command::SetVolume(new));
+                reopen_menu(s, KIND_MAIN);
+            }
+            MENU_POS_LOOP => {
+                post_command(Command::ToggleLoop);
+                reopen_menu(s, KIND_MAIN);
+            }
+            MENU_POS_EQ => {
+                post_command(Command::ToggleEq);
+                reopen_menu(s, KIND_MAIN);
+            }
+            MENU_POS_EQ_OPEN => {
+                // Swap the main menu for the band strip, in place.
+                reopen_menu(s, KIND_EQ_BANDS);
+            }
+            MENU_POS_WINDOW => post_command(Command::ToggleWindow),
+            MENU_POS_QUIT => {
                 log_info!("UI", "tray quit chosen");
                 post_command(Command::Quit);
             }
-            _ => {} // dismissed without selection
-        }
+            _ => {} // separator rows carry no command
+        },
     }
 }
 
@@ -398,6 +628,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_APP_TRAY => {
                 on_tray(s, lp);
+                LRESULT(0)
+            }
+            WM_MENUCOMMAND => {
+                on_menu_command(s, wp);
+                LRESULT(0)
+            }
+            WM_APP_MENU_REOPEN => {
+                // wParam = KIND_MAIN | KIND_EQ_BANDS (posted by sticky rows).
+                match wp.0 as usize {
+                    KIND_EQ_BANDS => eq_popup(s, s.menu_pt),
+                    _ => popup_menu(s, s.menu_pt),
+                }
                 LRESULT(0)
             }
             m if m == s.taskbar_created => {
