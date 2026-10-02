@@ -163,8 +163,11 @@ pub struct SharedState {
     volume_bits: AtomicU32,
     /// Written by the WASAPI callback, read by the broker's 1 Hz timer.
     frames_played: AtomicU64,
-    /// Current track's rate — makes `frames_played` meaningful as time.
+    /// The OUTPUT device's rate — makes `frames_played` meaningful as time.
+    /// Set once when the stream opens; chunks are already resampled to it.
     sample_rate: AtomicU32,
+    /// The output device's channel count, for decoder-side layout mixing.
+    device_channels: AtomicU32,
     /// Bumped on every Load. Chunks from a dead generation are discarded.
     generation: AtomicU64,
     eq_enabled: AtomicBool,
@@ -182,6 +185,7 @@ impl SharedState {
             volume_bits: AtomicU32::new(0.8f32.to_bits()),
             frames_played: AtomicU64::new(0),
             sample_rate: AtomicU32::new(0),
+            device_channels: AtomicU32::new(0),
             generation: AtomicU64::new(0),
             eq_enabled: AtomicBool::new(true),
             eq_dirty: AtomicBool::new(true),
@@ -234,10 +238,36 @@ impl SharedState {
     }
     pub fn reset_playhead(&self) {
         self.frames_played.store(0, Ordering::Relaxed);
-        self.sample_rate.store(0, Ordering::Relaxed);
+    }
+    /// Called by the output callback only (realtime context): playhead advance.
+    pub fn add_frames_played(&self, frames: u64) {
+        self.frames_played.fetch_add(frames, Ordering::Relaxed);
+    }
+    /// Consumes the dirty flag (decoder rebuilds biquad coefficients when set).
+    pub fn take_eq_dirty(&self) -> bool {
+        self.eq_dirty.swap(false, Ordering::Acquire)
+    }
+    /// Device rate — set once by the output stream, read by the decoder as
+    /// its resampling target and by the broker for time math.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate.load(Ordering::Relaxed)
     }
     pub fn set_sample_rate(&self, rate: u32) {
         self.sample_rate.store(rate, Ordering::Relaxed);
+    }
+    pub fn device_channels(&self) -> u32 {
+        self.device_channels.load(Ordering::Relaxed)
+    }
+    pub fn set_device_channels(&self, n: u32) {
+        self.device_channels.store(n, Ordering::Relaxed);
+    }
+    /// Snapshot of all band gains, for the decoder's coefficient rebuild.
+    pub fn eq_gains(&self) -> [f32; EQ_BANDS] {
+        let mut out = [0.0; EQ_BANDS];
+        for (i, g) in self.eq_gains_cdb.iter().enumerate() {
+            out[i] = g.load(Ordering::Relaxed) as f32 / 100.0;
+        }
+        out
     }
     pub fn bump_generation(&self) {
         self.generation.fetch_add(1, Ordering::Release);
@@ -267,22 +297,50 @@ pub enum Flow {
     Exit,
 }
 
-/// The decision point. Owns the decoder's command channel; everything else is
-/// derived state. The presentation layer (headless loop now, Win32 later)
-/// calls `handle_command` / `handle_status` and renders `view`.
+/// Broker → decoder link: the command channel plus an optional kill switch.
+/// Before every Stop/Load/Shutdown, `interrupt` tears down any yt-dlp child
+/// the decoder is reading from — otherwise a network-stalled pipe read would
+/// defer the command indefinitely. This stays audio-agnostic: the audio
+/// module installs the closure, the broker just calls it.
+#[derive(Clone)]
+pub struct DecoderLink {
+    tx: Sender<DecoderCmd>,
+    interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl DecoderLink {
+    pub fn with_interrupt(tx: Sender<DecoderCmd>, interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self { tx, interrupt: Some(interrupt) }
+    }
+
+    pub fn send(&self, cmd: DecoderCmd) {
+        if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown | DecoderCmd::Load(_)) {
+            if let Some(f) = &self.interrupt {
+                f();
+            }
+        }
+        if let Err(e) = self.tx.send(cmd) {
+            log_error!("BROKER", "decoder channel dead: {e}");
+        }
+    }
+}
+
+/// The decision point. Owns the decoder link; everything else is derived
+/// state. The presentation layer (headless loop, Win32 pump) calls
+/// `handle_command` / `handle_status` and renders `view`.
 pub struct Broker {
     shared: Arc<SharedState>,
-    decoder_tx: Sender<DecoderCmd>,
+    decoder: DecoderLink,
     track: Option<TrackMeta>,
     view: String,
     view_dirty: bool,
 }
 
 impl Broker {
-    pub fn new(shared: Arc<SharedState>, decoder_tx: Sender<DecoderCmd>) -> Self {
+    pub fn new(shared: Arc<SharedState>, decoder: DecoderLink) -> Self {
         let mut broker = Self {
             shared,
-            decoder_tx,
+            decoder,
             track: None,
             view: String::new(),
             view_dirty: false,
@@ -427,7 +485,6 @@ impl Broker {
                         .unwrap_or_default()
                 );
                 self.track = Some(TrackMeta { source, title, duration, sample_rate, channels });
-                self.shared.set_sample_rate(sample_rate);
                 self.shared.reset_playhead();
                 // Step 3: the cpal stream is (re)started here, not before.
                 self.set_phase(Phase::Playing, "stream opened");
@@ -458,9 +515,7 @@ impl Broker {
     }
 
     fn send_decoder(&mut self, cmd: DecoderCmd) {
-        if let Err(e) = self.decoder_tx.send(cmd) {
-            log_error!("BROKER", "decoder channel dead: {e}");
-        }
+        self.decoder.send(cmd);
     }
 
     fn refresh(&mut self) {

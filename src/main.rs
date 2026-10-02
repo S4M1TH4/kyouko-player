@@ -46,7 +46,8 @@ mod ui;
 
 use crossbeam_channel::bounded;
 
-use crate::broker::{Broker, Command, DecoderCmd, SharedState, Status};
+use crate::audio::AudioOut;
+use crate::broker::{Broker, Command, DecoderCmd, DecoderLink, SharedState, Status};
 use crate::ui::CMD_TX;
 
 fn main() {
@@ -78,18 +79,32 @@ fn main() {
     CMD_TX.set(cmd_tx.clone()).ok();
 
     let audio = audio::spawn(shared.clone(), decoder_rx, status_tx);
+    let audio_out = match audio::open_output_stream(audio.chunk_rx, audio.drained_tx, shared.clone()) {
+        Ok(stream) => AudioOut::new(Some(stream)),
+        Err(e) => {
+            log_error!("MAIN", "audio output unavailable: {e} — running silent");
+            AudioOut::new(None)
+        }
+    };
     let _terminal = terminal::spawn(cmd_tx);
 
-    // Keep a clone so shutdown can reach the decoder even if the broker loop
-    // exits through an error path instead of a Quit.
-    let decoder_tx_shutdown = decoder_tx.clone();
+    // The kill switch rides along with every Stop/Load/Shutdown so a stalled
+    // yt-dlp pipe read can never defer a command or hang shutdown.
+    let controls = audio.controls.clone();
+    let link = DecoderLink::with_interrupt(decoder_tx, controls.hook());
+    let shutdown_link = link.clone();
 
-    let broker = Broker::new(shared, decoder_tx);
+    let broker = Broker::new(shared, link);
     log_info!("MAIN", "broker online — entering sleep-on-idle event loop");
-    ui::run(broker, cmd_rx, status_rx);
+    ui::run(broker, cmd_rx, status_rx, audio_out);
 
     log_info!("MAIN", "event loop over — reaping decoder");
-    let _ = decoder_tx_shutdown.try_send(DecoderCmd::Shutdown);
+    // Defensive shutdown for error-path exits; skipped when the decoder
+    // already exited (Quit flow sends its own Shutdown).
+    if !audio.decoder.is_finished() {
+        shutdown_link.send(DecoderCmd::Shutdown);
+    }
+    audio.controls.interrupt();
     let _ = audio.decoder.join();
     log_info!("MAIN", "shutdown complete — echo faded");
     // Returning from main terminates the parked stdin thread; that is fine.

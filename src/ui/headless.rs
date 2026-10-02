@@ -4,10 +4,18 @@
 
 use crossbeam_channel::{select, Receiver};
 
-use crate::broker::{Broker, Command, Flow, Status};
+use crate::audio::AudioOut;
+use crate::broker::{Broker, Command, Flow, Phase, Status};
 use crate::{log_info, log_warn};
 
-pub fn run(mut broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status>) {
+pub fn run(
+    mut broker: Broker,
+    cmd_rx: Receiver<Command>,
+    status_rx: Receiver<Status>,
+    mut audio_out: AudioOut,
+) {
+    let shared = broker.shared();
+    let mut last_phase = shared.phase();
     log_info!("UI", "headless mode — panel follows on every state change");
     loop {
         // Blocks until a command or a status arrives. Thread parks in the
@@ -33,6 +41,12 @@ pub fn run(mut broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<St
                     break;
                 }
             },
+        }
+        // Mirror the phase onto the output stream (WASAPI play/pause).
+        let phase = shared.phase();
+        if phase != last_phase {
+            audio_out.set_playing(phase == Phase::Playing);
+            last_phase = phase;
         }
         // The broker is the only thing allowed to decide the panel changed.
         if let Some(panel) = broker.take_refresh() {

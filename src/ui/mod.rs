@@ -33,6 +33,7 @@ use std::sync::OnceLock;
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::audio::AudioOut;
 use crate::broker::{Broker, Command, Status};
 
 /// Write end of the command channel, parked in a static so tray-menu choices
@@ -81,14 +82,19 @@ fn post(msg: u32) {
 #[cfg(not(windows))]
 fn post(_msg: u32) {}
 
-pub fn run(broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status>) {
+pub fn run(
+    broker: Broker,
+    cmd_rx: Receiver<Command>,
+    status_rx: Receiver<Status>,
+    audio_out: AudioOut,
+) {
     // Debug escape hatch: the step-1 headless pump, kept for CI-style runs.
     if std::env::var_os("KYOUKO_HEADLESS").is_some() {
-        headless::run(broker, cmd_rx, status_rx);
+        headless::run(broker, cmd_rx, status_rx, audio_out);
         return;
     }
     #[cfg(windows)]
-    win32::run(broker, cmd_rx, status_rx);
+    win32::run(broker, cmd_rx, status_rx, audio_out);
     #[cfg(not(windows))]
-    headless::run(broker, cmd_rx, status_rx);
+    headless::run(broker, cmd_rx, status_rx, audio_out);
 }

@@ -37,6 +37,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::audio::AudioOut;
+
 use super::render::Renderer;
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
@@ -56,6 +58,8 @@ struct UiState {
     shared: Arc<SharedState>,
     renderer: Renderer,
     tray: Tray,
+    /// Owns the cpal stream; mirrors the phase onto WASAPI play/pause.
+    audio_out: AudioOut,
     /// 1 Hz timer only exists while Playing — this is the "render loop sleeps
     /// when paused" guarantee, enforced here.
     timer_on: bool,
@@ -64,7 +68,12 @@ struct UiState {
     taskbar_created: u32,
 }
 
-pub fn run(broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status>) {
+pub fn run(
+    broker: Broker,
+    cmd_rx: Receiver<Command>,
+    status_rx: Receiver<Status>,
+    audio_out: AudioOut,
+) {
     let shared = broker.shared();
 
     unsafe {
@@ -80,7 +89,7 @@ pub fn run(broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status
         Ok(r) => r,
         Err(e) => {
             log_error!("UI", "renderer init failed: {e} — falling back to headless");
-            super::headless::run(broker, cmd_rx, status_rx);
+            super::headless::run(broker, cmd_rx, status_rx, AudioOut::new(None));
             return;
         }
     };
@@ -91,7 +100,7 @@ pub fn run(broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status
         Err(e) => {
             log_error!("UI", "GetModuleHandleW failed: {e} — falling back to headless");
             drop(renderer);
-            super::headless::run(broker, cmd_rx, status_rx);
+            super::headless::run(broker, cmd_rx, status_rx, AudioOut::new(None));
             return;
         }
     };
@@ -108,7 +117,7 @@ pub fn run(broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status
     if unsafe { RegisterClassW(&wc) } == 0 {
         log_error!("UI", "RegisterClassW failed — falling back to headless");
         drop(renderer);
-        super::headless::run(broker, cmd_rx, status_rx);
+        super::headless::run(broker, cmd_rx, status_rx, AudioOut::new(None));
         return;
     }
 
@@ -125,6 +134,7 @@ pub fn run(broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status
         shared,
         renderer,
         tray: Tray::new(),
+        audio_out,
         timer_on: false,
         last_phase: Phase::Stopped,
         hidden: false,
@@ -151,7 +161,7 @@ pub fn run(broker: Broker, cmd_rx: Receiver<Command>, status_rx: Receiver<Status
         Err(e) => {
             log_error!("UI", "CreateWindowExW failed: {e} — falling back to headless");
             let s = unsafe { *Box::from_raw(state) };
-            super::headless::run(s.broker, s.cmd_rx, s.status_rx);
+            super::headless::run(s.broker, s.cmd_rx, s.status_rx, s.audio_out);
             return;
         }
     };
@@ -215,6 +225,8 @@ fn workarea_top_right(width: i32, _height: i32) -> (i32, i32) {
 fn sync(s: &mut UiState) {
     let phase = s.shared.phase();
     if phase != s.last_phase {
+        // WASAPI follows the phase: running while Playing, stopped otherwise.
+        s.audio_out.set_playing(phase == Phase::Playing);
         if phase == Phase::Playing && !s.timer_on {
             unsafe { SetTimer(Some(s.hwnd), TIMER_ID, TIMER_MS, None) };
             s.timer_on = true;
