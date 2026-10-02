@@ -1,0 +1,66 @@
+[package]
+name = "kyouko-player"
+version = "0.1.0"
+edition = "2024"
+description = "The mountain echo; only heard, never seen. A zero-resource, event-driven audio player."
+
+# ── Dependency policy ────────────────────────────────────────────────────────
+# No async runtime, no GUI toolkit, no rodio, no tracing. Every dependency must
+# pull its weight or it gets deleted. `yt-dlp` is spawned via std::process —
+# no crate needed for YouTube.
+
+[dependencies]
+# Raw Win32. Only the feature gates we actually touch; additive for the
+# Win32 UI/tray module (step 2). No abstraction layers on top of this.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+] }
+
+# Audio output. cpal on Windows = WASAPI in event-driven shared mode: the OS
+# wakes the callback only when it needs samples, and `Stream::pause()` stops
+# the callback entirely (true zero-CPU pause). Cross-platform by construction,
+# so the future Linux port keeps this module untouched.
+cpal = "0.15"
+
+# Decoding. Defaults off — we ship exactly the codecs we play, nothing else.
+# `isomp4`+`aac` covers yt-dlp's format 140 (m4a); `mkv` covers webm/matroska
+# video pulled in as audio. Video containers decode audio-only by design.
+# Note: Opus arrives with symphonia 0.6 (0.5 has no opus feature); until then
+# the YouTube fallback path is AAC (140) / Vorbis, which is what we want for
+# audio anyway. `opt-simd` enables symphonia's SSE/AVX decode paths.
+symphonia = { version = "0.5", default-features = false, features = [
+    "mp3",
+    "aac",
+    "flac",
+    "wav",
+    "pcm",
+    "adpcm",
+    "ogg",
+    "vorbis",
+    "isomp4",
+    "mkv",
+    "opt-simd",
+] }
+
+# Channels. Chosen over std::sync::mpsc for exactly two capabilities the whole
+# architecture rests on: `select!` over multiple blocking receives (no polling)
+# and bounded queues (backpressure is our only scheduling mechanism).
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3        # "z" would starve the decode loop; 3 keeps biquads + symphonia fast
+lto = "fat"
+codegen-units = 1
+panic = "abort"      # no unwind tables anywhere; a panic is a bug, we abort
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1        # decoder stays usable when debugging from the terminal
