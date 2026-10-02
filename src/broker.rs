@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Sender;
 
+use crate::config::PersistedState;
 use crate::{log_debug, log_error, log_info, log_warn};
 
 // ── Tuning constants (consumed by the audio module in step 3) ────────────────
@@ -59,6 +60,25 @@ impl Source {
             Source::Youtube { url, .. } => url,
         }
     }
+
+    /// Raw string form (path or URL) — exactly what persistence stores and
+    /// what `from_raw` turns back into a `Source`.
+    pub fn raw(&self) -> &str {
+        match self {
+            Source::File(p) => p,
+            Source::Youtube { url, .. } => url,
+        }
+    }
+
+    /// Inverse of `raw`: URL-shaped strings stream via yt-dlp, everything
+    /// else opens as a local file.
+    pub fn from_raw(raw: &str) -> Source {
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            Source::Youtube { url: raw.to_string(), format: "140".to_string() }
+        } else {
+            Source::File(raw.to_string())
+        }
+    }
 }
 
 impl fmt::Display for Source {
@@ -74,7 +94,9 @@ impl fmt::Display for Source {
 /// converge here — the broker is the single decision point.
 #[derive(Clone, Debug)]
 pub enum Command {
-    Load(Source),
+    /// `paused: true` stages the source in the decoder (buffered, resume is
+    /// instant) while the output stays stopped — used for last-track restore.
+    Load { source: Source, paused: bool },
     Pause,
     Resume,
     Toggle,
@@ -334,6 +356,15 @@ pub struct Broker {
     track: Option<TrackMeta>,
     view: String,
     view_dirty: bool,
+    /// Load asked for a staged (paused) start: the next Opened flips to
+    /// Paused instead of Playing. Consumed there, cleared on failure.
+    stage_paused: bool,
+    /// Raw form of the most recently OPENED source — survives Stop/Finished
+    /// (where `track` is cleared) so a volume tweak never erases last_track.
+    last_source_raw: Option<String>,
+    /// Installed by main; writes PersistedState to disk. A closure keeps the
+    /// broker I/O-free (and testable).
+    saver: Option<Arc<dyn Fn(PersistedState) + Send + Sync>>,
 }
 
 impl Broker {
@@ -344,9 +375,35 @@ impl Broker {
             track: None,
             view: String::new(),
             view_dirty: false,
+            stage_paused: false,
+            last_source_raw: None,
+            saver: None,
         };
         broker.refresh();
         broker
+    }
+
+    /// Install the persistence sink. Fired on the save triggers: volume,
+    /// EQ gains, opened track, Quit.
+    pub fn with_saver(mut self, saver: Arc<dyn Fn(PersistedState) + Send + Sync>) -> Self {
+        self.saver = Some(saver);
+        self
+    }
+
+    /// Current persistent-worthy state.
+    pub fn persist_snapshot(&self) -> PersistedState {
+        PersistedState {
+            volume: self.shared.volume(),
+            eq_gains: self.shared.eq_gains(),
+            last_track: self.last_source_raw.clone(),
+        }
+    }
+
+    fn persist(&self) {
+        if let Some(saver) = &self.saver {
+            saver(self.persist_snapshot());
+            log_debug!("BROKER", "state persisted to disk");
+        }
     }
 
     /// Panel changed since last `take_refresh`? (Presentation pulls; the
@@ -384,8 +441,13 @@ impl Broker {
     pub fn handle_command(&mut self, cmd: Command) -> Flow {
         log_debug!("BROKER", "command: {cmd:?}");
         match cmd {
-            Command::Load(source) => {
-                log_info!("BROKER", "load: {source}");
+            Command::Load { source, paused } => {
+                log_info!(
+                    "BROKER",
+                    "load{}: {source}",
+                    if paused { " [staged paused]" } else { "" }
+                );
+                self.stage_paused = paused;
                 self.track = None;
                 self.shared.reset_playhead();
                 self.shared.bump_generation();
@@ -422,25 +484,29 @@ impl Broker {
                 let v = v.clamp(0.0, 1.0);
                 self.shared.set_volume(v);
                 log_info!("BROKER", "volume: {:.0}%", v * 100.0);
+                self.persist();
             }
-            Command::EqGain { band, gain_db } => match band {
-                Some(b) if b < EQ_BANDS => {
-                    let stored = self.shared.set_eq_gain(b, gain_db);
-                    log_info!(
-                        "BROKER",
-                        "eq[{}Hz]: {gain_db:+.1} -> {stored:+.1} dB",
-                        EQ_BAND_HZ[b]
-                    );
-                }
-                Some(b) => log_warn!("BROKER", "eq band {b} out of range (0..={})", EQ_BANDS - 1),
-                None => {
-                    let stored = self.shared.set_eq_gain(0, gain_db);
-                    for b in 1..EQ_BANDS {
-                        self.shared.set_eq_gain(b, gain_db);
+            Command::EqGain { band, gain_db } => {
+                match band {
+                    Some(b) if b < EQ_BANDS => {
+                        let stored = self.shared.set_eq_gain(b, gain_db);
+                        log_info!(
+                            "BROKER",
+                            "eq[{}Hz]: {gain_db:+.1} -> {stored:+.1} dB",
+                            EQ_BAND_HZ[b]
+                        );
                     }
-                    log_info!("BROKER", "eq[all]: {gain_db:+.1} -> {stored:+.1} dB");
+                    Some(b) => log_warn!("BROKER", "eq band {b} out of range (0..={})", EQ_BANDS - 1),
+                    None => {
+                        let stored = self.shared.set_eq_gain(0, gain_db);
+                        for b in 1..EQ_BANDS {
+                            self.shared.set_eq_gain(b, gain_db);
+                        }
+                        log_info!("BROKER", "eq[all]: {gain_db:+.1} -> {stored:+.1} dB");
+                    }
                 }
-            },
+                self.persist();
+            }
             Command::EqEnabled(on) => {
                 self.shared.set_eq_enabled(on);
                 log_info!("BROKER", "eq: {}", if on { "ON" } else { "OFF" });
@@ -463,6 +529,7 @@ impl Broker {
             }
             Command::Quit => {
                 log_info!("BROKER", "quit — shutting decoder down (kills yt-dlp child)");
+                self.persist(); // final flush; Ctrl+C / tray / terminal all land here
                 self.send_decoder(DecoderCmd::Shutdown);
                 self.set_phase(Phase::Stopped, "quit");
                 return Flow::Exit;
@@ -484,10 +551,27 @@ impl Broker {
                         .map(|d| format!(", {}", fmt_mmss(d)))
                         .unwrap_or_default()
                 );
+                self.last_source_raw = Some(source.raw().to_string());
                 self.track = Some(TrackMeta { source, title, duration, sample_rate, channels });
                 self.shared.reset_playhead();
-                // Step 3: the cpal stream is (re)started here, not before.
-                self.set_phase(Phase::Playing, "stream opened");
+                // A staged load resolves to Paused instead of Playing: the
+                // track is buffered and resume is instant, but the output
+                // stays stopped — 0% CPU until the user asks for sound.
+                let target = if self.stage_paused {
+                    self.stage_paused = false;
+                    Phase::Paused
+                } else {
+                    Phase::Playing
+                };
+                self.set_phase(
+                    target,
+                    if target == Phase::Paused {
+                        "staged — resume to play"
+                    } else {
+                        "stream opened"
+                    },
+                );
+                self.persist();
             }
             Status::Finished => {
                 log_info!("BROKER", "track finished");
@@ -497,6 +581,7 @@ impl Broker {
             }
             Status::Failed { source, reason } => {
                 log_error!("BROKER", "failed to open {source}: {reason}");
+                self.stage_paused = false;
                 self.track = None;
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "load failed");
@@ -605,6 +690,104 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// A broker wired to an in-memory sink — no disk I/O in tests.
+    fn broker_with_sink() -> (Broker, Arc<Mutex<Vec<PersistedState>>>) {
+        let shared = SharedState::new();
+        let (tx, _rx) = crossbeam_channel::bounded::<DecoderCmd>(8);
+        let sink: Arc<Mutex<Vec<PersistedState>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_for_saver = Arc::clone(&sink);
+        let broker = Broker::new(shared, DecoderLink::with_interrupt(
+            tx,
+            Arc::new(|| {}),
+        ))
+        .with_saver(Arc::new(move |st| {
+            sink_for_saver.lock().unwrap().push(st);
+        }));
+        (broker, sink)
+    }
+
+    #[test]
+    fn staged_load_opens_paused_and_clears_on_failure() {
+        let (mut broker, _) = broker_with_sink();
+        broker.handle_command(Command::Load {
+            source: Source::File("nowhere.mp3".into()),
+            paused: true,
+        });
+        // Staged flag is set by Load...
+        assert!(broker.stage_paused);
+        // ...and a FAILED open must not leave it armed for a future track.
+        broker.handle_status(Status::Failed {
+            source: Source::File("nowhere.mp3".into()),
+            reason: "test".into(),
+        });
+        assert!(!broker.stage_paused);
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+    }
+
+    #[test]
+    fn opened_consumes_stage_flag_once() {
+        let (mut broker, _) = broker_with_sink();
+        broker.handle_command(Command::Load {
+            source: Source::File("a.mp3".into()),
+            paused: true,
+        });
+        broker.handle_status(Status::Opened {
+            source: Source::File("a.mp3".into()),
+            sample_rate: 48_000,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
+        assert_eq!(broker.shared.phase(), Phase::Paused);
+        assert!(!broker.stage_paused);
+        // A follow-up normal load must play, not inherit the staged pause.
+        broker.handle_command(Command::Load {
+            source: Source::File("b.mp3".into()),
+            paused: false,
+        });
+        broker.handle_status(Status::Opened {
+            source: Source::File("b.mp3".into()),
+            sample_rate: 48_000,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+    }
+
+    #[test]
+    fn save_triggers_fire_and_snapshot_matches() {
+        let (mut broker, sink) = broker_with_sink();
+        broker.handle_command(Command::Volume(0.25));
+        broker.handle_command(Command::EqGain { band: Some(2), gain_db: 4.0 });
+        broker.handle_status(Status::Opened {
+            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "140".into() },
+            sample_rate: 44_100,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
+        broker.handle_command(Command::Volume(0.5));
+        let snaps = sink.lock().unwrap();
+        // Volume, EqGain, Opened, Volume → 4 saves.
+        assert_eq!(snaps.len(), 4);
+        let last = snaps.last().unwrap();
+        assert_eq!(last.volume, 0.5);
+        assert_eq!(last.eq_gains[2], 4.0);
+        assert_eq!(last.last_track.as_deref(), Some("https://youtu.be/x"));
+    }
+
+    #[test]
+    fn source_raw_round_trip() {
+        assert_eq!(Source::from_raw("C:\\m\\a.flac").raw(), "C:\\m\\a.flac");
+        assert!(matches!(
+            Source::from_raw("https://youtu.be/x"),
+            Source::Youtube { url, format } if url == "https://youtu.be/x" && format == "140"
+        ));
+        assert!(matches!(Source::from_raw("song.mp3"), Source::File(_)));
+    }
 
     #[test]
     fn panel_reflects_eq_and_volume_changes() {

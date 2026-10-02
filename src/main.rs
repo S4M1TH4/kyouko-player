@@ -40,14 +40,18 @@
 
 mod audio;
 mod broker;
+mod config;
 mod logging;
 mod terminal;
 mod ui;
 
 use crossbeam_channel::bounded;
 
+use std::sync::Arc;
+
 use crate::audio::AudioOut;
-use crate::broker::{Broker, Command, DecoderCmd, DecoderLink, SharedState, Status};
+use crate::broker::{Broker, Command, DecoderCmd, DecoderLink, SharedState, Source, Status};
+use crate::config::PersistedState;
 use crate::ui::CMD_TX;
 
 fn main() {
@@ -69,7 +73,34 @@ fn main() {
         }
     }
 
+    // Restore persisted state before anything can play: volume and EQ apply
+    // to the shared atomics immediately, so even the first track inherits them.
+    let restored = config::load();
     let shared = SharedState::new();
+    shared.set_volume(restored.volume);
+    for (band, gain) in restored.eq_gains.iter().enumerate() {
+        shared.set_eq_gain(band, *gain);
+    }
+    let eq_desc = {
+        let mut parts = Vec::new();
+        for (band, gain) in restored.eq_gains.iter().enumerate() {
+            if gain.abs() >= 0.05 {
+                parts.push(format!("{}Hz {:+.1}", crate::broker::EQ_BAND_HZ[band], gain));
+            }
+        }
+        if parts.is_empty() {
+            "flat".to_string()
+        } else {
+            parts.join(", ")
+        }
+    };
+    log_info!(
+        "MAIN",
+        "restored: volume {:.0}%, eq ({}), last_track {}",
+        restored.volume * 100.0,
+        eq_desc,
+        restored.last_track.as_deref().unwrap_or("<none>")
+    );
 
     // The four message arteries. Bounded everywhere: a full queue is the
     // scheduler — senders block (park), nobody ever spins.
@@ -77,6 +108,26 @@ fn main() {
     let (decoder_tx, decoder_rx) = bounded::<DecoderCmd>(8); // broker → decoder
     let (status_tx, status_rx) = bounded::<Status>(16); // decoder → broker
     CMD_TX.set(cmd_tx.clone()).ok();
+
+    // Launch track: an explicit CLI argument plays right away; otherwise a
+    // persisted last_track is STAGED in the decoder — buffered, resume is
+    // instant — with the output left stopped (paused, 0% CPU).
+    let initial = match std::env::args().nth(1) {
+        Some(arg) => Some((Source::from_raw(&arg), false)),
+        None => restored
+            .last_track
+            .as_deref()
+            .map(Source::from_raw)
+            .map(|s| (s, true)),
+    };
+    if let Some((source, paused)) = initial {
+        log_info!(
+            "MAIN",
+            "launch track: {source} ({})",
+            if paused { "staged paused" } else { "autoplay" }
+        );
+        let _ = cmd_tx.send(Command::Load { source, paused });
+    }
 
     let audio = audio::spawn(shared.clone(), decoder_rx, status_tx);
     let audio_out = match audio::open_output_stream(audio.chunk_rx, audio.drained_tx, shared.clone()) {
@@ -94,7 +145,12 @@ fn main() {
     let link = DecoderLink::with_interrupt(decoder_tx, controls.hook());
     let shutdown_link = link.clone();
 
-    let broker = Broker::new(shared, link);
+    // Persistence sink: the broker calls it on every save trigger
+    // (volume / EQ gains / opened track / Quit). Fire-and-forget writes on
+    // the broker thread — no locks, no background flusher thread.
+    let saver: Arc<dyn Fn(PersistedState) + Send + Sync> =
+        Arc::new(|state| config::store(&state));
+    let broker = Broker::new(shared, link).with_saver(saver);
     log_info!("MAIN", "broker online — entering sleep-on-idle event loop");
     ui::run(broker, cmd_rx, status_rx, audio_out);
 

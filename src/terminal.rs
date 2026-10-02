@@ -73,16 +73,22 @@ fn parse(line: &str) -> Option<Command> {
                     .strip_prefix('"')
                     .and_then(|p| p.strip_suffix('"'))
                     .unwrap_or(rest);
-                Some(Command::Load(Source::File(path.to_string())))
+                Some(Command::Load {
+                    source: Source::File(path.to_string()),
+                    paused: false,
+                })
             }
         }
         "yt" => {
             let mut parts = rest.split_whitespace();
             match (parts.next(), parts.next()) {
-                (Some(url), fmt) => Some(Command::Load(Source::Youtube {
-                    url: url.to_string(),
-                    format: fmt.unwrap_or("140").to_string(),
-                })),
+                (Some(url), fmt) => Some(Command::Load {
+                    source: Source::Youtube {
+                        url: url.to_string(),
+                        format: fmt.unwrap_or("140").to_string(),
+                    },
+                    paused: false,
+                }),
                 _ => {
                     log_warn!("TERM", "usage: yt <url> [format_id] (default 140 = m4a 128k)");
                     None

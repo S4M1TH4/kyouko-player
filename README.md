@@ -34,6 +34,7 @@ Clone the repository and build using Cargo:
 
 ```powershell
 git clone https://github.com/S4M1TH4/kyouko-player.git
+cd Kyouko-Player
 cargo build --release
 ```
 
