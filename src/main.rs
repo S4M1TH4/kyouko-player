@@ -81,6 +81,7 @@ fn main() {
     for (band, gain) in restored.eq_gains.iter().enumerate() {
         shared.set_eq_gain(band, *gain);
     }
+    shared.set_loop_enabled(restored.loop_enabled);
     let eq_desc = {
         let mut parts = Vec::new();
         for (band, gain) in restored.eq_gains.iter().enumerate() {
@@ -96,9 +97,10 @@ fn main() {
     };
     log_info!(
         "MAIN",
-        "restored: volume {:.0}%, eq ({}), last_track {}",
+        "restored: volume {:.0}%, eq ({}), loop {}, last_track {}",
         restored.volume * 100.0,
         eq_desc,
+        if restored.loop_enabled { "ON" } else { "OFF" },
         restored.last_track.as_deref().unwrap_or("<none>")
     );
 

@@ -47,7 +47,7 @@ The compiled executable will be located at `target/release/kyouko-player.exe`.
 Pass local file paths directly via command-line arguments:
 
 ```powershell
-.\target\release\kyouko-player.exe "C:\Path\To\audio.flv"
+.\target\release\kyouko-player.exe C:\Path\To\audio.flv
 ```
 
 ### YouTube Streaming
@@ -55,7 +55,7 @@ Pass local file paths directly via command-line arguments:
 Stream audio directly from YouTube URLs:
 
 ```powershell
-.\target\release\kyouko-player.exe "https://www.youtube.com/watch?v=DdUoGjniJ7s"
+.\target\release\kyouko-player.exe https://www.youtube.com/watch?v=DdUoGjniJ7s
 ```
 
 ### CLI Terminal Commands

@@ -34,11 +34,13 @@ pub struct PersistedState {
     pub eq_gains: [f32; EQ_BANDS],
     /// Raw last track: a local file path or a YouTube URL.
     pub last_track: Option<String>,
+    /// Track repeat (mpv `loop-file` style).
+    pub loop_enabled: bool,
 }
 
 impl Default for PersistedState {
     fn default() -> Self {
-        Self { volume: 0.8, eq_gains: [0.0; EQ_BANDS], last_track: None }
+        Self { volume: 0.8, eq_gains: [0.0; EQ_BANDS], last_track: None, loop_enabled: false }
     }
 }
 
@@ -83,9 +85,10 @@ pub fn store_to(path: &Path, state: &PersistedState) {
         eq.push_str(&format!("{gain:.2}"));
     }
     let body = format!(
-        "# kyouko-player state — rewritten automatically, safe to edit\nvolume={:.3}\neq_gains={eq}\nlast_track={}\n",
+        "# kyouko-player state — rewritten automatically, safe to edit\nvolume={:.3}\neq_gains={eq}\nlast_track={}\nloop={}\n",
         state.volume,
         state.last_track.as_deref().unwrap_or(""),
+        if state.loop_enabled { "true" } else { "false" },
     );
     let tmp = path.with_extension("cfg.tmp");
     let outcome = fs::File::create(&tmp)
@@ -128,6 +131,9 @@ fn parse(text: &str) -> PersistedState {
             "last_track" => {
                 state.last_track = if value.is_empty() { None } else { Some(value.to_string()) };
             }
+            "loop" => {
+                state.loop_enabled = value.eq_ignore_ascii_case("true");
+            }
             _ => {} // unknown key — ignore, forward compatibility
         }
     }
@@ -149,6 +155,7 @@ mod tests {
             volume: 0.05,
             eq_gains: [6.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 0.0, 8.0, 0.0],
             last_track: Some(r"C:\My Music\kyouko test file.mp3".into()),
+            loop_enabled: true,
         };
         store_to(&path, &state);
         let loaded = load_from(&path);
@@ -173,6 +180,19 @@ mod tests {
         assert_eq!(loaded.volume, 1.0);
         assert_eq!(loaded.eq_gains[0], EQ_MAX_GAIN_DB);
         assert_eq!(loaded.eq_gains[1], -EQ_MAX_GAIN_DB);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn loop_flag_round_trip_and_garbage() {
+        let path = temp_path("loop");
+        store_to(&path, &PersistedState { loop_enabled: true, ..Default::default() });
+        assert_eq!(load_from(&path).loop_enabled, true);
+        store_to(&path, &PersistedState { loop_enabled: false, ..Default::default() });
+        assert_eq!(load_from(&path).loop_enabled, false);
+        fs::write(&path, "loop=banana
+").unwrap();
+        assert_eq!(load_from(&path).loop_enabled, false); // strict parse → default
         let _ = fs::remove_file(&path);
     }
 

@@ -97,7 +97,7 @@ fn parse(line: &str) -> Option<Command> {
         }
         "pause" => Some(Command::Pause),
         "resume" => Some(Command::Resume),
-        "toggle" | "p" => Some(Command::Toggle),
+        "toggle" | "p" => Some(Command::TogglePause),
         "stop" => Some(Command::Stop),
         "vol" | "volume" => match rest.parse::<f64>() {
             Ok(v) if (0.0..=100.0).contains(&v) => Some(Command::Volume((v / 100.0) as f32)),
@@ -111,6 +111,7 @@ fn parse(line: &str) -> Option<Command> {
             }
         },
         "eq" => parse_eq(rest),
+        "l" | "loop" => Some(Command::ToggleLoop),
         "state" | "dump" => Some(Command::DumpState),
         "icon" => {
             // Print the procedural tray glyph — see it without a screenshot.

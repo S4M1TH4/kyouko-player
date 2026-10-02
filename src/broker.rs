@@ -99,13 +99,20 @@ pub enum Command {
     Load { source: Source, paused: bool },
     Pause,
     Resume,
-    Toggle,
+    /// Flip between Playing and Paused (tray menu + terminal toggle).
+    TogglePause,
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
     Volume(f32),
     /// Band gain in dB, clamped to ±12. `None` = all bands.
     EqGain { band: Option<usize>, gain_db: f32 },
     EqEnabled(bool),
+    /// Flip EQ bypass (off = biquads skipped, saved band gains untouched).
+    ToggleEq,
+    /// Toggle track repeat (mpv `loop-file`): Finished replays the source.
+    ToggleLoop,
+    /// Show/hide the echo window (handled by the presentation layer).
+    ToggleWindow,
     DumpState,
     Quit,
 }
@@ -190,6 +197,8 @@ pub struct SharedState {
     sample_rate: AtomicU32,
     /// The output device's channel count, for decoder-side layout mixing.
     device_channels: AtomicU32,
+    /// Track repeat (mpv `loop-file` style): Finished replays the same source.
+    loop_enabled: AtomicBool,
     /// Bumped on every Load. Chunks from a dead generation are discarded.
     generation: AtomicU64,
     eq_enabled: AtomicBool,
@@ -208,6 +217,7 @@ impl SharedState {
             frames_played: AtomicU64::new(0),
             sample_rate: AtomicU32::new(0),
             device_channels: AtomicU32::new(0),
+            loop_enabled: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             eq_enabled: AtomicBool::new(true),
             eq_dirty: AtomicBool::new(true),
@@ -282,6 +292,12 @@ impl SharedState {
     }
     pub fn set_device_channels(&self, n: u32) {
         self.device_channels.store(n, Ordering::Relaxed);
+    }
+    pub fn loop_enabled(&self) -> bool {
+        self.loop_enabled.load(Ordering::Relaxed)
+    }
+    pub fn set_loop_enabled(&self, on: bool) {
+        self.loop_enabled.store(on, Ordering::Relaxed);
     }
     /// Snapshot of all band gains, for the decoder's coefficient rebuild.
     pub fn eq_gains(&self) -> [f32; EQ_BANDS] {
@@ -396,6 +412,7 @@ impl Broker {
             volume: self.shared.volume(),
             eq_gains: self.shared.eq_gains(),
             last_track: self.last_source_raw.clone(),
+            loop_enabled: self.shared.loop_enabled(),
         }
     }
 
@@ -468,7 +485,7 @@ impl Broker {
                     log_warn!("BROKER", "resume ignored while {}", self.shared.phase());
                 }
             }
-            Command::Toggle => match self.shared.phase() {
+            Command::TogglePause => match self.shared.phase() {
                 Phase::Playing => self.set_phase(Phase::Paused, "toggle"),
                 Phase::Paused => self.set_phase(Phase::Playing, "toggle"),
                 p => log_warn!("BROKER", "toggle ignored while {p}"),
@@ -511,11 +528,29 @@ impl Broker {
                 self.shared.set_eq_enabled(on);
                 log_info!("BROKER", "eq: {}", if on { "ON" } else { "OFF" });
             }
+            // Bypass only: eq_enabled gates the biquad pass in the decoder;
+            // the saved band gains are untouched, so nothing to persist.
+            Command::ToggleEq => {
+                let on = !self.shared.eq_enabled();
+                self.shared.set_eq_enabled(on);
+                log_info!("BROKER", "eq: {}", if on { "ON" } else { "OFF" });
+            }
+            Command::ToggleLoop => {
+                let on = !self.shared.loop_enabled();
+                self.shared.set_loop_enabled(on);
+                log_info!("LOOP", "repeat: {}", if on { "ON" } else { "OFF" });
+                self.persist();
+            }
+            // Presentation-side command: the Win32 drain intercepts this and
+            // toggles the window; it never reaches here in normal flow.
+            Command::ToggleWindow => {
+                log_debug!("BROKER", "window toggle is presentation-side");
+            }
             Command::DumpState => {
                 let s = &self.shared;
                 log_info!(
                     "BROKER",
-                    "state dump: phase={} generation={} rate={} frames={} pos={} vol={:.2} eq_on={} gains_cdb={:?}",
+                    "state dump: phase={} generation={} rate={} frames={} pos={} vol={:.2} eq_on={} loop={} gains_cdb={:?}",
                     s.phase(),
                     s.generation(),
                     s.sample_rate.load(Ordering::Relaxed),
@@ -523,6 +558,7 @@ impl Broker {
                     fmt_mmss(s.position()),
                     s.volume(),
                     s.eq_enabled(),
+                    s.loop_enabled(),
                     s.eq_gains_cdb.each_ref().map(|g| g.load(Ordering::Relaxed)),
                 );
                 self.refresh(); // re-print the panel with the dump
@@ -574,6 +610,24 @@ impl Broker {
                 self.persist();
             }
             Status::Finished => {
+                // mpv loop-file: replay the exact source (preserving a custom
+                // YouTube format id when the track carried one). A replay is
+                // just a normal load — generation bump, LOADING, persistence —
+                // and for pipes it means a clean re-open of yt-dlp.
+                let replay = self.shared.loop_enabled().then(|| {
+                    self.track
+                        .as_ref()
+                        .map(|t| t.source.clone())
+                        .or_else(|| self.last_source_raw.as_deref().map(Source::from_raw))
+                });
+                match replay {
+                    Some(Some(source)) => {
+                        log_info!("LOOP", "repeat: replaying {source}");
+                        self.handle_command(Command::Load { source, paused: false });
+                        return; // handle_command already refreshed the panel
+                    }
+                    _ => {}
+                }
                 log_info!("BROKER", "track finished");
                 self.track = None;
                 self.shared.reset_playhead();
@@ -692,10 +746,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// A broker wired to an in-memory sink — no disk I/O in tests.
-    fn broker_with_sink() -> (Broker, Arc<Mutex<Vec<PersistedState>>>) {
+    /// A broker wired to an in-memory sink — no disk I/O in tests. Returns
+    /// the decoder command receiver so tests can observe what the broker
+    /// asked the decoder to do.
+    fn broker_with_sink() -> (
+        Broker,
+        Arc<Mutex<Vec<PersistedState>>>,
+        crossbeam_channel::Receiver<DecoderCmd>,
+    ) {
         let shared = SharedState::new();
-        let (tx, _rx) = crossbeam_channel::bounded::<DecoderCmd>(8);
+        let (tx, rx) = crossbeam_channel::bounded::<DecoderCmd>(8);
         let sink: Arc<Mutex<Vec<PersistedState>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_for_saver = Arc::clone(&sink);
         let broker = Broker::new(shared, DecoderLink::with_interrupt(
@@ -705,12 +765,22 @@ mod tests {
         .with_saver(Arc::new(move |st| {
             sink_for_saver.lock().unwrap().push(st);
         }));
-        (broker, sink)
+        (broker, sink, rx)
+    }
+
+    fn open_youtube(broker: &mut Broker) {
+        broker.handle_status(Status::Opened {
+            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "140".into() },
+            sample_rate: 44_100,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
     }
 
     #[test]
     fn staged_load_opens_paused_and_clears_on_failure() {
-        let (mut broker, _) = broker_with_sink();
+        let (mut broker, _, _rx) = broker_with_sink();
         broker.handle_command(Command::Load {
             source: Source::File("nowhere.mp3".into()),
             paused: true,
@@ -728,7 +798,7 @@ mod tests {
 
     #[test]
     fn opened_consumes_stage_flag_once() {
-        let (mut broker, _) = broker_with_sink();
+        let (mut broker, _, _rx) = broker_with_sink();
         broker.handle_command(Command::Load {
             source: Source::File("a.mp3".into()),
             paused: true,
@@ -759,7 +829,7 @@ mod tests {
 
     #[test]
     fn save_triggers_fire_and_snapshot_matches() {
-        let (mut broker, sink) = broker_with_sink();
+        let (mut broker, sink, _rx) = broker_with_sink();
         broker.handle_command(Command::Volume(0.25));
         broker.handle_command(Command::EqGain { band: Some(2), gain_db: 4.0 });
         broker.handle_status(Status::Opened {
@@ -777,6 +847,91 @@ mod tests {
         assert_eq!(last.volume, 0.5);
         assert_eq!(last.eq_gains[2], 4.0);
         assert_eq!(last.last_track.as_deref(), Some("https://youtu.be/x"));
+    }
+
+    #[test]
+    fn loop_on_replays_track_at_eof() {
+        let (mut broker, sink, rx) = broker_with_sink();
+        broker.handle_command(Command::ToggleLoop);
+        assert!(broker.shared.loop_enabled());
+        open_youtube(&mut broker);
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        broker.handle_status(Status::Finished);
+        // Replayed: a fresh autoplay Load went to the decoder, phase is
+        // LOADING (never dipped through Stopped), and the toggle itself
+        // plus the Opened persist produced exactly two sink writes.
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { .. }))));
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+        assert_eq!(sink.lock().unwrap().len(), 2);
+        assert!(sink.lock().unwrap().last().unwrap().loop_enabled);
+    }
+
+    #[test]
+    fn loop_off_stops_at_eof() {
+        let (mut broker, sink, rx) = broker_with_sink();
+        open_youtube(&mut broker);
+        broker.handle_status(Status::Finished);
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        assert!(rx.try_recv().is_err(), "no replay command without loop");
+        assert_eq!(sink.lock().unwrap().len(), 1); // only the Opened save
+    }
+
+    #[test]
+    fn loop_replay_prefers_custom_format_id() {
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::ToggleLoop);
+        broker.handle_status(Status::Opened {
+            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "251".into() },
+            sample_rate: 48_000,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
+        broker.handle_status(Status::Finished);
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::Youtube { format, .. })) => {
+                assert_eq!(format, "251", "replay must keep the track's format id");
+            }
+            other => panic!("expected replay load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_pause_resumes_and_pauses() {
+        let (mut broker, _, _rx) = broker_with_sink();
+        broker.handle_command(Command::Load {
+            source: Source::File("a.mp3".into()),
+            paused: true,
+        });
+        broker.handle_status(Status::Opened {
+            source: Source::File("a.mp3".into()),
+            sample_rate: 48_000,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
+        assert_eq!(broker.shared.phase(), Phase::Paused);
+        broker.handle_command(Command::TogglePause);
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        broker.handle_command(Command::TogglePause);
+        assert_eq!(broker.shared.phase(), Phase::Paused);
+    }
+
+    #[test]
+    fn toggle_eq_bypasses_without_touching_gains_or_persistence() {
+        let (mut broker, sink, _rx) = broker_with_sink();
+        broker.handle_command(Command::EqGain { band: Some(0), gain_db: 6.0 });
+        let saves = sink.lock().unwrap().len();
+        broker.handle_command(Command::ToggleEq);
+        assert!(!broker.shared.eq_enabled(), "first toggle bypasses EQ");
+        assert_eq!(broker.shared.eq_gains()[0], 6.0, "bypass must not touch gains");
+        broker.handle_command(Command::ToggleEq);
+        assert!(broker.shared.eq_enabled());
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            saves,
+            "eq bypass is runtime-only: no save trigger"
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
+use windows::Win32::UI::Shell::NIN_SELECT;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW,
@@ -47,8 +48,12 @@ use crate::{log_error, log_info, log_warn};
 
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 1000;
-const MENU_TOGGLE: usize = 1;
-const MENU_QUIT: usize = 2;
+/// Tray menu command ids — each dispatches a `Command` through the channel.
+/// (Play/Pause lives on left-click only, not in this menu.)
+const MENU_LOOP: usize = 1;
+const MENU_EQ: usize = 2;
+const MENU_WINDOW: usize = 3;
+const MENU_QUIT: usize = 4;
 
 struct UiState {
     hwnd: HWND,
@@ -257,6 +262,8 @@ fn phase_name(p: Phase) -> &'static str {
 fn drain_commands(s: &mut UiState) -> bool {
     loop {
         match s.cmd_rx.try_recv() {
+            // Presentation-side command: never reaches the broker.
+            Ok(Command::ToggleWindow) => toggle_visible(s),
             Ok(cmd) => {
                 if s.broker.handle_command(cmd) == Flow::Exit {
                     return true;
@@ -282,7 +289,10 @@ fn drain_statuses(s: &mut UiState) {
 
 fn on_tray(s: &mut UiState, lp: LPARAM) {
     match lp.0 as u32 {
-        WM_LBUTTONUP => toggle_visible(s),
+        // Left-click = play/pause, dispatched through the command channel so
+        // the broker stays the single decision point (NIN_SELECT covers
+        // NOTIFYICON_VERSION_4 shells; version 0 delivers WM_LBUTTONUP).
+        WM_LBUTTONUP | NIN_SELECT => post_command(Command::TogglePause),
         WM_RBUTTONUP | WM_CONTEXTMENU => popup_menu(s),
         _ => {}
     }
@@ -300,13 +310,31 @@ fn toggle_visible(s: &mut UiState) {
     }
 }
 
+/// Tray menu selections travel through the same command channel as the
+/// terminal — the menu is a producer, the broker stays the single decision
+/// point (one posted wake per selection; no polling anywhere).
+fn post_command(cmd: Command) {
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.try_send(cmd);
+    }
+    wake_broker();
+}
+
 fn popup_menu(s: &mut UiState) {
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
     };
-    let toggle_label = if s.hidden { w!("show echo") } else { w!("hide echo") };
+    // Query every state RIGHT HERE: labels are built fresh each time the
+    // menu opens, so they always reflect the live loop/EQ. (Play/Pause is
+    // NOT a menu item — left-click on the icon toggles it.)
+    let loop_label = if s.shared.loop_enabled() { w!("Loop: ON") } else { w!("Loop: OFF") };
+    let eq_label = if s.shared.eq_enabled() { w!("EQ: ON") } else { w!("EQ: OFF") };
+    let window_label = if s.hidden { w!("Show Echo") } else { w!("Hide Echo") };
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE, toggle_label);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_LOOP, loop_label);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_EQ, eq_label);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_WINDOW, window_label);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("quit"));
         // KB135788: the menu's owner must be foreground or it won't dismiss.
@@ -324,15 +352,14 @@ fn popup_menu(s: &mut UiState) {
         );
         let _ = DestroyMenu(menu);
         match choice.0 as usize {
-            MENU_TOGGLE => toggle_visible(s),
+            MENU_LOOP => post_command(Command::ToggleLoop),
+            MENU_EQ => post_command(Command::ToggleEq),
+            MENU_WINDOW => post_command(Command::ToggleWindow),
             MENU_QUIT => {
                 log_info!("UI", "tray quit chosen");
-                if let Some(tx) = CMD_TX.get() {
-                    let _ = tx.try_send(Command::Quit);
-                }
-                wake_broker();
+                post_command(Command::Quit);
             }
-            _ => {}
+            _ => {} // dismissed without selection
         }
     }
 }
