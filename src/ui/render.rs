@@ -43,10 +43,11 @@ const FONT_HEIGHT: i32 = -9;
 
 fn accent(phase: Phase) -> [u8; 3] {
     match phase {
-        Phase::Playing => [0xA8, 0xE0, 0xBE], // mint
-        Phase::Paused => [0xE8, 0xC8, 0x8A],  // amber
+        Phase::Playing => [0xA8, 0xE0, 0xBE], // mint — active state, unchanged
+        // Inactive states share the spec magenta (#E436C8).
+        Phase::Paused => [0xE4, 0x36, 0xC8],
         Phase::Loading => [0x96, 0xC8, 0xEB], // sky
-        Phase::Stopped => [0xB0, 0xB0, 0xB8], // ash
+        Phase::Stopped => [0xE4, 0x36, 0xC8],
     }
 }
 
