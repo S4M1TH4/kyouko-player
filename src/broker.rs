@@ -146,6 +146,10 @@ pub enum Status {
     /// Natural end of stream (not Stop).
     Finished,
     Failed { source: Source, reason: String },
+    /// YouTube title resolved asynchronously after Opened (a lightweight
+    /// yt-dlp metadata fetch that must never delay the audio stream).
+    /// Generation-guarded: a stale fetch cannot label a newer track.
+    TrackTitle { generation: u64, title: String },
 }
 
 /// Playback phase. Stored as `u8` in `SharedState`.
@@ -379,6 +383,9 @@ pub struct Broker {
     /// Raw form of the most recently OPENED source — survives Stop/Finished
     /// (where `track` is cleared) so a volume tweak never erases last_track.
     last_source_raw: Option<String>,
+    /// A YouTube title that resolved before its Opened landed (metadata
+    /// fetch can beat the first decoded packet). Generation-tagged.
+    pending_title: Option<(u64, String)>,
     /// Installed by main; writes PersistedState to disk. A closure keeps the
     /// broker I/O-free (and testable).
     saver: Option<Arc<dyn Fn(PersistedState) + Send + Sync>>,
@@ -394,6 +401,7 @@ impl Broker {
             view_dirty: false,
             stage_paused: false,
             last_source_raw: None,
+            pending_title: None,
             saver: None,
         };
         broker.refresh();
@@ -589,6 +597,15 @@ impl Broker {
                         .unwrap_or_default()
                 );
                 self.last_source_raw = Some(source.raw().to_string());
+                let generation = self.shared.generation();
+                let title = match title {
+                    Some(t) => Some(t),
+                    // A resolver may have beaten the first decoded packet.
+                    None => self
+                        .pending_title
+                        .take_if(|(g, _)| *g == generation)
+                        .map(|(_, t)| t),
+                };
                 self.track = Some(TrackMeta { source, title, duration, sample_rate, channels });
                 self.shared.reset_playhead();
                 // A staged load resolves to Paused instead of Playing: the
@@ -633,6 +650,20 @@ impl Broker {
                 self.track = None;
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "track finished");
+            }
+            Status::TrackTitle { generation, title } => {
+                // Guard: a slow resolver for a dead track must not relabel
+                // the current one.
+                if generation == self.shared.generation() {
+                    if let Some(track) = &mut self.track {
+                        log_info!("BROKER", "track title resolved: {title}");
+                        track.title = Some(title);
+                    } else {
+                        // Opened has not landed yet — stash for it.
+                        self.pending_title = Some((generation, title));
+                    }
+                    self.refresh();
+                }
             }
             Status::Failed { source, reason } => {
                 log_error!("BROKER", "failed to open {source}: {reason}");
@@ -933,6 +964,38 @@ mod tests {
             saves,
             "eq bypass is runtime-only: no save trigger"
         );
+    }
+
+    #[test]
+    fn track_title_applies_only_for_live_generation() {
+        let (mut broker, _, _rx) = broker_with_sink();
+        let current_gen = broker.shared().generation();
+        // Resolved BEFORE Opened: stashed, then applied when Opened lands.
+        broker.handle_status(Status::TrackTitle {
+            generation: current_gen,
+            title: "Early Title".into(),
+        });
+        broker.handle_status(Status::Opened {
+            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "140".into() },
+            sample_rate: 44_100,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
+        assert!(broker.view().contains("Early Title"), "stashed title applied on Opened");
+        // A STALE resolver (unrelated generation) must be ignored.
+        broker.handle_status(Status::TrackTitle {
+            generation: current_gen.wrapping_add(100),
+            title: "Wrong Track".into(),
+        });
+        assert!(broker.view().contains("Early Title"));
+        assert!(!broker.view().contains("Wrong Track"));
+        // A live-generation resolver updates the panel in place.
+        broker.handle_status(Status::TrackTitle {
+            generation: broker.shared().generation(),
+            title: "Resolved Title".into(),
+        });
+        assert!(broker.view().contains("Resolved Title"));
     }
 
     #[test]

@@ -554,6 +554,42 @@ fn send_chunk(
     }
 }
 
+/// Transient metadata fetch: `yt-dlp --print title` is simulate-only — it
+/// exits on its own right after the metadata arrives, so there is nothing to
+/// orphan beyond a few seconds and nothing to poll. Detached; failure is
+/// logged and the panel simply keeps the URL.
+fn spawn_title_resolver(url: String, generation: u64, status_tx: Sender<Status>) {
+    let _ = thread::Builder::new()
+        .name("kyouko-title".into())
+        .spawn(move || match Command::new("yt-dlp")
+            .args(["--no-playlist", "--print", "title", &url])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let title = clean_title(&String::from_utf8_lossy(&out.stdout));
+                if title.is_empty() {
+                    log_warn!("TITLE", "resolved to an empty title — keeping URL");
+                } else {
+                    log_info!("TITLE", "resolved: {title}");
+                    let _ = status_tx.send(Status::TrackTitle { generation, title });
+                    crate::ui::wake_status();
+                }
+            }
+            Ok(_) => log_warn!("TITLE", "yt-dlp exited nonzero during title fetch"),
+            Err(e) => log_warn!("TITLE", "title fetch failed: {e}"),
+        });
+}
+
+/// One line, trimmed, control-char-free, capped — terminal titles must never
+/// smuggle newlines into the panel renderer.
+fn clean_title(raw: &str) -> String {
+    let line = raw.lines().next().unwrap_or("").trim();
+    line.chars().take(120).collect()
+}
+
 fn play_source(
     shared: &Arc<SharedState>,
     cmds: &Receiver<DecoderCmd>,
@@ -581,6 +617,13 @@ fn play_source(
         track.duration.map(|d| format!(", {}", d.as_secs_f32() as u32)).unwrap_or_default(),
         track.title
     );
+    // YouTube containers carry no title metadata — resolve it out-of-band
+    // while the audio stream keeps flowing. The resolver is a transient
+    // simulate-only yt-dlp that parks on its own pipe (zero polling) and
+    // reports through the status channel; failure just leaves the URL.
+    if let Source::Youtube { url, .. } = &source {
+        spawn_title_resolver(url.clone(), generation, status_tx.clone());
+    }
 
     // Device-side targets. `dst_channels` can't be finalized yet when the
     // container withholds the source layout (AAC-in-fMP4 via yt-dlp) — it is
@@ -999,6 +1042,15 @@ mod tests {
         let mut out = Vec::new();
         rs.process(&input, 4800, &mut out);
         assert!((out.len() as i64 - 4410 * 2).abs() <= 4, "got {} samples", out.len());
+    }
+
+    #[test]
+    fn clean_title_takes_first_line_and_caps() {
+        assert_eq!(clean_title("Neo Tokyo [HD]\nsecond line\r\n"), "Neo Tokyo [HD]");
+        assert_eq!(clean_title("  padded  "), "padded");
+        assert_eq!(clean_title(""), "");
+        let long = "x".repeat(300);
+        assert_eq!(clean_title(&long).chars().count(), 120);
     }
 
     #[test]
