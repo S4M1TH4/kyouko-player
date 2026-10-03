@@ -63,9 +63,11 @@ fn parse(line: &str) -> Option<Command> {
         None => (line, ""),
     };
     match head {
-        "play" | "load" => {
+        // Concise command keys (v2). Legacy long forms were removed on purpose
+        // — `p`/`y`/`r`/`s`/`q` are the whole story, plus vol/eq/l/state/icon.
+        "p" => {
             if rest.is_empty() {
-                log_warn!("TERM", "usage: play <path>");
+                log_warn!("TERM", "usage: p <path>");
                 None
             } else {
                 // Tolerate shell-style quoting around paths with spaces.
@@ -79,7 +81,7 @@ fn parse(line: &str) -> Option<Command> {
                 })
             }
         }
-        "yt" => {
+        "y" => {
             let mut parts = rest.split_whitespace();
             match (parts.next(), parts.next()) {
                 (Some(url), fmt) => Some(Command::Load {
@@ -90,15 +92,14 @@ fn parse(line: &str) -> Option<Command> {
                     paused: false,
                 }),
                 _ => {
-                    log_warn!("TERM", "usage: yt <url> [format_id] (default 140 = m4a 128k)");
+                    log_warn!("TERM", "usage: y <url> [format_id] (default 140 = m4a 128k)");
                     None
                 }
             }
         }
-        "pause" => Some(Command::Pause),
-        "resume" => Some(Command::Resume),
-        "toggle" | "p" => Some(Command::TogglePause),
-        "stop" => Some(Command::Stop),
+        // One key for the whole play/pause/resume cycle (spacebar-style).
+        "r" => Some(Command::TogglePause),
+        "s" => Some(Command::Stop),
         "vol" | "volume" => match rest.parse::<f64>() {
             Ok(v) if (0.0..=100.0).contains(&v) => Some(Command::SetVolume((v / 100.0) as f32)),
             Ok(v) => {
@@ -118,7 +119,7 @@ fn parse(line: &str) -> Option<Command> {
             println!("{}", crate::ui::glyph::glyph_ascii());
             None
         }
-        "quit" | "exit" => Some(Command::Quit),
+        "q" => Some(Command::Quit),
         "help" | "?" => {
             print_help();
             None
@@ -173,15 +174,76 @@ fn print_help() {
         .join(" ");
     println!(
         "commands:\n  \
-         play <path>            load a local file (audio or video, decoded as audio)\n  \
-         yt <url> [format_id]   stream from YouTube via yt-dlp (default 140 = m4a 128k)\n  \
-         pause | resume | toggle | stop\n  \
-         vol <0-100>            set volume percent\n  \
+         p <path>              load a local file (audio or video, decoded as audio)\n  \
+         y <url> [format_id]   stream from YouTube via yt-dlp (default 140 = m4a 128k)\n  \
+         r                     toggle play / pause / resume\n  \
+         s                     stop playback\n  \
+         vol <0-100>           set volume percent\n  \
          eq <0-9|all> <gain_dB> band gains {bands} Hz, {:+}..{:+} dB\n  \
          eq on | off | reset\n  \
-         state                  dump full state\n  \
-         quit                   graceful shutdown",
+         l / loop              toggle track repeat mode ON/OFF\n  \
+         state                 dump full state\n  \
+         icon                  print the tray glyph\n  \
+         q                     graceful shutdown",
         -12.0,
         12.0
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concise_keys_map_to_commands() {
+        assert!(matches!(
+            parse("p C:\\m\\a.flac"),
+            Some(Command::Load {
+                source: Source::File(_),
+                paused: false
+            })
+        ));
+        assert!(matches!(
+            parse("y https://youtu.be/x 251"),
+            Some(Command::Load {
+                source: Source::Youtube { format, .. },
+                paused: false
+            }) if format == "251"
+        ));
+        assert!(matches!(parse("y https://youtu.be/x"), Some(Command::Load { .. })));
+        assert!(matches!(parse("r"), Some(Command::TogglePause)));
+        assert!(matches!(parse("s"), Some(Command::Stop)));
+        assert!(matches!(parse("q"), Some(Command::Quit)));
+        assert!(matches!(parse("l"), Some(Command::ToggleLoop)));
+        assert!(matches!(
+            parse("vol 50"),
+            Some(Command::SetVolume(v)) if (v - 0.5).abs() < 1e-6
+        ));
+        assert!(matches!(
+            parse("eq 0 3"),
+            Some(Command::EqGain {
+                band: Some(0),
+                gain_db
+            }) if gain_db == 3.0
+        ));
+    }
+
+    #[test]
+    fn legacy_long_forms_are_gone() {
+        for line in ["play x", "load x", "yt x", "pause", "resume", "toggle", "stop", "quit", "exit"] {
+            assert!(parse(line).is_none(), "'{line}' must no longer parse");
+        }
+    }
+
+    #[test]
+    fn quoted_paths_with_spaces_survive() {
+        match parse("p \"C:\\My Music\\a b.flac\"") {
+            Some(Command::Load {
+                source: Source::File(p),
+                ..
+            }) => assert_eq!(p, "C:\\My Music\\a b.flac"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(parse("p").is_none(), "bare p needs a path");
+    }
 }

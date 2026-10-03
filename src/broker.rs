@@ -97,9 +97,7 @@ pub enum Command {
     /// `paused: true` stages the source in the decoder (buffered, resume is
     /// instant) while the output stays stopped — used for last-track restore.
     Load { source: Source, paused: bool },
-    Pause,
-    Resume,
-    /// Flip between Playing and Paused (tray menu + terminal toggle).
+    /// Flip between Playing and Paused (tray menu + terminal `r`).
     TogglePause,
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
@@ -479,20 +477,6 @@ impl Broker {
                 self.shared.bump_generation();
                 self.set_phase(Phase::Loading, "load requested");
                 self.send_decoder(DecoderCmd::Load(source));
-            }
-            Command::Pause => {
-                if self.shared.phase() == Phase::Playing {
-                    self.set_phase(Phase::Paused, "pause");
-                } else {
-                    log_warn!("BROKER", "pause ignored while {}", self.shared.phase());
-                }
-            }
-            Command::Resume => {
-                if self.shared.phase() == Phase::Paused {
-                    self.set_phase(Phase::Playing, "resume");
-                } else {
-                    log_warn!("BROKER", "resume ignored while {}", self.shared.phase());
-                }
             }
             Command::TogglePause => match self.shared.phase() {
                 Phase::Playing => self.set_phase(Phase::Paused, "toggle"),
