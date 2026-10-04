@@ -692,24 +692,10 @@ fn fmt_mmss(d: Duration) -> String {
     format!("{:02}:{:02}", s / 60, s % 60)
 }
 
+/// Borderless: no frame, no gutters — just the text, truncated at 28
+/// columns so the layered window keeps a stable width.
 fn row(content: &str) -> String {
-    let mut s = String::with_capacity(32);
-    s.push('|');
-    s.push(' ');
-    let mut w = 0;
-    for c in content.chars() {
-        if w >= 28 {
-            break;
-        }
-        s.push(c);
-        w += 1;
-    }
-    for _ in w..28 {
-        s.push(' ');
-    }
-    s.push(' ');
-    s.push('|');
-    s
+    content.chars().take(28).collect()
 }
 
 fn band_row(labels: &[&str]) -> String {
@@ -722,7 +708,8 @@ fn gain_row(shared: &SharedState, start: usize) -> String {
         .collect()
 }
 
-/// 8 rows, 32 columns — sized for the 200 px floating window in step 2.
+/// Borderless panel — plain text lines only (the frame was removed by
+/// design); the layered window's own edges provide the boundary.
 pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     let timeline = match track.and_then(|t| t.duration) {
         Some(d) => format!("{} / {}", fmt_mmss(shared.position()), fmt_mmss(d)),
@@ -737,7 +724,6 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     let bar = format!("{}{}", "|".repeat(cells), "-".repeat(10 - cells));
 
     let mut p = String::with_capacity(400);
-    p.push_str("+------------------------------+\n");
     p.push_str(&row(&format!("KYOUKO    {}", shared.phase())));
     p.push('\n');
     p.push_str(&row(&format!("time : {timeline}")));
@@ -758,8 +744,6 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     p.push_str(&row(&band_row(&EQ_BAND_LABELS[5..])));
     p.push('\n');
     p.push_str(&row(&gain_row(shared, 5)));
-    p.push('\n');
-    p.push_str("+------------------------------+");
     p
 }
 
