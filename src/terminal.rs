@@ -84,13 +84,17 @@ fn parse(line: &str) -> Option<Command> {
         "y" => {
             let mut parts = rest.split_whitespace();
             match (parts.next(), parts.next()) {
-                (Some(url), fmt) => Some(Command::Load {
-                    source: Source::Youtube {
-                        url: url.to_string(),
-                        format: fmt.unwrap_or("140").to_string(),
-                    },
-                    paused: false,
-                }),
+                (Some(url), fmt) => {
+                    let url = url.to_string();
+                    Some(Command::Load {
+                        source: Source::Youtube {
+                            playlist_index: crate::broker::playlist_index_of(&url),
+                            url,
+                            format: fmt.unwrap_or("140").to_string(),
+                        },
+                        paused: false,
+                    })
+                }
                 _ => {
                     log_warn!("TERM", "usage: y <url> [format_id] (default 140 = m4a 128k)");
                     None

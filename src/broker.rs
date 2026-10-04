@@ -49,7 +49,9 @@ pub enum Source {
     /// Path as typed on the terminal (wide-char conversion happens at open).
     File(String),
     /// `format` is a yt-dlp format id; default "140" = m4a 128 kbps.
-    Youtube { url: String, format: String },
+    /// `playlist_index: Some(n)` marks a playlist-shaped URL playing entry n
+    /// — at EOF the broker advances to n+1 (see Finished handling).
+    Youtube { url: String, format: String, playlist_index: Option<usize> },
 }
 
 impl Source {
@@ -71,10 +73,15 @@ impl Source {
     }
 
     /// Inverse of `raw`: URL-shaped strings stream via yt-dlp, everything
-    /// else opens as a local file.
+    /// else opens as a local file. Playlist-shaped URLs (a `list=` parameter
+    /// without an explicit video id) become advancing sources at entry 1.
     pub fn from_raw(raw: &str) -> Source {
         if raw.starts_with("http://") || raw.starts_with("https://") {
-            Source::Youtube { url: raw.to_string(), format: "140".to_string() }
+            Source::Youtube {
+                url: raw.to_string(),
+                format: "140".to_string(),
+                playlist_index: playlist_index_of(raw),
+            }
         } else {
             Source::File(raw.to_string())
         }
@@ -85,8 +92,32 @@ impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Source::File(p) => write!(f, "file({p})"),
-            Source::Youtube { url, format } => write!(f, "youtube({url} [fmt {format}])"),
+            Source::Youtube { url, format, .. } => {
+                write!(f, "youtube({url} [fmt {format}])")
+            }
         }
+    }
+}
+
+/// A URL is playlist-shaped when it carries a `list=` parameter but no
+/// explicit video id (`watch?v=` / `youtu.be/`) — the latter stays a single
+/// video even if it happens to sit inside a playlist.
+pub fn playlist_index_of(url: &str) -> Option<usize> {
+    let has_list = url.contains("list=");
+    let is_video = url.contains("watch?v=") || url.contains("youtu.be/");
+    (has_list && !is_video).then_some(1)
+}
+
+/// Next source in a playlist run: only playlist-shaped YouTube sources
+/// advance (index n -> n+1). Everything else has no "next".
+fn advance_playlist(source: &Source) -> Option<Source> {
+    match source {
+        Source::Youtube { url, format, playlist_index: Some(n) } => Some(Source::Youtube {
+            url: url.clone(),
+            format: format.clone(),
+            playlist_index: Some(n + 1),
+        }),
+        _ => None,
     }
 }
 
@@ -144,10 +175,6 @@ pub enum Status {
     /// Natural end of stream (not Stop).
     Finished,
     Failed { source: Source, reason: String },
-    /// YouTube title resolved asynchronously after Opened (a lightweight
-    /// yt-dlp metadata fetch that must never delay the audio stream).
-    /// Generation-guarded: a stale fetch cannot label a newer track.
-    TrackTitle { generation: u64, title: String },
 }
 
 /// Playback phase. Stored as `u8` in `SharedState`.
@@ -381,9 +408,7 @@ pub struct Broker {
     /// Raw form of the most recently OPENED source — survives Stop/Finished
     /// (where `track` is cleared) so a volume tweak never erases last_track.
     last_source_raw: Option<String>,
-    /// A YouTube title that resolved before its Opened landed (metadata
-    /// fetch can beat the first decoded packet). Generation-tagged.
-    pending_title: Option<(u64, String)>,
+
     /// Installed by main; writes PersistedState to disk. A closure keeps the
     /// broker I/O-free (and testable).
     saver: Option<Arc<dyn Fn(PersistedState) + Send + Sync>>,
@@ -399,7 +424,6 @@ impl Broker {
             view_dirty: false,
             stage_paused: false,
             last_source_raw: None,
-            pending_title: None,
             saver: None,
         };
         broker.refresh();
@@ -581,15 +605,6 @@ impl Broker {
                         .unwrap_or_default()
                 );
                 self.last_source_raw = Some(source.raw().to_string());
-                let generation = self.shared.generation();
-                let title = match title {
-                    Some(t) => Some(t),
-                    // A resolver may have beaten the first decoded packet.
-                    None => self
-                        .pending_title
-                        .take_if(|(g, _)| *g == generation)
-                        .map(|(_, t)| t),
-                };
                 self.track = Some(TrackMeta { source, title, duration, sample_rate, channels });
                 self.shared.reset_playhead();
                 // A staged load resolves to Paused instead of Playing: the
@@ -612,42 +627,33 @@ impl Broker {
                 self.persist();
             }
             Status::Finished => {
-                // mpv loop-file: replay the exact source (preserving a custom
-                // YouTube format id when the track carried one). A replay is
-                // just a normal load — generation bump, LOADING, persistence —
-                // and for pipes it means a clean re-open of yt-dlp.
+                // 1. mpv loop-file: replay the exact source (preserving a
+                //    custom YouTube format id when the track carries one).
                 let replay = self.shared.loop_enabled().then(|| {
                     self.track
                         .as_ref()
                         .map(|t| t.source.clone())
                         .or_else(|| self.last_source_raw.as_deref().map(Source::from_raw))
                 });
-                match replay {
-                    Some(Some(source)) => {
-                        log_info!("LOOP", "repeat: replaying {source}");
-                        self.handle_command(Command::Load { source, paused: false });
-                        return; // handle_command already refreshed the panel
-                    }
-                    _ => {}
+                if let Some(Some(source)) = replay {
+                    log_info!("LOOP", "repeat: replaying {source}");
+                    self.handle_command(Command::Load { source, paused: false });
+                    return; // handle_command already refreshed the panel
+                }
+                // 2. Playlist progression: a finished playlist entry advances
+                //    to the next index via a fresh (sequential, single-process)
+                //    load — title prefetch included.
+                if let Some(source) =
+                    self.track.as_ref().map(|t| t.source.clone()).and_then(|src| advance_playlist(&src))
+                {
+                    log_info!("BROKER", "playlist: advancing to entry {:?}", source);
+                    self.handle_command(Command::Load { source, paused: false });
+                    return;
                 }
                 log_info!("BROKER", "track finished");
                 self.track = None;
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "track finished");
-            }
-            Status::TrackTitle { generation, title } => {
-                // Guard: a slow resolver for a dead track must not relabel
-                // the current one.
-                if generation == self.shared.generation() {
-                    if let Some(track) = &mut self.track {
-                        log_info!("BROKER", "track title resolved: {title}");
-                        track.title = Some(title);
-                    } else {
-                        // Opened has not landed yet — stash for it.
-                        self.pending_title = Some((generation, title));
-                    }
-                    self.refresh();
-                }
             }
             Status::Failed { source, reason } => {
                 log_error!("BROKER", "failed to open {source}: {reason}");
@@ -786,7 +792,11 @@ mod tests {
 
     fn open_youtube(broker: &mut Broker) {
         broker.handle_status(Status::Opened {
-            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "140".into() },
+            source: Source::Youtube {
+                url: "https://youtu.be/x".into(),
+                format: "140".into(),
+                playlist_index: None,
+            },
             sample_rate: 44_100,
             channels: 2,
             title: None,
@@ -849,7 +859,11 @@ mod tests {
         broker.handle_command(Command::SetVolume(0.25));
         broker.handle_command(Command::EqGain { band: Some(2), gain_db: 4.0 });
         broker.handle_status(Status::Opened {
-            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "140".into() },
+            source: Source::Youtube {
+                url: "https://youtu.be/x".into(),
+                format: "140".into(),
+                playlist_index: None,
+            },
             sample_rate: 44_100,
             channels: 2,
             title: None,
@@ -897,7 +911,11 @@ mod tests {
         let (mut broker, _, rx) = broker_with_sink();
         broker.handle_command(Command::ToggleLoop);
         broker.handle_status(Status::Opened {
-            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "251".into() },
+            source: Source::Youtube {
+                url: "https://youtu.be/x".into(),
+                format: "251".into(),
+                playlist_index: None,
+            },
             sample_rate: 48_000,
             channels: 2,
             title: None,
@@ -951,35 +969,51 @@ mod tests {
     }
 
     #[test]
-    fn track_title_applies_only_for_live_generation() {
-        let (mut broker, _, _rx) = broker_with_sink();
-        let current_gen = broker.shared().generation();
-        // Resolved BEFORE Opened: stashed, then applied when Opened lands.
-        broker.handle_status(Status::TrackTitle {
-            generation: current_gen,
-            title: "Early Title".into(),
-        });
+    fn finished_playlist_entry_advances_to_next() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let pl = |n: usize| Source::Youtube {
+            url: "https://youtube.com/playlist?list=PLtest".into(),
+            format: "140".into(),
+            playlist_index: Some(n),
+        };
+        broker.handle_command(Command::Load { source: pl(1), paused: false });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { .. }))));
         broker.handle_status(Status::Opened {
-            source: Source::Youtube { url: "https://youtu.be/x".into(), format: "140".into() },
+            source: pl(1),
             sample_rate: 44_100,
             channels: 2,
-            title: None,
+            title: Some("Entry One".into()),
             duration: None,
         });
-        assert!(broker.view().contains("Early Title"), "stashed title applied on Opened");
-        // A STALE resolver (unrelated generation) must be ignored.
-        broker.handle_status(Status::TrackTitle {
-            generation: current_gen.wrapping_add(100),
-            title: "Wrong Track".into(),
-        });
-        assert!(broker.view().contains("Early Title"));
-        assert!(!broker.view().contains("Wrong Track"));
-        // A live-generation resolver updates the panel in place.
-        broker.handle_status(Status::TrackTitle {
-            generation: broker.shared().generation(),
-            title: "Resolved Title".into(),
-        });
-        assert!(broker.view().contains("Resolved Title"));
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        broker.handle_status(Status::Finished);
+        // Advanced: a Load for entry 2 is issued and the phase is LOADING —
+        // the playlist never dips through Stopped.
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::Youtube { url, playlist_index: Some(2), .. })) => {
+                assert_eq!(url, "https://youtube.com/playlist?list=PLtest");
+            }
+            other => panic!("expected playlist advance, got {other:?}"),
+        }
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+    }
+
+    #[test]
+    fn playlist_urls_gain_an_index_videos_do_not() {
+        match Source::from_raw("https://youtube.com/playlist?list=PLx") {
+            Source::Youtube {
+                playlist_index: Some(1),
+                ..
+            } => {}
+            other => panic!("playlist URL must advance: {other:?}"),
+        }
+        match Source::from_raw("https://www.youtube.com/watch?v=abc&list=PLx") {
+            Source::Youtube {
+                playlist_index: None,
+                ..
+            } => {}
+            other => panic!("watch URL must stay a single video: {other:?}"),
+        }
     }
 
     #[test]
@@ -987,7 +1021,7 @@ mod tests {
         assert_eq!(Source::from_raw("C:\\m\\a.flac").raw(), "C:\\m\\a.flac");
         assert!(matches!(
             Source::from_raw("https://youtu.be/x"),
-            Source::Youtube { url, format } if url == "https://youtu.be/x" && format == "140"
+            Source::Youtube { url, format, .. } if url == "https://youtu.be/x" && format == "140"
         ));
         assert!(matches!(Source::from_raw("song.mp3"), Source::File(_)));
     }

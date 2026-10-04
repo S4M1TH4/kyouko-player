@@ -369,6 +369,33 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Exact yt-dlp command line for a load. Pure so the playlist-index logic
+/// (which governs crawling bounds) is unit-testable without spawning.
+fn yt_dlp_args(format: &str, playlist_index: Option<usize>, url: &str) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut a: Vec<OsString> = Vec::new();
+    match playlist_index {
+        // Advancing playlist entry n: the list is the source of truth.
+        Some(n) => {
+            a.push("--playlist-items".into());
+            a.push(n.to_string().into());
+        }
+        // Single video (or an untracked URL): --no-playlist alone, and a
+        // --playlist-items 1 bound so a playlist-only URL can never crawl.
+        None => {
+            a.push("--no-playlist".into());
+            a.push("--playlist-items".into());
+            a.push("1".into());
+        }
+    }
+    a.push("-f".into());
+    a.push(format.into());
+    a.push("-o".into());
+    a.push("-".into());
+    a.push(url.into());
+    a
+}
+
 fn open_track(source: &Source, child_slot: &Arc<Mutex<Option<Child>>>) -> Result<ActiveTrack, String> {
     let mut err_tail: Option<Arc<Mutex<Vec<u8>>>> = None;
     match open_track_inner(source, child_slot, &mut err_tail) {
@@ -408,10 +435,14 @@ fn open_track_inner(
             let mss = MediaSourceStream::new(Box::new(file), Default::default());
             (mss, None)
         }
-        Source::Youtube { url, format } => {
-            log_info!("DECODER", "spawning yt-dlp -f {format}");
+        Source::Youtube { url, format, playlist_index } => {
+            log_info!(
+                "DECODER",
+                "spawning yt-dlp -f {format} (playlist entry {:?})",
+                playlist_index
+            );
             let mut child = Command::new("yt-dlp")
-                .args(["--no-playlist", "-f", format, "-o", "-", url])
+                .args(yt_dlp_args(format, *playlist_index, url))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -554,40 +585,61 @@ fn send_chunk(
     }
 }
 
-/// Transient metadata fetch: `yt-dlp --print title` is simulate-only — it
-/// exits on its own right after the metadata arrives, so there is nothing to
-/// orphan beyond a few seconds and nothing to poll. Detached; failure is
-/// logged and the panel simply keeps the URL.
-fn spawn_title_resolver(url: String, generation: u64, status_tx: Sender<Status>) {
-    let _ = thread::Builder::new()
-        .name("kyouko-title".into())
-        .spawn(move || match Command::new("yt-dlp")
-            .args(["--no-playlist", "--print", "title", &url])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-        {
-            Ok(out) if out.status.success() => {
-                let title = clean_title(&String::from_utf8_lossy(&out.stdout));
-                if title.is_empty() {
-                    log_warn!("TITLE", "resolved to an empty title — keeping URL");
-                } else {
-                    log_info!("TITLE", "resolved: {title}");
-                    let _ = status_tx.send(Status::TrackTitle { generation, title });
-                    crate::ui::wake_status();
-                }
-            }
-            Ok(_) => log_warn!("TITLE", "yt-dlp exited nonzero during title fetch"),
-            Err(e) => log_warn!("TITLE", "title fetch failed: {e}"),
-        });
-}
-
 /// One line, trimmed, control-char-free, capped — terminal titles must never
 /// smuggle newlines into the panel renderer.
 fn clean_title(raw: &str) -> String {
     let line = raw.lines().next().unwrap_or("").trim();
     line.chars().take(120).collect()
+}
+
+/// Single-shot title resolution, run SEQUENTIALLY on the decoder thread
+/// before the audio child is spawned — there is never more than one yt-dlp
+/// process alive per load. The child lives in the shared ChildGuard slot, so
+/// `AudioControls::interrupt()` (Stop / Skip / Shutdown) kills it mid-fetch;
+/// the parked `read_to_string` unblocks with EOF and it is reaped at once.
+/// Failure of any kind -> None (the panel keeps the URL; playback proceeds).
+fn fetch_title_blocking(
+    url: &str,
+    playlist_index: Option<usize>,
+    child_slot: &Arc<Mutex<Option<Child>>>,
+) -> Option<String> {
+    let mut args: Vec<std::ffi::OsString> = vec!["--print".into(), "title".into()];
+    match playlist_index {
+        Some(n) => {
+            args.push("--playlist-items".into());
+            args.push(n.to_string().into());
+        }
+        None => args.push("--no-playlist".into()),
+    }
+    args.push(url.into());
+    let mut child = Command::new("yt-dlp")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    if let Ok(mut slot) = child_slot.lock() {
+        *slot = Some(child);
+    }
+    log_info!("DECODER", "resolving title (single-shot, tracked)");
+    let mut raw = String::new();
+    let read_ok = std::io::BufReader::new(stdout).read_to_string(&mut raw).is_ok();
+    // Reap regardless of how the read ended (natural exit or kill).
+    if let Ok(mut slot) = child_slot.lock() {
+        if let Some(mut c) = slot.take() {
+            let _ = c.kill(); // no-op after natural exit
+            let _ = c.wait();
+        }
+    }
+    let title = if read_ok { clean_title(&raw) } else { String::new() };
+    if title.is_empty() {
+        log_warn!("DECODER", "title fetch failed — keeping URL");
+        return None;
+    }
+    log_info!("DECODER", "title resolved: {title}");
+    Some(title)
 }
 
 fn play_source(
@@ -600,6 +652,16 @@ fn play_source(
     source: Source,
 ) -> PlayExit {
     let generation = shared.generation();
+    // Single-shot, SEQUENTIAL title resolution: one yt-dlp at a time, ever.
+    // The prefetch child lives in the same ChildGuard slot as the audio
+    // child would, so Stop/Skip/Shutdown kill it mid-fetch (its parked read
+    // unblocks with EOF) and it is reaped immediately.
+    let mut resolved_title = match &source {
+        Source::Youtube { url, playlist_index, .. } => {
+            fetch_title_blocking(url, *playlist_index, child_slot)
+        }
+        _ => None,
+    };
     let mut track = match open_track(&source, child_slot) {
         Ok(t) => t,
         Err(reason) => {
@@ -617,13 +679,6 @@ fn play_source(
         track.duration.map(|d| format!(", {}", d.as_secs_f32() as u32)).unwrap_or_default(),
         track.title
     );
-    // YouTube containers carry no title metadata — resolve it out-of-band
-    // while the audio stream keeps flowing. The resolver is a transient
-    // simulate-only yt-dlp that parks on its own pipe (zero polling) and
-    // reports through the status channel; failure just leaves the URL.
-    if let Source::Youtube { url, .. } = &source {
-        spawn_title_resolver(url.clone(), generation, status_tx.clone());
-    }
 
     // Device-side targets. `dst_channels` can't be finalized yet when the
     // container withholds the source layout (AAC-in-fMP4 via yt-dlp) — it is
@@ -725,11 +780,13 @@ fn play_source(
             };
             chunk_samples = CHUNK_FRAMES * dst_channels;
             pending.reserve(chunk_samples * 2);
+            // Container tags win (local files); the prefetched YouTube
+            // title fills the gap.
             let _ = status_tx.send(Status::Opened {
                 source: source.clone(),
                 sample_rate: track.sample_rate,
                 channels: track.channels as u16,
-                title: track.title.take(),
+                title: track.title.take().or_else(|| resolved_title.take()),
                 duration: track.duration,
             });
             crate::ui::wake_status();
@@ -1051,6 +1108,27 @@ mod tests {
         assert_eq!(clean_title(""), "");
         let long = "x".repeat(300);
         assert_eq!(clean_title(&long).chars().count(), 120);
+    }
+
+    #[test]
+    fn yt_dlp_args_bound_by_playlist_index() {
+        let to_str = |a: &std::ffi::OsString| a.to_string_lossy().to_string();
+
+        let single = yt_dlp_args("140", None, "u");
+        let single: Vec<String> = single.iter().map(to_str).collect();
+        assert!(single.contains(&"--no-playlist".to_string()));
+        let i = single.iter().position(|a| a == "--playlist-items").unwrap();
+        assert_eq!(single[i + 1], "1");
+
+        let third = yt_dlp_args("140", Some(3), "u");
+        let third: Vec<String> = third.iter().map(to_str).collect();
+        assert!(
+            !third.contains(&"--no-playlist".to_string()),
+            "playlist entry must not force --no-playlist"
+        );
+        let i = third.iter().position(|a| a == "--playlist-items").unwrap();
+        assert_eq!(third[i + 1], "3");
+        assert_eq!(third.last().unwrap(), "u");
     }
 
     #[test]
