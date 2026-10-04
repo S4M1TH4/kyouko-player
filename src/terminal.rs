@@ -103,6 +103,13 @@ fn parse(line: &str) -> Option<Command> {
         }
         // One key for the whole play/pause/resume cycle (spacebar-style).
         "r" => Some(Command::TogglePause),
+        // Seek +/-5 seconds. `.` and `,` mirror the media-player convention
+        // (right = forward, left = backward).
+        "." => Some(Command::SeekRelative(5.0)),
+        "," => Some(Command::SeekRelative(-5.0)),
+        // Track navigation (distinct from ./, which are seek keys).
+        ">" => Some(Command::NextTrack),
+        "<" => Some(Command::PrevTrack),
         "s" => Some(Command::Stop),
         "vol" | "volume" => match rest.parse::<f64>() {
             Ok(v) if (0.0..=100.0).contains(&v) => Some(Command::SetVolume((v / 100.0) as f32)),
@@ -181,6 +188,8 @@ fn print_help() {
          p <path>              load a local file (audio or video, decoded as audio)\n  \
          y <url> [format_id]   stream from YouTube via yt-dlp (default 140 = m4a 128k)\n  \
          r                     toggle play / pause / resume\n  \
+         . / ,                 seek +5s / -5s\n  \
+         > / <                 next / previous track (playlist item)\n  \
          s                     stop playback\n  \
          vol <0-100>           set volume percent\n  \
          eq <0-9|all> <gain_dB> band gains {bands} Hz, {:+}..{:+} dB\n  \
@@ -207,6 +216,10 @@ mod tests {
                 paused: false
             })
         ));
+        assert!(matches!(parse("."), Some(Command::SeekRelative(d)) if d == 5.0));
+        assert!(matches!(parse(","), Some(Command::SeekRelative(d)) if d == -5.0));
+        assert!(matches!(parse(">"), Some(Command::NextTrack)));
+        assert!(matches!(parse("<"), Some(Command::PrevTrack)));
         assert!(matches!(
             parse("y https://youtu.be/x 251"),
             Some(Command::Load {

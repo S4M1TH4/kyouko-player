@@ -130,6 +130,12 @@ pub enum Command {
     Load { source: Source, paused: bool },
     /// Flip between Playing and Paused (tray menu + terminal `r`).
     TogglePause,
+    /// Jump the playhead by a signed offset in seconds (terminal `.` / `,`).
+    SeekRelative(f64),
+    /// Next / previous track: playlist sources step their entry index
+    /// (clamped at the start); everything else restarts from 00:00.
+    NextTrack,
+    PrevTrack,
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
     /// Terminal `vol`, tray vol row (+/-10% steps) all land here.
@@ -152,6 +158,9 @@ pub enum Command {
 #[derive(Debug)]
 pub enum DecoderCmd {
     Load(Source),
+    /// Jump the playhead by a signed offset in seconds. Executed on the
+    /// decoder thread; ignored while no track is open.
+    SeekRelative(f64),
     /// Drop the current source and go back to park. Wakes the decoder even
     /// when it is parked waiting for chunk-channel space (select! on both).
     Stop,
@@ -172,6 +181,9 @@ pub enum Status {
         title: Option<String>,
         duration: Option<Duration>,
     },
+    /// The playhead moved (seek); the presentation layer refreshes its view.
+    /// The new position is already in SharedState.
+    Seeked,
     /// Natural end of stream (not Stop).
     Finished,
     Failed { source: Source, reason: String },
@@ -305,6 +317,10 @@ impl SharedState {
     pub fn add_frames_played(&self, frames: u64) {
         self.frames_played.fetch_add(frames, Ordering::Relaxed);
     }
+    /// Overwrite the playhead (device-rate frames) — used by seeks.
+    pub fn set_playhead_frames(&self, frames: u64) {
+        self.frames_played.store(frames, Ordering::Relaxed);
+    }
     /// Consumes the dirty flag (decoder rebuilds biquad coefficients when set).
     pub fn take_eq_dirty(&self) -> bool {
         self.eq_dirty.swap(false, Ordering::Acquire)
@@ -408,6 +424,9 @@ pub struct Broker {
     /// Raw form of the most recently OPENED source — survives Stop/Finished
     /// (where `track` is cleared) so a volume tweak never erases last_track.
     last_source_raw: Option<String>,
+    /// The source a LOADING load will open (no track exists yet) — lets
+    /// navigation work while metadata/probe is still in flight.
+    pending_source: Option<Source>,
 
     /// Installed by main; writes PersistedState to disk. A closure keeps the
     /// broker I/O-free (and testable).
@@ -424,6 +443,7 @@ impl Broker {
             view_dirty: false,
             stage_paused: false,
             last_source_raw: None,
+            pending_source: None,
             saver: None,
         };
         broker.refresh();
@@ -452,6 +472,45 @@ impl Broker {
             saver(self.persist_snapshot());
             log_debug!("BROKER", "state persisted to disk");
         }
+    }
+
+    /// Track navigation: playlist-shaped YouTube sources step their entry
+    /// index (previous clamps at entry 1, where the reload acts as a restart
+    /// from 00:00); sources without a playlist (or a queue — none exists)
+    /// simply restart the current track. Every navigation is a normal Load,
+    /// so the single-process lifecycle and orphan-proofing apply untouched.
+    fn navigate(&mut self, dir: i32) {
+        let current = self
+            .track
+            .as_ref()
+            .map(|t| t.source.clone())
+            .or_else(|| self.pending_source.clone());
+        let Some(current) = current else {
+            log_warn!("BROKER", "navigate ignored — nothing loaded");
+            return;
+        };
+        let target = match &current {
+            Source::Youtube { url, format, playlist_index: Some(n) } => {
+                let next = if dir > 0 { n + 1 } else { (*n).saturating_sub(1).max(1) };
+                log_info!(
+                    "BROKER",
+                    "navigate {}: playlist entry {} -> {}",
+                    if dir > 0 { "next" } else { "prev" },
+                    n,
+                    next
+                );
+                Source::Youtube {
+                    url: url.clone(),
+                    format: format.clone(),
+                    playlist_index: Some(next),
+                }
+            }
+            other => {
+                log_info!("BROKER", "navigate: no queue — restarting current track");
+                other.clone()
+            }
+        };
+        self.handle_command(Command::Load { source: target, paused: false });
     }
 
     /// Panel changed since last `take_refresh`? (Presentation pulls; the
@@ -497,11 +556,18 @@ impl Broker {
                 );
                 self.stage_paused = paused;
                 self.track = None;
+                self.pending_source = Some(source.clone());
                 self.shared.reset_playhead();
                 self.shared.bump_generation();
                 self.set_phase(Phase::Loading, "load requested");
                 self.send_decoder(DecoderCmd::Load(source));
             }
+            Command::SeekRelative(delta) => {
+                log_info!("BROKER", "seek {delta:+.1}s");
+                self.send_decoder(DecoderCmd::SeekRelative(delta));
+            }
+            Command::NextTrack => self.navigate(1),
+            Command::PrevTrack => self.navigate(-1),
             Command::TogglePause => match self.shared.phase() {
                 Phase::Playing => self.set_phase(Phase::Paused, "toggle"),
                 Phase::Paused => self.set_phase(Phase::Playing, "toggle"),
@@ -510,6 +576,7 @@ impl Broker {
             Command::Stop => {
                 log_info!("BROKER", "stop");
                 self.send_decoder(DecoderCmd::Stop);
+                self.pending_source = None;
                 self.track = None;
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "stop");
@@ -605,6 +672,7 @@ impl Broker {
                         .unwrap_or_default()
                 );
                 self.last_source_raw = Some(source.raw().to_string());
+                self.pending_source = None; // the track now carries it
                 self.track = Some(TrackMeta { source, title, duration, sample_rate, channels });
                 self.shared.reset_playhead();
                 // A staged load resolves to Paused instead of Playing: the
@@ -655,9 +723,16 @@ impl Broker {
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "track finished");
             }
+            Status::Seeked => {
+                // The decoder already moved SharedState's playhead; this only
+                // repaints the panel (matters while paused — the 1 Hz timer
+                // is not running).
+                self.refresh();
+            }
             Status::Failed { source, reason } => {
                 log_error!("BROKER", "failed to open {source}: {reason}");
                 self.stage_paused = false;
+                self.pending_source = None;
                 self.track = None;
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "load failed");
@@ -978,6 +1053,26 @@ mod tests {
                 assert_eq!(url, "https://youtube.com/playlist?list=PLtest");
             }
             other => panic!("expected playlist advance, got {other:?}"),
+        }
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+    }
+
+    #[test]
+    fn navigate_works_while_still_loading() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let pl1 = Source::Youtube {
+            url: "https://youtube.com/playlist?list=PLx".into(),
+            format: "140".into(),
+            playlist_index: Some(1),
+        };
+        // Load issued, Opened not yet landed (probe in flight).
+        broker.handle_command(Command::Load { source: pl1.clone(), paused: false });
+        assert!(broker.track.is_none());
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(..))), "initial load pending");
+        broker.handle_command(Command::NextTrack);
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(2), .. })) => {}
+            other => panic!("expected advance during LOADING, got {other:?}"),
         }
         assert_eq!(broker.shared.phase(), Phase::Loading);
     }

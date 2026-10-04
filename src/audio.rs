@@ -40,10 +40,11 @@ use crossbeam_channel::{bounded, select, Receiver, Sender, TryRecvError, TrySend
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatReader, Track};
-use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
+use symphonia::core::formats::{FormatReader, SeekMode, SeekTo, Track};
+use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 use symphonia::default::get_probe;
 
 use crate::broker::{
@@ -51,7 +52,7 @@ use crate::broker::{
     EQ_BAND_HZ,
 };
 use crate::log_error;
-use crate::{log_info, log_warn};
+use crate::{log_info, log_warn, log_debug};
 
 /// One decoded, EQ'd, volume-applied, resampled block of interleaved f32
 /// samples at the DEVICE rate. `generation` stamps which load produced it;
@@ -308,9 +309,17 @@ fn run_decoder(
     log_info!("DECODER", "online — parked on command channel (zero CPU)");
     loop {
         let first = match cmds.recv() {
-            Ok(DecoderCmd::Load(s)) => s,
-            Ok(DecoderCmd::Stop) => continue,
-            Ok(DecoderCmd::Shutdown) | Err(_) => break,
+            Ok(cmd) => {
+                log_debug!("DECODER", "recv {cmd:?}");
+                match cmd {
+                    DecoderCmd::Load(s) => s,
+                    // Nothing is open — a seek has nothing to move.
+                    DecoderCmd::SeekRelative(_) => continue,
+                    DecoderCmd::Stop => continue,
+                    DecoderCmd::Shutdown => break,
+                }
+            }
+            Err(_) => break,
         };
         let mut next = Some(first);
         'tracks: while let Some(source) = next.take() {
@@ -338,6 +347,8 @@ struct ActiveTrack {
     track_id: u32,
     sample_rate: u32,
     channels: usize,
+    /// False for non-seekable sources (yt-dlp stdout pipes).
+    seekable: bool,
     duration: Option<Duration>,
     title: Option<String>,
     /// yt-dlp's stderr tail, kept mid-track so decode failures show why.
@@ -490,6 +501,7 @@ fn open_track_inner(
             hint.with_extension(ext);
         }
     }
+    let seekable = mss.is_seekable();
     let probed = get_probe()
         .format(&hint, mss, &Default::default(), &MetadataOptions::default())
         .map_err(|e| format!("probe: {e}"))?;
@@ -537,6 +549,7 @@ fn open_track_inner(
         track_id,
         sample_rate,
         channels,
+        seekable,
         duration,
         title,
         // The tail rides on the track so mid-stream decode failures can show
@@ -550,6 +563,8 @@ enum SendOutcome {
     Sent,
     Stopped,
     NewSource(Source),
+    /// A seek arrived while parked waiting for chunk space.
+    SeekRelative(f64),
     Shutdown,
     SinkGone,
 }
@@ -576,6 +591,7 @@ fn send_chunk(
                         Ok(DecoderCmd::Stop) => return SendOutcome::Stopped,
                         Ok(DecoderCmd::Shutdown) => return SendOutcome::Shutdown,
                         Ok(DecoderCmd::Load(s)) => return SendOutcome::NewSource(s),
+                        Ok(DecoderCmd::SeekRelative(d)) => return SendOutcome::SeekRelative(d),
                         Err(_) => return SendOutcome::Shutdown,
                     },
                 }
@@ -642,6 +658,54 @@ fn fetch_title_blocking(
     Some(title)
 }
 
+/// Seek the open track by `delta` seconds (clamped at 0). Local files use
+/// symphonia's native container seek; a non-seekable source (yt-dlp pipe)
+/// refuses gracefully. Returns true when the playhead moved. Resets codec
+/// state, stale buffers, the chunk generation and the playhead so decoding
+/// resumes seamlessly at the new position.
+#[allow(clippy::too_many_arguments)]
+fn seek_relative(
+    track: &mut ActiveTrack,
+    shared: &SharedState,
+    delta: f64,
+    pending: &mut Vec<f32>,
+    eq: &mut EqChain,
+    resampler: &mut Option<LinearResampler>,
+    generation: &mut u64,
+) -> bool {
+    if !track.seekable {
+        log_info!("DECODER", "Seeking not supported for live streams");
+        return false;
+    }
+    let target = (shared.position().as_secs_f64() + delta).max(0.0);
+    let to = SeekTo::Time {
+        time: Time { seconds: target as u64, frac: target.fract() },
+        track_id: Some(track.track_id),
+    };
+    let device_rate = shared.sample_rate().max(1);
+    match track.format.seek(SeekMode::Coarse, to) {
+        Ok(_) => {
+            track.decoder.reset();
+            pending.clear();
+            eq.built = false; // biquad state is stale past the seek
+            *resampler = None; // fractional carry is stale past the seek
+            shared.bump_generation(); // in-flight stale chunks are discarded by the callback
+            *generation = shared.generation(); // fresh chunks carry the new one
+            shared.set_playhead_frames((target * device_rate as f64).round() as u64);
+            log_info!("DECODER", "seek {delta:+.1}s -> playhead {:.1}s", target);
+            true
+        }
+        Err(SymphoniaError::Unsupported(_)) => {
+            log_info!("DECODER", "Seeking not supported for live streams");
+            false
+        }
+        Err(e) => {
+            log_warn!("DECODER", "seek failed: {e}");
+            false
+        }
+    }
+}
+
 fn play_source(
     shared: &Arc<SharedState>,
     cmds: &Receiver<DecoderCmd>,
@@ -651,7 +715,7 @@ fn play_source(
     child_slot: &Arc<Mutex<Option<Child>>>,
     source: Source,
 ) -> PlayExit {
-    let generation = shared.generation();
+    let mut generation = shared.generation();
     // Single-shot, SEQUENTIAL title resolution: one yt-dlp at a time, ever.
     // The prefetch child lives in the same ChildGuard slot as the audio
     // child would, so Stop/Skip/Shutdown kill it mid-fetch (its parked read
@@ -662,6 +726,15 @@ fn play_source(
         }
         _ => None,
     };
+    // The prefetch may have been killed by an interrupt for a NEWER command
+    // (Stop / Skip) — honor it here instead of spawning a doomed audio child.
+    match cmds.try_recv() {
+        Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
+        Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
+        Ok(DecoderCmd::Load(s)) => return PlayExit::NewSource(s),
+        Ok(DecoderCmd::SeekRelative(_)) | Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => return PlayExit::Shutdown,
+    }
     let mut track = match open_track(&source, child_slot) {
         Ok(t) => t,
         Err(reason) => {
@@ -715,6 +788,21 @@ fn play_source(
             Ok(DecoderCmd::Load(s)) => {
                 exit = PlayExit::NewSource(s);
                 break 'play;
+            }
+            Ok(DecoderCmd::SeekRelative(delta)) => {
+                if seek_relative(
+                    &mut track,
+                    shared,
+                    delta,
+                    &mut pending,
+                    &mut eq,
+                    &mut resampler,
+                    &mut generation,
+                ) {
+                    let _ = status_tx.send(Status::Seeked);
+                    crate::ui::wake_status();
+                }
+                continue;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
@@ -842,6 +930,21 @@ fn play_source(
                     exit = PlayExit::Stopped;
                     break 'play;
                 }
+                SendOutcome::SeekRelative(delta) => {
+                    if seek_relative(
+                        &mut track,
+                        shared,
+                        delta,
+                        &mut pending,
+                        &mut eq,
+                        &mut resampler,
+                        &mut generation,
+                    ) {
+                        let _ = status_tx.send(Status::Seeked);
+                        crate::ui::wake_status();
+                        continue 'play;
+                    }
+                }
                 SendOutcome::NewSource(s) => {
                     exit = PlayExit::NewSource(s);
                     break 'play;
@@ -867,6 +970,12 @@ fn play_source(
         match send_chunk(chunk_tx, cmds, chunk) {
             SendOutcome::Sent => {}
             SendOutcome::Stopped => exit = PlayExit::Stopped,
+            SendOutcome::SeekRelative(d) => {
+                // Seeking during the final flush: playhead moves, track still
+                // ends — nothing to replay a half-flushed tail into.
+                exit = PlayExit::Stopped;
+                let _ = d;
+            }
             SendOutcome::NewSource(s) => exit = PlayExit::NewSource(s),
             SendOutcome::Shutdown => exit = PlayExit::Shutdown,
             SendOutcome::SinkGone => exit = PlayExit::SinkGone,
@@ -893,6 +1002,7 @@ fn play_source(
                         Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
                         Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
                         Ok(DecoderCmd::Load(s)) => return PlayExit::NewSource(s),
+                        Ok(DecoderCmd::SeekRelative(_)) => {} // tail is draining; nothing to move
                         Err(_) => return PlayExit::Shutdown,
                     },
                 }

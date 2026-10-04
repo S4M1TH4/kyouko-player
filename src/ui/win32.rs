@@ -56,18 +56,20 @@ const TIMER_MS: u32 = 1000;
 /// Tray menu item POSITIONS. The menu is created with MNS_NOTIFYBYPOS, so
 /// selections arrive as WM_MENUCOMMAND with the position in wParam — that is
 /// what lets the vol row tell a left-click (+10%) from a right-click (-10%).
-/// Positions include separator rows: vol, sep, loop, eq, equalizer, sep,
-/// window, sep, quit.
-const MENU_POS_VOL: usize = 0;
-const MENU_POS_LOOP: usize = 2;
-const MENU_POS_EQ: usize = 3;
-const MENU_POS_EQ_OPEN: usize = 4;
-const MENU_POS_WINDOW: usize = 6;
-const MENU_POS_QUIT: usize = 8;
+/// Positions include separator rows: seek, sep, vol, sep, loop, eq,
+/// equalizer, sep, window, sep, quit.
+const MENU_POS_SEEK: usize = 0;
+const MENU_POS_VOL: usize = 2;
+const MENU_POS_LOOP: usize = 4;
+const MENU_POS_EQ: usize = 5;
+const MENU_POS_EQ_OPEN: usize = 6;
+const MENU_POS_WINDOW: usize = 8;
+const MENU_POS_QUIT: usize = 10;
 
 /// Which popup a WM_MENUCOMMAND belongs to (positions are per-menu).
 const KIND_MAIN: usize = 0;
 const KIND_EQ_BANDS: usize = 1;
+const KIND_SEEK: usize = 2;
 const EQ_BAND_STEP_DB: f32 = 1.0;
 
 /// Strip position -> band index for the 5x2 grid (column-major: 31/1k,
@@ -432,8 +434,14 @@ fn popup_menu(s: &mut UiState, pt: POINT) {
     let eq_label = if s.shared.eq_enabled() { w!("EQ: ON") } else { w!("EQ: OFF") };
     let window_label = if s.hidden { w!("Show Echo") } else { w!("Hide Echo") };
     unsafe {
-        let _ =
-            AppendMenuW(menu, MF_STRING, MENU_POS_VOL, windows::core::PCWSTR(vol_label.as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_SEEK, w!("Seek"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_POS_VOL,
+            windows::core::PCWSTR(vol_label.as_ptr()),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_POS_LOOP, loop_label);
         let _ = AppendMenuW(menu, MF_STRING, MENU_POS_EQ, eq_label);
@@ -528,6 +536,52 @@ fn eq_popup(s: &mut UiState, pt: POINT) {
     }
 }
 
+/// The seek strip: four horizontal columns — `<<` previous track, `<` -5s,
+/// `>` +5s, `>>` next track. Labels are static (nothing here changes state
+/// visibly), but the strip is STILL sticky via WM_APP_MENU_REOPEN so several
+/// clicks can be chained without re-opening the menu. All dispatches are
+/// plain left-clicks routed through the command channel.
+fn seek_popup(s: &mut UiState, pt: POINT) {
+    let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+    unsafe {
+        for (pos, label) in [
+            (0usize, w!("<<")),
+            (1usize, w!("<")),
+            (2usize, w!(">")),
+            (3usize, w!(">>")),
+        ] {
+            let flags = if pos == 0 { MF_STRING } else { MF_STRING | MF_MENUBREAK };
+            let _ = AppendMenuW(menu, flags, pos, label);
+        }
+        let info = MENUINFO {
+            cbSize: std::mem::size_of::<MENUINFO>() as u32,
+            fMask: MENUINFO_MASK(MIM_STYLE.0),
+            dwStyle: MENUINFO_STYLE(MNS_NOTIFYBYPOS.0),
+            ..Default::default()
+        };
+        let _ = SetMenuInfo(menu, &info);
+        let _ = SetForegroundWindow(s.hwnd);
+        MENU_RIGHT_CLICK.store(false, std::sync::atomic::Ordering::Relaxed);
+        s.menu_kind = KIND_SEEK;
+        let hook = SetWindowsHookExW(
+            WH_GETMESSAGE,
+            Some(menu_message_hook),
+            None,
+            GetCurrentThreadId(),
+        );
+        if let Err(e) = &hook {
+            log_error!("UI", "menu hook install failed: {e}");
+        }
+        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, None, s.hwnd, None);
+        if let Ok(h) = hook {
+            let _ = UnhookWindowsHookEx(h);
+        }
+        let _ = DestroyMenu(menu);
+    }
+}
+
 /// MNS_NOTIFYBYPOS dispatch: wParam = item position. NOTE: on current shells
 /// this message arrives AFTER `TrackPopupMenu` has already returned and
 /// closed the menu — which is why sticky items re-open via
@@ -535,8 +589,24 @@ fn eq_popup(s: &mut UiState, pt: POINT) {
 /// volume change first and the reopened menu renders the fresh label.
 fn on_menu_command(s: &mut UiState, wp: WPARAM) {
     use std::sync::atomic::Ordering;
+    log_debug!(
+        "UI",
+        "menu command: kind={} pos={} right={}",
+        s.menu_kind,
+        wp.0,
+        MENU_RIGHT_CLICK.load(Ordering::Relaxed)
+    );
     let right_clicked = MENU_RIGHT_CLICK.load(Ordering::Relaxed);
     match s.menu_kind {
+        // Seek strip: `<<` prev track, `<` -5s, `>` +5s, `>>` next track.
+        // Every dispatch is sticky (the strip re-opens with the same shape).
+        KIND_SEEK => match wp.0 as usize {
+            0 => post_command(Command::PrevTrack),
+            1 => post_command(Command::SeekRelative(-5.0)),
+            2 => post_command(Command::SeekRelative(5.0)),
+            3 => post_command(Command::NextTrack),
+            _ => {}
+        },
         KIND_EQ_BANDS => {
             // Position maps through EQ_STRIP_ORDER to the band index.
             // Left-click +1 dB, right-click -1 dB, clamped by SharedState.
@@ -559,6 +629,10 @@ fn on_menu_command(s: &mut UiState, wp: WPARAM) {
             reopen_menu(s, KIND_EQ_BANDS);
         }
         _ => match wp.0 as usize {
+            MENU_POS_SEEK => {
+                // Swap the main menu for the seek strip, in place.
+                reopen_menu(s, KIND_SEEK);
+            }
             MENU_POS_VOL => {
                 let old = s.shared.volume();
                 let new = (old + if right_clicked { -0.1 } else { 0.1 }).clamp(0.0, 1.0);
@@ -635,9 +709,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_MENU_REOPEN => {
-                // wParam = KIND_MAIN | KIND_EQ_BANDS (posted by sticky rows).
+                // wParam = KIND_MAIN | KIND_EQ_BANDS | KIND_SEEK (posted by
+                // sticky rows).
                 match wp.0 as usize {
                     KIND_EQ_BANDS => eq_popup(s, s.menu_pt),
+                    KIND_SEEK => seek_popup(s, s.menu_pt),
                     _ => popup_menu(s, s.menu_pt),
                 }
                 LRESULT(0)
