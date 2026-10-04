@@ -10,6 +10,7 @@
 //! * Every transition goes through the broker and gets logged.
 
 use std::fmt;
+use std::path::Path;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering,
 };
@@ -40,6 +41,11 @@ pub const EQ_BAND_HZ: [u32; EQ_BANDS] =
 pub const EQ_BAND_LABELS: [&str; EQ_BANDS] =
     ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
 pub const EQ_MAX_GAIN_DB: f32 = 12.0;
+
+/// Extensions a folder scan queues. Deliberately matches the symphonia
+/// feature set this binary was built with (.opus waits for symphonia 0.6).
+const MEDIA_EXTENSIONS: [&str; 10] =
+    ["mp3", "flac", "wav", "m4a", "aac", "mp4", "mkv", "webm", "ogg", "aiff"];
 
 // ── Message vocabulary ───────────────────────────────────────────────────────
 
@@ -108,6 +114,50 @@ pub fn playlist_index_of(url: &str) -> Option<usize> {
     (has_list && !is_video).then_some(1)
 }
 
+/// The terminal queue listing: 1-based numbering with an arrow marker on
+/// the currently selected track. Pure so the format is unit-testable; the
+/// broker's ShowQueue arm prints what this returns.
+fn format_queue(queue: &[Source], current: Option<usize>) -> String {
+    if queue.is_empty() {
+        return "no local queue loaded (load a folder with `p <folder>`)".to_string();
+    }
+    let mut out = format!("local queue ({} tracks):
+", queue.len());
+    for (i, source) in queue.iter().enumerate() {
+        let marker = if current == Some(i) { "->" } else { "  " };
+        out.push_str(&format!("{} [{:>2}] {}
+", marker, i + 1, source.display_name()));
+    }
+    out
+}
+
+/// Shallow scan of one folder: files with a recognized media extension,
+/// sorted newest-first (files without a mtime sort last). Single-level by
+/// design — no recursion, so the one-off scan cannot block the broker.
+fn scan_folder(dir: &str) -> Vec<Source> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(Option<std::time::SystemTime>, Source)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                return None;
+            }
+            let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+            if !MEDIA_EXTENSIONS.contains(&ext.as_str()) {
+                return None;
+            }
+            let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
+            Some((modified, Source::File(path.to_string_lossy().into_owned())))
+        })
+        .collect();
+    // Newest first; Option ordering puts undated entries at the end.
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.into_iter().map(|(_, source)| source).collect()
+}
+
 /// Next source in a playlist run: only playlist-shaped YouTube sources
 /// advance (index n -> n+1). Everything else has no "next".
 fn advance_playlist(source: &Source) -> Option<Source> {
@@ -136,6 +186,11 @@ pub enum Command {
     /// (clamped at the start); everything else restarts from 00:00.
     NextTrack,
     PrevTrack,
+    /// Print the local folder queue to the terminal.
+    ShowQueue,
+    /// Jump straight to a queue track. Carries the user's 1-BASED number —
+    /// the broker converts and validates it against the queue bounds.
+    JumpToTrack(usize),
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
     /// Terminal `vol`, tray vol row (+/-10% steps) all land here.
@@ -427,6 +482,10 @@ pub struct Broker {
     /// The source a LOADING load will open (no track exists yet) — lets
     /// navigation work while metadata/probe is still in flight.
     pending_source: Option<Source>,
+    /// Local folder queue (shallow scan, newest first) + position. A single
+    /// file load becomes a one-entry queue; a YouTube load clears it.
+    local_queue: Vec<Source>,
+    queue_index: Option<usize>,
 
     /// Installed by main; writes PersistedState to disk. A closure keeps the
     /// broker I/O-free (and testable).
@@ -444,6 +503,8 @@ impl Broker {
             stage_paused: false,
             last_source_raw: None,
             pending_source: None,
+            local_queue: Vec::new(),
+            queue_index: None,
             saver: None,
         };
         broker.refresh();
@@ -474,12 +535,60 @@ impl Broker {
         }
     }
 
+    /// The common load tail - everything a Load does once queue management
+    /// has settled which source to open.
+    fn begin_load(&mut self, source: Source, paused: bool) {
+        log_info!(
+            "BROKER",
+            "load{}: {source}",
+            if paused { " [staged paused]" } else { "" }
+        );
+        self.stage_paused = paused;
+        self.track = None;
+        self.pending_source = Some(source.clone());
+        self.shared.reset_playhead();
+        self.shared.bump_generation();
+        self.set_phase(Phase::Loading, "load requested");
+        self.send_decoder(DecoderCmd::Load(source));
+    }
+
+    /// Load a track straight from the local folder queue WITHOUT re-running
+    /// queue management (which would clobber the folder queue on every
+    /// auto-advance). Used by navigation and EOF advancement.
+    fn load_queue_track(&mut self, index: usize) {
+        self.queue_index = Some(index);
+        let source = self.local_queue[index].clone();
+        self.begin_load(source, false);
+    }
+
     /// Track navigation: playlist-shaped YouTube sources step their entry
     /// index (previous clamps at entry 1, where the reload acts as a restart
     /// from 00:00); sources without a playlist (or a queue — none exists)
     /// simply restart the current track. Every navigation is a normal Load,
     /// so the single-process lifecycle and orphan-proofing apply untouched.
     fn navigate(&mut self, dir: i32) {
+        // Local folder queue first: it navigates purely by index, even while
+        // stopped or while a load is still in flight.
+        if !self.local_queue.is_empty() {
+            let idx = self.queue_index.unwrap_or(0);
+            let last = self.local_queue.len() - 1;
+            let next_i = (idx as i32 + dir).clamp(0, last as i32) as usize;
+            if dir > 0 && next_i == idx && idx == last {
+                log_info!("BROKER", "navigate: end of folder queue — stopping");
+                self.handle_command(Command::Stop);
+                return;
+            }
+            log_info!(
+                "BROKER",
+                "navigate {}: folder track {} -> {} (of {})",
+                if dir > 0 { "next" } else { "prev" },
+                idx,
+                next_i,
+                last
+            );
+            self.load_queue_track(next_i);
+            return;
+        }
         let current = self
             .track
             .as_ref()
@@ -489,28 +598,49 @@ impl Broker {
             log_warn!("BROKER", "navigate ignored — nothing loaded");
             return;
         };
-        let target = match &current {
-            Source::Youtube { url, format, playlist_index: Some(n) } => {
-                let next = if dir > 0 { n + 1 } else { (*n).saturating_sub(1).max(1) };
-                log_info!(
-                    "BROKER",
-                    "navigate {}: playlist entry {} -> {}",
-                    if dir > 0 { "next" } else { "prev" },
-                    n,
-                    next
-                );
-                Source::Youtube {
-                    url: url.clone(),
-                    format: format.clone(),
-                    playlist_index: Some(next),
-                }
+        // YouTube playlist: step the entry index.
+        if let Source::Youtube { url, format, playlist_index: Some(n) } = &current {
+            let next = if dir > 0 { n + 1 } else { (*n).saturating_sub(1).max(1) };
+            log_info!(
+                "BROKER",
+                "navigate {}: playlist entry {} -> {}",
+                if dir > 0 { "next" } else { "prev" },
+                n,
+                next
+            );
+            let target = Source::Youtube {
+                url: url.clone(),
+                format: format.clone(),
+                playlist_index: Some(next),
+            };
+            self.handle_command(Command::Load { source: target, paused: false });
+            return;
+        }
+        // Local folder queue: step the file index; Next past the end stops
+        // gracefully, Prev at the start restarts the first file.
+        if !self.local_queue.is_empty() {
+            let idx = self.queue_index.unwrap_or(0);
+            let last = self.local_queue.len() - 1;
+            let next_i = (idx as i32 + dir).clamp(0, last as i32) as usize;
+            if dir > 0 && next_i == idx && idx == last {
+                log_info!("BROKER", "navigate: end of folder queue — stopping");
+                self.handle_command(Command::Stop);
+                return;
             }
-            other => {
-                log_info!("BROKER", "navigate: no queue — restarting current track");
-                other.clone()
-            }
-        };
-        self.handle_command(Command::Load { source: target, paused: false });
+            log_info!(
+                "BROKER",
+                "navigate {}: folder track {} -> {} (of {})",
+                if dir > 0 { "next" } else { "prev" },
+                idx,
+                next_i,
+                last
+            );
+            self.load_queue_track(next_i);
+            return;
+        }
+        // No playlist, no queue: restart the current track.
+        log_info!("BROKER", "navigate: no queue — restarting current track");
+        self.handle_command(Command::Load { source: current, paused: false });
     }
 
     /// Panel changed since last `take_refresh`? (Presentation pulls; the
@@ -549,6 +679,43 @@ impl Broker {
         log_debug!("BROKER", "command: {cmd:?}");
         match cmd {
             Command::Load { source, paused } => {
+                // Folder expansion: `p <dir>` queues the folder's media files
+                // (shallow scan, newest first) and plays the first one. A
+                // folder with no supported media leaves the player untouched.
+                let mut source = source;
+                let mut queue_managed = false;
+                if let Source::File(path) = &source {
+                    if Path::new(path).is_dir() {
+                        let files = scan_folder(path);
+                        if files.is_empty() {
+                            log_error!(
+                                "BROKER",
+                                "folder {path} contains no supported media files — playback state unchanged"
+                            );
+                            self.refresh();
+                            return Flow::Continue;
+                        }
+                        log_info!("BROKER", "folder queue: {} tracks from {path}", files.len());
+                        self.local_queue = files.clone();
+                        self.queue_index = Some(0);
+                        source = files[0].clone();
+                        queue_managed = true;
+                    }
+                }
+                if !queue_managed {
+                    // A direct file load becomes a one-entry queue; a YouTube
+                    // load supersedes any local queue.
+                    match &source {
+                        Source::File(_) => {
+                            self.local_queue = vec![source.clone()];
+                            self.queue_index = Some(0);
+                        }
+                        Source::Youtube { .. } => {
+                            self.local_queue.clear();
+                            self.queue_index = None;
+                        }
+                    }
+                }
                 log_info!(
                     "BROKER",
                     "load{}: {source}",
@@ -568,6 +735,32 @@ impl Broker {
             }
             Command::NextTrack => self.navigate(1),
             Command::PrevTrack => self.navigate(-1),
+            Command::ShowQueue => {
+                // The queue is broker-owned: the listing prints from this
+                // event loop (the spec's single-owner requirement).
+                let current = self.queue_index;
+                println!("{}", format_queue(&self.local_queue, current));
+            }
+            Command::JumpToTrack(num) => {
+                if self.local_queue.is_empty() {
+                    log_warn!("BROKER", "jump ignored — no local queue loaded");
+                } else {
+                    // 1-based user number -> 0-based index, bounds-checked.
+                    match num.checked_sub(1).filter(|idx| *idx < self.local_queue.len()) {
+                        Some(idx) => {
+                            log_info!("BROKER", "jump: track {num} of {}", self.local_queue.len());
+                            self.load_queue_track(idx);
+                        }
+                        None => {
+                            log_warn!(
+                                "BROKER",
+                                "jump: track {num} out of range (1-{})",
+                                self.local_queue.len()
+                            );
+                        }
+                    }
+                }
+            }
             Command::TogglePause => match self.shared.phase() {
                 Phase::Playing => self.set_phase(Phase::Paused, "toggle"),
                 Phase::Paused => self.set_phase(Phase::Playing, "toggle"),
@@ -716,6 +909,18 @@ impl Broker {
                 {
                     log_info!("BROKER", "playlist: advancing to entry {:?}", source);
                     self.handle_command(Command::Load { source, paused: false });
+                    return;
+                }
+                // Local folder queue: play the next file, if any.
+                let idx = self.queue_index.unwrap_or(0);
+                if idx + 1 < self.local_queue.len() {
+                    log_info!(
+                        "BROKER",
+                        "folder queue: advancing to {}/{}",
+                        idx + 2,
+                        self.local_queue.len()
+                    );
+                    self.load_queue_track(idx + 1);
                     return;
                 }
                 log_info!("BROKER", "track finished");
@@ -1055,6 +1260,140 @@ mod tests {
             other => panic!("expected playlist advance, got {other:?}"),
         }
         assert_eq!(broker.shared.phase(), Phase::Loading);
+    }
+
+    #[test]
+    fn folder_load_queues_and_plays_newest_first() {
+        // Real temp dir: two media files (different mtimes) + noise.
+        let dir = std::env::temp_dir().join(format!("kyouko-queue-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("01 - Old.mp3");
+        let new = dir.join("02 - New.flac");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&new, b"x").unwrap();
+        // set_modified needs a write handle on Windows.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&new)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::create_dir(dir.join("nested")).unwrap();
+
+        let (mut broker, _, rx) = broker_with_sink();
+        let dir_path = dir.to_string_lossy().into_owned();
+        broker.handle_command(Command::Load {
+            source: Source::File(dir_path.clone()),
+            paused: false,
+        });
+        // The folder scan queued both media files (newest first) and the
+        // decoder was handed the newest one.
+        assert_eq!(broker.local_queue.len(), 2);
+        assert_eq!(broker.queue_index, Some(0));
+        assert!(broker.local_queue[0].display_name().contains("New"));
+        assert!(broker.local_queue[1].display_name().contains("Old"));
+        let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
+            panic!("expected first folder track load")
+        };
+        assert!(p.contains("02 - New"));
+
+        // NextTrack walks the queue (and does not clobber it).
+        broker.handle_command(Command::NextTrack);
+        assert_eq!(broker.queue_index, Some(1));
+        assert_eq!(broker.local_queue.len(), 2, "navigation must preserve the queue");
+        let Ok(DecoderCmd::Load(Source::File(p1))) = rx.try_recv() else {
+            panic!("expected queue advance to the oldest file")
+        };
+        assert!(p1.contains("01"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn next_track_at_queue_end_stops_gracefully() {
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.local_queue = vec![Source::File("C:\\album\\only.mp3".into())];
+        broker.queue_index = Some(0);
+        broker.handle_command(Command::NextTrack);
+        // End of queue: a graceful Stop, no Load, no restart.
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+    }
+
+    #[test]
+    fn prev_track_at_queue_start_reloads_first_file() {
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.local_queue = vec![Source::File("C:\\album\\only.mp3".into())];
+        broker.queue_index = Some(0);
+        broker.handle_command(Command::PrevTrack);
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::File(p))) => assert!(p.contains("only.mp3")),
+            other => panic!("expected restart of first file, got {other:?}"),
+        }
+        assert_eq!(broker.queue_index, Some(0));
+    }
+
+    #[test]
+    fn youtube_load_clears_the_local_queue() {
+        let (mut broker, _, _rx) = broker_with_sink();
+        broker.local_queue = vec![Source::File("C:\\album\\only.mp3".into())];
+        broker.queue_index = Some(0);
+        broker.handle_command(Command::Load {
+            source: Source::Youtube {
+                url: "https://youtu.be/x".into(),
+                format: "140".into(),
+                playlist_index: None,
+            },
+            paused: false,
+        });
+        assert!(broker.local_queue.is_empty());
+        assert_eq!(broker.queue_index, None);
+    }
+
+    #[test]
+    fn queue_listing_marks_the_current_track() {
+        let queue = vec![
+            Source::File("C:\\album\\01 First.wav".into()),
+            Source::File("C:\\album\\02 Second.wav".into()),
+            Source::File("C:\\album\\03 Third.wav".into()),
+        ];
+        let listing = format_queue(&queue, Some(1));
+        assert!(listing.contains("local queue (3 tracks)"));
+        assert!(listing.contains("  [ 1] 01 First.wav"));
+        assert!(listing.contains("-> [ 2] 02 Second.wav"), "arrow marks current");
+        assert!(listing.contains("  [ 3] 03 Third.wav"));
+        // No selection: no arrows anywhere.
+        assert!(!format_queue(&queue, None).contains("->"));
+    }
+
+    #[test]
+    fn queue_listing_empty_message() {
+        let listing = format_queue(&[], None);
+        assert!(listing.contains("no local queue loaded"));
+    }
+
+    #[test]
+    fn jump_to_track_validates_and_loads() {
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.local_queue = vec![
+            Source::File("C:\\album\\01.wav".into()),
+            Source::File("C:\\album\\02.wav".into()),
+        ];
+        broker.queue_index = Some(0);
+        // 1-based jump to track 2 -> 0-based index 1.
+        broker.handle_command(Command::JumpToTrack(2));
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::File(p))) => assert!(p.contains("02")),
+            other => panic!("expected jump load, got {other:?}"),
+        }
+        assert_eq!(broker.queue_index, Some(1));
+        // Out of bounds (and zero) are rejected cleanly: nothing dispatched.
+        broker.handle_command(Command::JumpToTrack(9));
+        broker.handle_command(Command::JumpToTrack(0));
+        assert!(rx.try_recv().is_err(), "out-of-range jumps dispatch nothing");
+        assert_eq!(broker.queue_index, Some(1), "state unchanged on bad jumps");
     }
 
     #[test]

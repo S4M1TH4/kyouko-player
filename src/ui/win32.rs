@@ -56,15 +56,15 @@ const TIMER_MS: u32 = 1000;
 /// Tray menu item POSITIONS. The menu is created with MNS_NOTIFYBYPOS, so
 /// selections arrive as WM_MENUCOMMAND with the position in wParam — that is
 /// what lets the vol row tell a left-click (+10%) from a right-click (-10%).
-/// Positions include separator rows: seek, sep, vol, sep, loop, eq,
-/// equalizer, sep, window, sep, quit.
-const MENU_POS_SEEK: usize = 0;
-const MENU_POS_VOL: usize = 2;
-const MENU_POS_LOOP: usize = 4;
-const MENU_POS_EQ: usize = 5;
-const MENU_POS_EQ_OPEN: usize = 6;
-const MENU_POS_WINDOW: usize = 8;
-const MENU_POS_QUIT: usize = 10;
+/// Positions include separator rows: vol, sep, loop, eq, equalizer, seek,
+/// sep, window, sep, quit.
+const MENU_POS_VOL: usize = 0;
+const MENU_POS_LOOP: usize = 2;
+const MENU_POS_EQ: usize = 3;
+const MENU_POS_EQ_OPEN: usize = 4;
+const MENU_POS_SEEK: usize = 5;
+const MENU_POS_WINDOW: usize = 7;
+const MENU_POS_QUIT: usize = 9;
 
 /// Which popup a WM_MENUCOMMAND belongs to (positions are per-menu).
 const KIND_MAIN: usize = 0;
@@ -434,8 +434,6 @@ fn popup_menu(s: &mut UiState, pt: POINT) {
     let eq_label = if s.shared.eq_enabled() { w!("EQ: ON") } else { w!("EQ: OFF") };
     let window_label = if s.hidden { w!("Show Echo") } else { w!("Hide Echo") };
     unsafe {
-        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_SEEK, w!("Seek"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -446,6 +444,7 @@ fn popup_menu(s: &mut UiState, pt: POINT) {
         let _ = AppendMenuW(menu, MF_STRING, MENU_POS_LOOP, loop_label);
         let _ = AppendMenuW(menu, MF_STRING, MENU_POS_EQ, eq_label);
         let _ = AppendMenuW(menu, MF_STRING, MENU_POS_EQ_OPEN, w!("Equalizer"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_POS_SEEK, w!("Seek"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, MENU_POS_WINDOW, window_label);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -599,12 +598,26 @@ fn on_menu_command(s: &mut UiState, wp: WPARAM) {
     let right_clicked = MENU_RIGHT_CLICK.load(Ordering::Relaxed);
     match s.menu_kind {
         // Seek strip: `<<` prev track, `<` -5s, `>` +5s, `>>` next track.
-        // Every dispatch is sticky (the strip re-opens with the same shape).
+        // Every dispatch is sticky — reopen_menu keeps the strip on screen
+        // (it was missing here, which is why the strip closed after one
+        // click).
         KIND_SEEK => match wp.0 as usize {
-            0 => post_command(Command::PrevTrack),
-            1 => post_command(Command::SeekRelative(-5.0)),
-            2 => post_command(Command::SeekRelative(5.0)),
-            3 => post_command(Command::NextTrack),
+            0 => {
+                post_command(Command::PrevTrack);
+                reopen_menu(s, KIND_SEEK);
+            }
+            1 => {
+                post_command(Command::SeekRelative(-5.0));
+                reopen_menu(s, KIND_SEEK);
+            }
+            2 => {
+                post_command(Command::SeekRelative(5.0));
+                reopen_menu(s, KIND_SEEK);
+            }
+            3 => {
+                post_command(Command::NextTrack);
+                reopen_menu(s, KIND_SEEK);
+            }
             _ => {}
         },
         KIND_EQ_BANDS => {

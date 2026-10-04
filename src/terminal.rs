@@ -110,6 +110,20 @@ fn parse(line: &str) -> Option<Command> {
         // Track navigation (distinct from ./, which are seek keys).
         ">" => Some(Command::NextTrack),
         "<" => Some(Command::PrevTrack),
+        // Queue: bare `t` lists it, `t <num>` jumps to a track (1-based).
+        "t" => {
+            if rest.is_empty() {
+                Some(Command::ShowQueue)
+            } else {
+                match rest.parse::<usize>() {
+                    Ok(n) => Some(Command::JumpToTrack(n)),
+                    Err(_) => {
+                        log_warn!("TERM", "usage: t [track_number] - bare 't' lists the queue");
+                        None
+                    }
+                }
+            }
+        }
         "s" => Some(Command::Stop),
         "vol" | "volume" => match rest.parse::<f64>() {
             Ok(v) if (0.0..=100.0).contains(&v) => Some(Command::SetVolume((v / 100.0) as f32)),
@@ -220,6 +234,9 @@ mod tests {
         assert!(matches!(parse(","), Some(Command::SeekRelative(d)) if d == -5.0));
         assert!(matches!(parse(">"), Some(Command::NextTrack)));
         assert!(matches!(parse("<"), Some(Command::PrevTrack)));
+        assert!(matches!(parse("t"), Some(Command::ShowQueue)));
+        assert!(matches!(parse("t 2"), Some(Command::JumpToTrack(2))));
+        assert!(matches!(parse("t x"), None));
         assert!(matches!(
             parse("y https://youtu.be/x 251"),
             Some(Command::Load {
