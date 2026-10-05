@@ -14,12 +14,14 @@ use std::path::Path;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering,
 };
+use crossbeam_channel::Sender;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
+use std::thread::self;
 use std::time::Duration;
 
-use crossbeam_channel::Sender;
-
 use crate::config::PersistedState;
+use crate::ui::CMD_TX;
 use crate::{log_debug, log_error, log_info, log_warn};
 
 // ── Tuning constants (consumed by the audio module in step 3) ────────────────
@@ -131,6 +133,20 @@ fn format_queue(queue: &[Source], current: Option<usize>) -> String {
     out
 }
 
+/// The terminal listing for a resolved YouTube playlist: 1-based numbering
+/// with an arrow marker on the playing entry (1-based playlist index).
+fn format_yt_queue(titles: &[String], current: Option<usize>) -> String {
+    let mut out = format!("youtube playlist ({} videos):
+", titles.len());
+    for (i, title) in titles.iter().enumerate() {
+        let n = i + 1;
+        let marker = if current == Some(n) { "->" } else { "  " };
+        out.push_str(&format!("{} [{:>2}] {}
+", marker, n, title));
+    }
+    out
+}
+
 /// Shallow scan of one folder: files with a recognized media extension,
 /// sorted newest-first (files without a mtime sort last). Single-level by
 /// design — no recursion, so the one-off scan cannot block the broker.
@@ -186,8 +202,12 @@ pub enum Command {
     /// (clamped at the start); everything else restarts from 00:00.
     NextTrack,
     PrevTrack,
-    /// Print the local folder queue to the terminal.
+    /// Print the active queue (local folder or YouTube playlist) to the
+    /// terminal.
     ShowQueue,
+    /// A detached `--flat-playlist` fetch resolved a playlist's titles.
+    /// Carries the playlist URL so a stale fetch can be dropped.
+    YtQueueResolved { url: String, titles: Vec<String> },
     /// Jump straight to a queue track. Carries the user's 1-BASED number —
     /// the broker converts and validates it against the queue bounds.
     JumpToTrack(usize),
@@ -486,6 +506,11 @@ pub struct Broker {
     /// file load becomes a one-entry queue; a YouTube load clears it.
     local_queue: Vec<Source>,
     queue_index: Option<usize>,
+    /// YouTube playlist titles resolved by a detached `--flat-playlist`
+    /// fetch, plus the playlist URL they belong to. `Some(url)` with an
+    /// empty vec = the fetch is still in flight.
+    yt_queue: Vec<String>,
+    yt_queue_url: Option<String>,
 
     /// Installed by main; writes PersistedState to disk. A closure keeps the
     /// broker I/O-free (and testable).
@@ -505,6 +530,8 @@ impl Broker {
             pending_source: None,
             local_queue: Vec::new(),
             queue_index: None,
+            yt_queue: Vec::new(),
+            yt_queue_url: None,
             saver: None,
         };
         broker.refresh();
@@ -559,6 +586,69 @@ impl Broker {
         self.queue_index = Some(index);
         let source = self.local_queue[index].clone();
         self.begin_load(source, false);
+    }
+
+    /// Make sure a flat-playlist metadata fetch is in flight for `url`.
+    /// Spawns a detached, simulate-only yt-dlp (no stream resolution, so it
+    /// self-exits after printing the index — no crawler) that reports back
+    /// through `Command::YtQueueResolved`. Skipped when the fetch for this
+    /// exact playlist is already in flight or resolved.
+    fn ensure_yt_queue_fetch(&mut self, url: &str) {
+        if self.yt_queue_url.as_deref() == Some(url) {
+            return;
+        }
+        self.yt_queue.clear();
+        self.yt_queue_url = Some(url.to_string());
+        let Some(tx) = CMD_TX.get().cloned() else {
+            log_warn!("BROKER", "no command channel - playlist listing unavailable");
+            return;
+        };
+        let url = url.to_string();
+        let spawned = thread::Builder::new()
+            .name("kyouko-ytlist".into())
+            .spawn(move || {
+                let output = StdCommand::new("yt-dlp")
+                    .args(["--flat-playlist", "--print", "title", &url])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output();
+                match output {
+                    Ok(out) if out.status.success() => {
+                        let titles: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(String::from)
+                            .collect();
+                        if titles.is_empty() {
+                            log_warn!("TITLE", "flat-playlist fetch resolved no titles");
+                        } else {
+                            log_info!("TITLE", "playlist resolved: {} videos", titles.len());
+                            let _ = tx.send(Command::YtQueueResolved { url, titles });
+                        }
+                    }
+                    Ok(_) => log_warn!("TITLE", "flat-playlist fetch exited nonzero"),
+                    Err(e) => log_warn!("TITLE", "flat-playlist fetch failed: {e}"),
+                }
+            });
+        if let Err(e) = spawned {
+            log_warn!("BROKER", "playlist fetch thread failed to spawn: {e}");
+        }
+    }
+
+    /// The 1-based playlist index of the playing/pending track, when a
+    /// playlist-shaped YouTube source is active.
+    fn current_yt_index(&self) -> Option<usize> {
+        let current = self
+            .track
+            .as_ref()
+            .map(|t| t.source.clone())
+            .or_else(|| self.pending_source.clone());
+        match current {
+            Some(Source::Youtube { playlist_index: Some(n), .. }) => Some(n),
+            _ => None,
+        }
     }
 
     /// Track navigation: playlist-shaped YouTube sources step their entry
@@ -698,6 +788,9 @@ impl Broker {
                         log_info!("BROKER", "folder queue: {} tracks from {path}", files.len());
                         self.local_queue = files.clone();
                         self.queue_index = Some(0);
+                        // A folder load supersedes any YouTube playlist listing.
+                        self.yt_queue.clear();
+                        self.yt_queue_url = None;
                         source = files[0].clone();
                         queue_managed = true;
                     }
@@ -709,10 +802,21 @@ impl Broker {
                         Source::File(_) => {
                             self.local_queue = vec![source.clone()];
                             self.queue_index = Some(0);
+                            self.yt_queue.clear();
+                            self.yt_queue_url = None;
                         }
-                        Source::Youtube { .. } => {
+                        Source::Youtube { url, playlist_index: Some(_), .. } => {
                             self.local_queue.clear();
                             self.queue_index = None;
+                            let url = url.clone();
+                            self.ensure_yt_queue_fetch(&url);
+                        }
+                        Source::Youtube { .. } => {
+                            // Non-playlist YouTube: clears both queues.
+                            self.local_queue.clear();
+                            self.queue_index = None;
+                            self.yt_queue.clear();
+                            self.yt_queue_url = None;
                         }
                     }
                 }
@@ -735,13 +839,81 @@ impl Broker {
             }
             Command::NextTrack => self.navigate(1),
             Command::PrevTrack => self.navigate(-1),
+            Command::YtQueueResolved { url, titles } => {
+                // Only accept the fetch for the still-current playlist; a
+                // stale fetch (superseded by another load) is dropped.
+                if self.yt_queue_url.as_deref() == Some(url.as_str()) {
+                    log_info!("BROKER", "youtube playlist resolved: {} videos", titles.len());
+                    self.yt_queue = titles;
+                }
+            }
             Command::ShowQueue => {
                 // The queue is broker-owned: the listing prints from this
-                // event loop (the spec's single-owner requirement).
-                let current = self.queue_index;
-                println!("{}", format_queue(&self.local_queue, current));
+                // event loop (the spec's single-owner requirement). An active
+                // YouTube playlist takes precedence over the local queue.
+                if self.yt_queue_url.is_some() {
+                    if self.yt_queue.is_empty() {
+                        println!("YouTube playlist metadata is still loading...");
+                    } else {
+                        let current = self.current_yt_index();
+                        println!("{}", format_yt_queue(&self.yt_queue, current));
+                    }
+                } else {
+                    let current = self.queue_index;
+                    println!("{}", format_queue(&self.local_queue, current));
+                }
             }
             Command::JumpToTrack(num) => {
+                // A playlist-shaped YouTube current/pending source routes to
+                // the YT listing; everything else uses the local folder queue.
+                let yt_active = self.current_yt_index().is_some();
+                if yt_active {
+                    if self.yt_queue.is_empty() {
+                        log_warn!("BROKER", "jump: YouTube playlist metadata is still loading");
+                    } else {
+                        match num.checked_sub(1).filter(|idx| *idx < self.yt_queue.len()) {
+                            Some(i0) => {
+                                log_info!(
+                                    "BROKER",
+                                    "jump: youtube track {num} of {} - {}",
+                                    self.yt_queue.len(),
+                                    self.yt_queue[i0]
+                                );
+                                // Rebuild the target from the playing source
+                                // so a custom format id survives the jump.
+                                if let Some(target) = self
+                                    .track
+                                    .as_ref()
+                                    .map(|t| t.source.clone())
+                                    .or_else(|| self.pending_source.clone())
+                                    .and_then(|src| match src {
+                                        Source::Youtube { url, format, .. } => {
+                                            Some(Source::Youtube {
+                                                url,
+                                                format,
+                                                playlist_index: Some(i0 + 1),
+                                            })
+                                        }
+                                        _ => None,
+                                    })
+                                {
+                                    self.handle_command(Command::Load {
+                                        source: target,
+                                        paused: false,
+                                    });
+                                }
+                            }
+                            None => {
+                                log_warn!(
+                                    "BROKER",
+                                    "jump: track {num} out of range (1-{})",
+                                    self.yt_queue.len()
+                                );
+                            }
+                        }
+                    }
+                    return Flow::Continue;
+                }
                 if self.local_queue.is_empty() {
                     log_warn!("BROKER", "jump ignored — no local queue loaded");
                 } else {
@@ -1394,6 +1566,91 @@ mod tests {
         broker.handle_command(Command::JumpToTrack(0));
         assert!(rx.try_recv().is_err(), "out-of-range jumps dispatch nothing");
         assert_eq!(broker.queue_index, Some(1), "state unchanged on bad jumps");
+    }
+
+    #[test]
+    fn yt_queue_listing_marks_the_playing_entry() {
+        let titles = vec![
+            "Entry One".to_string(),
+            "Entry Two".to_string(),
+            "Entry Three".to_string(),
+        ];
+        // current is the 1-based playlist index of the playing entry.
+        let listing = format_yt_queue(&titles, Some(2));
+        assert!(listing.contains("youtube playlist (3 videos)"));
+        assert!(listing.contains("  [ 1] Entry One"));
+        assert!(listing.contains("-> [ 2] Entry Two"), "arrow marks the playing entry");
+        assert!(listing.contains("  [ 3] Entry Three"));
+        assert!(!format_yt_queue(&titles, None).contains("->"));
+    }
+
+    #[test]
+    fn yt_queue_resolved_only_applies_to_the_current_playlist() {
+        let (mut broker, _, _rx) = broker_with_sink();
+        let url_a = "https://youtube.com/playlist?list=A".to_string();
+        // A playlist-shaped load sets the fetch URL for A.
+        broker.handle_command(Command::Load {
+            source: Source::Youtube {
+                url: url_a.clone(),
+                format: "140".into(),
+                playlist_index: Some(1),
+            },
+            paused: false,
+        });
+        assert_eq!(broker.yt_queue_url.as_deref(), Some(url_a.as_str()));
+        // The fetch for A resolves: titles accepted.
+        broker.handle_command(Command::YtQueueResolved {
+            url: url_a.clone(),
+            titles: vec!["One".into(), "Two".into()],
+        });
+        assert_eq!(broker.yt_queue.len(), 2);
+        // A stale fetch for a DIFFERENT playlist is dropped.
+        broker.handle_command(Command::YtQueueResolved {
+            url: "https://youtube.com/playlist?list=B".into(),
+            titles: vec!["Wrong".into()],
+        });
+        assert_eq!(broker.yt_queue.len(), 2);
+        assert!(!broker.yt_queue.iter().any(|t| t == "Wrong"));
+    }
+
+    #[test]
+    fn yt_jump_requires_resolved_titles_and_bounds_checks() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let url = "https://youtube.com/playlist?list=A".to_string();
+        let pl = |n: usize| Source::Youtube {
+            url: url.clone(),
+            format: "140".into(),
+            playlist_index: Some(n),
+        };
+        broker.handle_command(Command::Load { source: pl(1), paused: false });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(..))), "initial load pending");
+        // Titles still loading: jump is refused cleanly.
+        broker.handle_command(Command::JumpToTrack(2));
+        assert!(rx.try_recv().is_err(), "no jump dispatch while metadata loads");
+        // Titles resolve (simulating the flat-playlist fetch reporting back).
+        broker.handle_command(Command::YtQueueResolved {
+            url: url.clone(),
+            titles: vec!["One".into(), "Two".into()],
+        });
+        // Jump to track 2 (1-based) -> Load with playlist_index Some(2).
+        broker.handle_command(Command::JumpToTrack(2));
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(2), .. })) => {}
+            other => panic!("expected jump load for entry 2, got {other:?}"),
+        }
+        // The jump target opens: Playing at entry 2.
+        broker.handle_status(Status::Opened {
+            source: pl(2),
+            sample_rate: 44_100,
+            channels: 2,
+            title: None,
+            duration: None,
+        });
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        // Out of range: nothing dispatched, state unchanged.
+        broker.handle_command(Command::JumpToTrack(9));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(broker.shared.phase(), Phase::Playing);
     }
 
     #[test]
