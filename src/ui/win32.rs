@@ -51,7 +51,7 @@ use crate::audio::AudioOut;
 use super::render::Renderer;
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
-use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status};
+use crate::broker::{Broker, Command, Flow, Phase, SharedState, Status};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 const TIMER_ID: usize = 1;
@@ -686,41 +686,48 @@ fn on_menu_command(s: &mut UiState, wp: WPARAM) {
     }
 }
 
-/// WM_DROPFILES: extract the first dropped path (file or folder) and route
-/// it through the command channel — the broker's folder-queue expansion
-/// treats it exactly like typing `p <path>`. Extra dropped items are noted
-/// and ignored (single-track / folder-queue architecture). `DragFinish`
-/// releases the shell-allocated memory either way.
+/// WM_DROPFILES: extract EVERY dropped path (files and/or folders) and
+/// route the whole batch through the command channel as
+/// `Command::LoadDropped` — the broker expands folders, filters to media,
+/// merges and sorts newest-first. `DragFinish` releases the shell-allocated
+/// memory either way.
 fn on_drop_files(_s: &mut UiState, hdrop: HDROP) {
     // DragQueryFileW with item 0xFFFFFFFF returns the dropped-item count;
-    // with an index and no buffer it returns that path's length in wchars.
+    // with an index and no buffer it returns that path's length in wchars
+    // (excluding the terminator).
     let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
-    let path_len = unsafe { DragQueryFileW(hdrop, 0, None) };
-    let path = if path_len > 0 {
+    let mut paths: Vec<String> = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let path_len = unsafe { DragQueryFileW(hdrop, index, None) };
+        if path_len == 0 {
+            continue;
+        }
         // The API null-terminates within the given buffer; the length query
         // excludes that terminator, so hand it the full buffer and slice the
         // terminator off afterwards.
         let mut buf = vec![0u16; path_len as usize + 1];
         unsafe {
-            DragQueryFileW(hdrop, 0, Some(&mut buf));
+            DragQueryFileW(hdrop, index, Some(&mut buf));
         }
-        String::from_utf16_lossy(&buf)
+        let path = String::from_utf16_lossy(&buf)
             .trim_end_matches(' ')
-            .to_string()
-    } else {
-        String::new()
-    };
+            .to_string();
+        if path.is_empty() {
+            continue;
+        }
+        paths.push(path);
+    }
     unsafe { DragFinish(hdrop) }; // free the shell-allocated drop structure
 
-    if count > 1 {
-        log_info!("UI", "drop: {count} items — using the first");
-    }
-    if path.is_empty() {
-        log_warn!("UI", "drop: empty path — ignoring");
+    if paths.is_empty() {
+        log_warn!("UI", "drop: no usable paths — ignoring");
         return;
     }
-    log_info!("UI", "drop: {path}");
-    post_command(Command::Load { source: Source::File(path), paused: false });
+    if paths.len() > 1 {
+        log_info!("UI", "drop: {} paths", paths.len());
+    }
+    log_info!("UI", "drop: {}", paths[0]);
+    post_command(Command::LoadDropped(paths));
 }
 
 /// DestroyWindow from event context; WM_DESTROY does the teardown.

@@ -147,6 +147,51 @@ fn format_yt_queue(titles: &[String], current: Option<usize>) -> String {
     out
 }
 
+/// Does this path carry a supported media extension?
+fn is_media_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| MEDIA_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// Modification time, if the file system reports one.
+fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Expand a batch of dropped paths (files and/or folders) into the merged,
+/// media-filtered, newest-first queue. Folders use the existing shallow
+/// scan; loose files are filtered by extension; the merged list is re-sorted
+/// by mtime so drops and scans interleave predictably. `None` when nothing
+/// in the batch is playable.
+fn collect_media_from_paths(paths: &[String]) -> Option<Vec<Source>> {
+    let mut files: Vec<Source> = Vec::new();
+    for path in paths {
+        let p = Path::new(path);
+        if p.is_dir() {
+            files.extend(scan_folder(path));
+        } else if p.is_file() && is_media_path(p) {
+            files.push(Source::File(path.clone()));
+        } else {
+            log_debug!("BROKER", "dropped path skipped (not media): {path}");
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    files.sort_by(|a, b| mtime_of(source_path(b)).cmp(&mtime_of(source_path(a))));
+    Some(files)
+}
+
+/// The path behind a file source (queue entries are always `Source::File`).
+fn source_path(source: &Source) -> &Path {
+    match source {
+        Source::File(p) => Path::new(p),
+        _ => Path::new(""),
+    }
+}
+
 /// Shallow scan of one folder: files with a recognized media extension,
 /// sorted newest-first (files without a mtime sort last). Single-level by
 /// design — no recursion, so the one-off scan cannot block the broker.
@@ -205,6 +250,10 @@ pub enum Command {
     /// Print the active queue (local folder or YouTube playlist) to the
     /// terminal.
     ShowQueue,
+    /// Load a batch of dropped paths (files and/or folders). The broker
+    /// expands folders, filters to supported media, merges and sorts
+    /// newest-first into the local queue.
+    LoadDropped(Vec<String>),
     /// A detached `--flat-playlist` fetch resolved a playlist's titles.
     /// Carries the playlist URL so a stale fetch can be dropped.
     YtQueueResolved { url: String, titles: Vec<String> },
@@ -768,6 +817,31 @@ impl Broker {
     pub fn handle_command(&mut self, cmd: Command) -> Flow {
         log_debug!("BROKER", "command: {cmd:?}");
         match cmd {
+            Command::LoadDropped(paths) => {
+                // Drag-and-drop batches: expand, filter, merge, sort
+                // newest-first, then play the first track. An empty result
+                // leaves the player completely untouched.
+                match collect_media_from_paths(&paths) {
+                    Some(files) => {
+                        log_info!(
+                            "BROKER",
+                            "drop queue: {} media files (newest first)",
+                            files.len()
+                        );
+                        self.local_queue = files;
+                        self.queue_index = Some(0);
+                        let first = self.local_queue[0].clone();
+                        self.begin_load(first, false);
+                    }
+                    None => {
+                        log_error!(
+                            "BROKER",
+                            "drop contained no supported media files — playback state unchanged"
+                        );
+                        self.refresh();
+                    }
+                }
+            }
             Command::Load { source, paused } => {
                 // Folder expansion: `p <dir>` queues the folder's media files
                 // (shallow scan, newest first) and plays the first one. A
@@ -1505,6 +1579,91 @@ mod tests {
             other => panic!("expected restart of first file, got {other:?}"),
         }
         assert_eq!(broker.queue_index, Some(0));
+    }
+
+    #[test]
+    fn load_dropped_expands_filters_and_sorts() {
+        // Two real files with distinct mtimes + one non-media file + one
+        // missing path + a real folder containing a media file.
+        let dir = std::env::temp_dir().join(format!("kyouko-drop-{}-expands", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = dir.join("older.mp3");
+        let newer = dir.join("newer.flac");
+        std::fs::write(&older, b"x").unwrap();
+        std::fs::write(&newer, b"x").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newer)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+
+        // A dropped subfolder is expanded by the same shallow scan.
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.wav"), b"x").unwrap();
+
+        let paths = vec![
+            newer.to_string_lossy().into_owned(),
+            format!("{}\\nothing_here.mp3", dir.to_string_lossy()),
+            dir.join("notes.txt").to_string_lossy().into_owned(),
+            sub.to_string_lossy().into_owned(),
+            "Z:\\missing\\drive\\track.flac".to_string(),
+            older.to_string_lossy().into_owned(),
+        ];
+        let Some(queue) = collect_media_from_paths(&paths) else {
+            panic!("mixed drop must resolve");
+        };
+        assert_eq!(queue.len(), 3, "older + newer + inner (notes/missing filtered)");
+        // Newest first across the whole merged batch.
+        assert!(queue[0].display_name().contains("newer.flac"));
+        assert!(queue.iter().any(|s| s.display_name().contains("inner.wav")));
+        assert!(queue.iter().any(|s| s.display_name().contains("older.mp3")));
+        assert!(!queue.iter().any(|s| s.display_name().contains("notes")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_dropped_dispatches_first_and_queues_rest() {
+        // Real files (the collector requires existing files; dropped paths
+        // that don't resolve are skipped).
+        let dir = std::env::temp_dir().join(format!("kyouko-drop-{}-dispatch", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.mp3");
+        let b = dir.join("b.mp3");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::LoadDropped(vec![
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        ]));
+        assert_eq!(broker.local_queue.len(), 2);
+        assert_eq!(broker.queue_index, Some(0));
+        let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
+            panic!("expected first dropped track to load")
+        };
+        assert!(p.contains("a.mp3"));
+        // NextTrack walks the dropped queue.
+        broker.handle_command(Command::NextTrack);
+        let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
+            panic!("expected queue walk")
+        };
+        assert!(p.contains("b.mp3"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn load_dropped_with_no_media_leaves_state_untouched() {
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::LoadDropped(vec![
+            "C:\\nothing\\notes.txt".into(),
+            "C:\\nothing\\image.png".into(),
+        ]));
+        assert!(broker.local_queue.is_empty());
+        assert!(rx.try_recv().is_err(), "nothing dispatched for a media-free drop");
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
     }
 
     #[test]
