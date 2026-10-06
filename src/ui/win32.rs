@@ -24,7 +24,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Shell::NIN_SELECT;
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, NIN_SELECT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer,
@@ -38,7 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
     TPM_RIGHTBUTTON, WH_GETMESSAGE, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
     WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MENUCOMMAND,
-    WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    WM_NCCREATE, WM_NCHITTEST, WM_DROPFILES, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_TIMER,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -48,7 +51,7 @@ use crate::audio::AudioOut;
 use super::render::Renderer;
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
-use crate::broker::{Broker, Command, Flow, Phase, SharedState, Status};
+use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 const TIMER_ID: usize = 1;
@@ -203,6 +206,8 @@ pub fn run(
     unsafe {
         (*state).hwnd = hwnd;
         set_pump_hwnd(hwnd.0 as isize);
+        // Accept shell drag-and-drop (files/folders) on the echo window.
+        DragAcceptFiles(hwnd, true);
         (*state).tray.add(hwnd);
         // Content exists before the window is shown — no first-paint flash.
         (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase());
@@ -681,6 +686,43 @@ fn on_menu_command(s: &mut UiState, wp: WPARAM) {
     }
 }
 
+/// WM_DROPFILES: extract the first dropped path (file or folder) and route
+/// it through the command channel — the broker's folder-queue expansion
+/// treats it exactly like typing `p <path>`. Extra dropped items are noted
+/// and ignored (single-track / folder-queue architecture). `DragFinish`
+/// releases the shell-allocated memory either way.
+fn on_drop_files(_s: &mut UiState, hdrop: HDROP) {
+    // DragQueryFileW with item 0xFFFFFFFF returns the dropped-item count;
+    // with an index and no buffer it returns that path's length in wchars.
+    let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
+    let path_len = unsafe { DragQueryFileW(hdrop, 0, None) };
+    let path = if path_len > 0 {
+        // The API null-terminates within the given buffer; the length query
+        // excludes that terminator, so hand it the full buffer and slice the
+        // terminator off afterwards.
+        let mut buf = vec![0u16; path_len as usize + 1];
+        unsafe {
+            DragQueryFileW(hdrop, 0, Some(&mut buf));
+        }
+        String::from_utf16_lossy(&buf)
+            .trim_end_matches(' ')
+            .to_string()
+    } else {
+        String::new()
+    };
+    unsafe { DragFinish(hdrop) }; // free the shell-allocated drop structure
+
+    if count > 1 {
+        log_info!("UI", "drop: {count} items — using the first");
+    }
+    if path.is_empty() {
+        log_warn!("UI", "drop: empty path — ignoring");
+        return;
+    }
+    log_info!("UI", "drop: {path}");
+    post_command(Command::Load { source: Source::File(path), paused: false });
+}
+
 /// DestroyWindow from event context; WM_DESTROY does the teardown.
 fn destroy(s: &mut UiState) {
     unsafe {
@@ -715,6 +757,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_APP_TRAY => {
                 on_tray(s, lp);
+                LRESULT(0)
+            }
+            WM_DROPFILES => {
+                on_drop_files(s, HDROP(wp.0 as *mut _));
                 LRESULT(0)
             }
             WM_MENUCOMMAND => {
