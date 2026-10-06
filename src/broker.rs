@@ -194,17 +194,30 @@ fn is_bilibili_url(url: &str) -> bool {
     url.contains("bilibili.com/") || url.contains("b23.tv/")
 }
 
+/// Does this address stream through the Niconico pathway? `nico.ms` is
+/// Niconico's shortlink host (redirects to a nicovideo.jp watch URL).
+fn is_niconico_url(url: &str) -> bool {
+    url.contains("nicovideo.jp/") || url.contains("nico.ms/")
+}
+
 /// Any host kyouko routes through the yt-dlp pathway.
 fn is_stream_url(url: &str) -> bool {
-    is_youtube_url(url) || is_bilibili_url(url)
+    is_youtube_url(url) || is_bilibili_url(url) || is_niconico_url(url)
 }
 
 /// yt-dlp format id a site's audio streams under. YouTube's default `140`
 /// (m4a 128k) does not exist on Bilibili — requesting it there yields an
 /// empty stream that fails symphonia's format probe — so Bilibili links
-/// select Bilibili's own DASH audio stream `30232` instead.
+/// select Bilibili's own DASH audio stream `30232` instead. Niconico
+/// likewise only resolves under its named format `audio-aac-128kbps`.
 fn default_format_for(url: &str) -> &'static str {
-    if is_bilibili_url(url) { "30232" } else { "140" }
+    if is_bilibili_url(url) {
+        "30232"
+    } else if is_niconico_url(url) {
+        "audio-aac-128kbps"
+    } else {
+        "140"
+    }
 }
 
 /// What a dropped batch of paths resolves to. A `.url` shortcut for a
@@ -2068,6 +2081,57 @@ mod tests {
             Source::from_raw("https://example.com/page"),
             Source::Youtube { format, .. } if format == "140"
         ));
+    }
+
+    #[test]
+    fn niconico_links_select_their_own_format() {
+        // Watch URL and nico.ms shortlink both carry the Niconico named
+        // audio format; YouTube keeps its m4a default.
+        for url in [
+            "https://www.nicovideo.jp/watch/sm46878644",
+            "https://nico.ms/sm46878644",
+            "http://www.nicovideo.jp/watch/sm9",
+        ] {
+            assert!(
+                matches!(
+                    Source::from_raw(url),
+                    Source::Youtube { format, playlist_index: None, .. }
+                        if format == "audio-aac-128kbps"
+                ),
+                "niconico link must carry audio-aac-128kbps: {url}"
+            );
+        }
+        assert!(matches!(
+            Source::from_raw("https://youtu.be/x"),
+            Source::Youtube { format, .. } if format == "140"
+        ));
+        assert!(matches!(
+            Source::from_raw("https://example.com/page"),
+            Source::Youtube { format, .. } if format == "140"
+        ));
+    }
+
+    #[test]
+    fn dropped_niconico_shortcut_streams_via_yt_dlp() {
+        let dir = std::env::temp_dir().join(format!("kyouko-nico-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shortcut = dir.join("sm.url");
+        std::fs::write(
+            &shortcut,
+            "[InternetShortcut]\r\nURL=https://www.nicovideo.jp/watch/sm46878644\r\n",
+        )
+        .unwrap();
+
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::LoadDropped(vec![shortcut.to_string_lossy().into_owned()]));
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::Youtube { format, playlist_index, .. })) => {
+                assert_eq!(format, "audio-aac-128kbps", "niconico drop must not use fmt 140");
+                assert_eq!(playlist_index, None);
+            }
+            other => panic!("expected niconico stream load, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
