@@ -170,11 +170,16 @@ impl Renderer {
             }
 
             // luminance → alpha; premultiplied accent color. Pixels where GDI
-            // never wrote stay 0 = fully transparent.
+            // never wrote keep a 1/255 ground plane: layered windows pass
+            // mouse input (and OLE drops) straight through pixels with
+            // alpha 0, so a truly empty surface would only accept input on
+            // the glyph pixels themselves. Alpha 1 (~0.4% of premultiplied
+            // black) is imperceptible but keeps the full rect hit-testable.
             let color = accent(phase);
             for px in std::slice::from_raw_parts_mut(self.bits, len).chunks_exact_mut(4) {
                 let lum = px[0].max(px[1]).max(px[2]);
                 if lum == 0 {
+                    px[3] = 1;
                     continue;
                 }
                 px[0] = (u32::from(color[2]) * u32::from(lum) / 255) as u8; // B

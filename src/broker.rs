@@ -160,6 +160,79 @@ fn mtime_of(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+/// Parse a Windows `.url` Internet Shortcut file for its target web
+/// address (the `URL=` line of the INI structure, case-insensitive, first
+/// match wins). Malformed/missing files and missing targets -> None.
+fn parse_url_shortcut(path: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    for line in raw.lines() {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("URL") {
+            let target = value.trim();
+            if target.starts_with("http://") || target.starts_with("https://") {
+                return Some(target.to_string());
+            }
+            return None; // a URL= line with a non-web target: not streamable
+        }
+    }
+    None
+}
+
+/// Does this address stream through the YouTube pathway?
+fn is_youtube_url(url: &str) -> bool {
+    url.contains("youtube.com/") || url.contains("youtu.be/")
+}
+
+/// What a dropped batch of paths resolves to. A YouTube `.url` shortcut
+/// wins over everything else in the same drop (spec prioritization);
+/// otherwise the surviving media files form the queue.
+enum DroppedBatch {
+    YouTube(String),
+    Media(Vec<Source>),
+}
+
+/// Classify a dropped batch. YouTube `.url` shortcuts are parsed and
+/// prioritized (the first one wins over everything else in the drop);
+/// non-YouTube shortcuts are skipped with a warning; every other path is
+/// delegated to `collect_media_from_paths` (folder expansion, media
+/// filtering, newest-first sort).
+fn classify_dropped(paths: &[String]) -> DroppedBatch {
+    let mut rest: Vec<String> = Vec::new();
+    for path in paths {
+        let is_url_file = Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("url"))
+            .unwrap_or(false);
+        if !is_url_file {
+            rest.push(path.clone());
+            continue;
+        }
+        match parse_url_shortcut(path) {
+            Some(target) if is_youtube_url(&target) => {
+                log_info!("BROKER", "dropped .url: YouTube link {target}");
+                return DroppedBatch::YouTube(target);
+            }
+            Some(target) => {
+                log_warn!(
+                    "BROKER",
+                    "dropped .url is not a YouTube link ({target}) - skipping"
+                );
+            }
+            None => {
+                log_warn!("BROKER", "dropped .url could not be parsed - skipping");
+            }
+        }
+    }
+    match collect_media_from_paths(&rest) {
+        Some(files) if !files.is_empty() => DroppedBatch::Media(files),
+        _ => DroppedBatch::Media(Vec::new()),
+    }
+}
+
 /// Expand a batch of dropped paths (files and/or folders) into the merged,
 /// media-filtered, newest-first queue. Folders use the existing shallow
 /// scan; loose files are filtered by extension; the merged list is re-sorted
@@ -818,11 +891,20 @@ impl Broker {
         log_debug!("BROKER", "command: {cmd:?}");
         match cmd {
             Command::LoadDropped(paths) => {
-                // Drag-and-drop batches: expand, filter, merge, sort
-                // newest-first, then play the first track. An empty result
-                // leaves the player completely untouched.
-                match collect_media_from_paths(&paths) {
-                    Some(files) => {
+                // Classify the batch first: a YouTube .url shortcut wins over
+                // everything else in the same drop; otherwise the surviving
+                // media files form the queue (newest first). An unplayable
+                // result leaves the player completely untouched.
+                match classify_dropped(&paths) {
+                    DroppedBatch::YouTube(url) => {
+                        // Identical to typing `y <url>`: the playlist flow
+                        // (flat fetch, index jumps, EOF advance) works as-is.
+                        self.handle_command(Command::Load {
+                            source: Source::from_raw(&url),
+                            paused: false,
+                        });
+                    }
+                    DroppedBatch::Media(files) if !files.is_empty() => {
                         log_info!(
                             "BROKER",
                             "drop queue: {} media files (newest first)",
@@ -833,7 +915,7 @@ impl Broker {
                         let first = self.local_queue[0].clone();
                         self.begin_load(first, false);
                     }
-                    None => {
+                    _ => {
                         log_error!(
                             "BROKER",
                             "drop contained no supported media files — playback state unchanged"
@@ -849,24 +931,64 @@ impl Broker {
                 let mut source = source;
                 let mut queue_managed = false;
                 if let Source::File(path) = &source {
-                    if Path::new(path).is_dir() {
-                        let files = scan_folder(path);
-                        if files.is_empty() {
-                            log_error!(
-                                "BROKER",
-                                "folder {path} contains no supported media files — playback state unchanged"
-                            );
-                            self.refresh();
-                            return Flow::Continue;
+                    // A typed/dropped .url shortcut: parse it; a YouTube
+                    // target routes to the streaming flow, anything else is
+                    // skipped without touching playback.
+                    if Path::new(path)
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.eq_ignore_ascii_case("url"))
+                        .unwrap_or(false)
+                    {
+                        match parse_url_shortcut(path) {
+                            Some(target) if is_youtube_url(&target) => {
+                                log_info!("BROKER", ".url shortcut: YouTube link {target}");
+                                self.handle_command(Command::Load {
+                                    source: Source::from_raw(&target),
+                                    paused,
+                                });
+                                return Flow::Continue;
+                            }
+                            Some(target) => {
+                                log_warn!(
+                                    "BROKER",
+                                    ".url shortcut is not a YouTube link ({target}) - ignoring"
+                                );
+                                self.refresh();
+                                return Flow::Continue;
+                            }
+                            None => {
+                                log_warn!("BROKER", ".url shortcut could not be parsed - ignoring");
+                                self.refresh();
+                                return Flow::Continue;
+                            }
                         }
-                        log_info!("BROKER", "folder queue: {} tracks from {path}", files.len());
-                        self.local_queue = files.clone();
-                        self.queue_index = Some(0);
-                        // A folder load supersedes any YouTube playlist listing.
-                        self.yt_queue.clear();
-                        self.yt_queue_url = None;
-                        source = files[0].clone();
-                        queue_managed = true;
+                    }
+                    if Path::new(path).is_dir() {
+                        match collect_media_from_paths(std::slice::from_ref(path)) {
+                            Some(files) => {
+                                log_info!(
+                                    "BROKER",
+                                    "folder queue: {} tracks from {path}",
+                                    files.len()
+                                );
+                                self.local_queue = files;
+                                self.queue_index = Some(0);
+                                // A folder load supersedes any YouTube listing.
+                                self.yt_queue.clear();
+                                self.yt_queue_url = None;
+                                source = self.local_queue[0].clone();
+                                queue_managed = true;
+                            }
+                            None => {
+                                log_error!(
+                                    "BROKER",
+                                    "folder {path} contains no supported media files — playback state unchanged"
+                                );
+                                self.refresh();
+                                return Flow::Continue;
+                            }
+                        }
                     }
                 }
                 if !queue_managed {
@@ -1635,6 +1757,14 @@ mod tests {
         std::fs::write(&a, b"x").unwrap();
         std::fs::write(&b, b"x").unwrap();
 
+        // Distinct mtimes: b is newer, so the newest-first sort leads with it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&b)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+
         let (mut broker, _, rx) = broker_with_sink();
         broker.handle_command(Command::LoadDropped(vec![
             a.to_string_lossy().into_owned(),
@@ -1642,16 +1772,17 @@ mod tests {
         ]));
         assert_eq!(broker.local_queue.len(), 2);
         assert_eq!(broker.queue_index, Some(0));
+        // Newest first: b.mp3 leads the queue.
         let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
             panic!("expected first dropped track to load")
         };
-        assert!(p.contains("a.mp3"));
-        // NextTrack walks the dropped queue.
+        assert!(p.contains("b.mp3"), "newest file plays first: {p}");
+        // NextTrack walks the dropped queue to the older file.
         broker.handle_command(Command::NextTrack);
         let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
             panic!("expected queue walk")
         };
-        assert!(p.contains("b.mp3"));
+        assert!(p.contains("a.mp3"), "oldest file follows: {p}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1810,6 +1941,83 @@ mod tests {
         broker.handle_command(Command::JumpToTrack(9));
         assert!(rx.try_recv().is_err());
         assert_eq!(broker.shared.phase(), Phase::Playing);
+    }
+
+    #[test]
+    fn url_shortcut_parser_extracts_web_targets() {
+        let dir = std::env::temp_dir().join(format!("kyouko-url-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shortcut = dir.join("song.url");
+        std::fs::write(
+            &shortcut,
+            "[InternetShortcut]\r\nURL=https://youtu.be/abc123\r\nIDList=\r\nHotKey=0\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_url_shortcut(shortcut.to_string_lossy().as_ref()).as_deref(),
+            Some("https://youtu.be/abc123")
+        );
+        // Case-insensitive key + leading whitespace on the value.
+        std::fs::write(&shortcut, "[InternetShortcut]\r\n  url =  https://youtu.be/xyz  \r\n")
+            .unwrap();
+        assert_eq!(
+            parse_url_shortcut(shortcut.to_string_lossy().as_ref()).as_deref(),
+            Some("https://youtu.be/xyz")
+        );
+        // Malformed: no URL= line, empty file, nonexistent file.
+        std::fs::write(&shortcut, "[InternetShortcut]\r\nIconIndex=0\r\n").unwrap();
+        assert_eq!(parse_url_shortcut(shortcut.to_string_lossy().as_ref()), None);
+        std::fs::write(&shortcut, "").unwrap();
+        assert_eq!(parse_url_shortcut(shortcut.to_string_lossy().as_ref()), None);
+        assert_eq!(
+            parse_url_shortcut(dir.join("nope.url").to_string_lossy().as_ref()),
+            None
+        );
+        // Non-web targets are rejected at parse time.
+        std::fs::write(&shortcut, "URL=file://C:/local.htm\r\n").unwrap();
+        assert_eq!(parse_url_shortcut(shortcut.to_string_lossy().as_ref()), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dropped_youtube_shortcut_wins_over_media_files() {
+        let dir = std::env::temp_dir().join(format!("kyouko-urlwin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("local.mp3"), b"x").unwrap();
+        let shortcut = dir.join("song.url");
+        std::fs::write(
+            &shortcut,
+            "[InternetShortcut]\r\nURL=https://youtu.be/dQw4w9WgXcQ\r\n",
+        )
+        .unwrap();
+
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::LoadDropped(vec![
+            dir.join("local.mp3").to_string_lossy().into_owned(),
+            shortcut.to_string_lossy().into_owned(),
+        ]));
+        // The YouTube link wins: a Youtube Load is dispatched, the local
+        // queue is cleared (superseded).
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::Youtube { playlist_index, .. })) => {
+                assert_eq!(playlist_index, None, "watch URL is a single video");
+            }
+            other => panic!("expected youtube load, got {other:?}"),
+        }
+        assert!(broker.local_queue.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dropped_non_youtube_shortcut_is_skipped() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let shortcut = std::env::temp_dir().join(format!("kyouko-nonurl-{}.url", std::process::id()));
+        std::fs::write(&shortcut, "[InternetShortcut]\r\nURL=https://example.com/page\r\n")
+            .unwrap();
+        broker.handle_command(Command::LoadDropped(vec![shortcut.to_string_lossy().into_owned()]));
+        assert!(rx.try_recv().is_err(), "non-YouTube .url dispatches nothing");
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        std::fs::remove_file(&shortcut).unwrap();
     }
 
     #[test]

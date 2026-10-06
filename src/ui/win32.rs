@@ -13,20 +13,31 @@
 //! thread sleeps in `GetMessageW` until a real event arrives.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, TryRecvError};
 
-use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, POINTL, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ValidateRect;
+use windows::Win32::System::Com::{
+    DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
+};
+use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Ole::{
+    CF_HDROP, CF_TEXT, CF_UNICODETEXT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropTarget,
+    IDropTarget_Impl, OleInitialize, OleUninitialize, RegisterDragDrop, ReleaseStgMedium,
+    RevokeDragDrop,
+};
+use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, NIN_SELECT,
-};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, NIN_SELECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer,
@@ -40,18 +51,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
     TPM_RIGHTBUTTON, WH_GETMESSAGE, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
     WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MENUCOMMAND,
-    WM_NCCREATE, WM_NCHITTEST, WM_DROPFILES, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_TIMER,
+    WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::core::{implement, Ref};
 
 use crate::audio::AudioOut;
 
 use super::render::Renderer;
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
-use crate::broker::{Broker, Command, Flow, Phase, SharedState, Status};
+use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 const TIMER_ID: usize = 1;
@@ -158,6 +168,17 @@ pub fn run(
 
     let (pos_x, pos_y) = workarea_top_right(width, height);
 
+    // OLE must be initialized on this thread before RegisterDragDrop.
+    // S_OK *or* S_FALSE counts as available (S_FALSE = already initialized;
+    // both are paired by OleUninitialize after the pump below).
+    let ole = unsafe { OleInitialize(None) };
+    if let Err(e) = &ole {
+        log_warn!("UI", "OleInitialize failed: {e} — drag-and-drop unavailable");
+    }
+    // Kept alive past the pump: the window's registration holds a reference
+    // that WM_DESTROY revokes; this local releases the last one afterwards.
+    let drop_target: IDropTarget = DropTarget::new().into();
+
     // The state box rides through WM_NCCREATE via lpCreateParams and is
     // reclaimed after the pump exits. Tray icon is registered once the hwnd
     // exists (add() below).
@@ -206,8 +227,13 @@ pub fn run(
     unsafe {
         (*state).hwnd = hwnd;
         set_pump_hwnd(hwnd.0 as isize);
-        // Accept shell drag-and-drop (files/folders) on the echo window.
-        DragAcceptFiles(hwnd, true);
+        // Accept OLE drops (browser links arrive as text/URL formats, files
+        // and folders as CF_HDROP) — see `DropTarget` below.
+        if ole.is_ok() {
+            if let Err(e) = RegisterDragDrop(hwnd, &drop_target) {
+                log_warn!("UI", "RegisterDragDrop failed: {e}");
+            }
+        }
         (*state).tray.add(hwnd);
         // Content exists before the window is shown — no first-paint flash.
         (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase());
@@ -239,6 +265,12 @@ pub fn run(
 
         // Reclaim state: Tray::drop removes the icon, Renderer::drop frees GDI.
         drop(Box::from_raw(state));
+    }
+    // Pair with OleInitialize (S_OK and S_FALSE both count). The drop
+    // target's last reference releases right after this: the local above
+    // goes out of scope when `run` returns.
+    if ole.is_ok() {
+        unsafe { OleUninitialize() };
     }
     log_info!("UI", "pump over — presentation released");
 }
@@ -686,17 +718,227 @@ fn on_menu_command(s: &mut UiState, wp: WPARAM) {
     }
 }
 
-/// WM_DROPFILES: extract EVERY dropped path (files and/or folders) and
-/// route the whole batch through the command channel as
-/// `Command::LoadDropped` — the broker expands folders, filters to media,
-/// merges and sorts newest-first. `DragFinish` releases the shell-allocated
-/// memory either way.
-fn on_drop_files(_s: &mut UiState, hdrop: HDROP) {
-    // DragQueryFileW with item 0xFFFFFFFF returns the dropped-item count;
-    // with an index and no buffer it returns that path's length in wchars
-    // (excluding the terminator).
+// ---------------------------------------------------------------------------
+// OLE drop target. Browsers hand link drags over as OLE string formats
+// (`CF_UNICODETEXT`, `CF_TEXT`, the URL locator formats) — never as a file
+// list, which is why the old `WM_DROPFILES`/HDROP path never fired for them.
+// Files, folders and `.url` shortcuts still arrive as `CF_HDROP` and remain
+// the fallback. Every payload funnels through the same command channel as
+// the terminal, so the broker stays the single decision point.
+//
+// COM discipline: each `GetData` hit is followed by exactly one
+// `ReleaseStgMedium`; `GlobalLock`/`GlobalUnlock` bracket every raw read of
+// the payload; `DragFinish` is never called on OLE-owned memory (the shell
+// owns those HGLOBALs).
+
+/// The echo window's `IDropTarget`. One bit of state: the DragEnter verdict
+/// that DragOver reuses, so no per-mouse-move data-object queries happen.
+#[implement(IDropTarget)]
+struct DropTarget {
+    can_drop: AtomicBool,
+}
+
+impl DropTarget {
+    fn new() -> Self {
+        Self { can_drop: AtomicBool::new(false) }
+    }
+
+    /// Does the data object carry anything we can consume? Queried once per
+    /// drag gesture (DragEnter), not once per DragOver.
+    fn accepts(obj: &IDataObject) -> bool {
+        [CF_UNICODETEXT, CF_TEXT, CF_HDROP].iter().any(|cf| Self::offers(obj, cf.0))
+            || Self::offers(obj, registered_format(w!("UniformResourceLocatorW")))
+            || Self::offers(obj, registered_format(w!("UniformResourceLocator")))
+    }
+
+    fn offers(obj: &IDataObject, cf: u16) -> bool {
+        if cf == 0 {
+            return false; // registered format unknown to this shell
+        }
+        unsafe { obj.QueryGetData(&string_format(cf)) }.is_ok()
+    }
+}
+
+/// RegisterClipboardFormatW id for a named shell format (0 = failure).
+fn registered_format(name: PCWSTR) -> u16 {
+    unsafe { RegisterClipboardFormatW(name) as u16 }
+}
+
+/// A `FORMATETC` asking for one clipboard format's HGLOBAL rendering.
+fn string_format(cf: u16) -> FORMATETC {
+    FORMATETC {
+        cfFormat: cf,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    }
+}
+
+impl IDropTarget_Impl for DropTarget_Impl {
+    fn DragEnter(
+        &self,
+        pdataobj: Ref<'_, IDataObject>,
+        _grfkeystate: MODIFIERKEYS_FLAGS,
+        _pt: &POINTL,
+        pdweffect: *mut DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        let accepted = match pdataobj.as_ref() {
+            Some(obj) => DropTarget::accepts(obj),
+            None => false,
+        };
+        log_info!("UI", "ole drag enter: accepted={accepted}");
+        self.can_drop.store(accepted, Ordering::Relaxed);
+        unsafe {
+            *pdweffect = if accepted { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+        }
+        Ok(())
+    }
+
+    fn DragOver(
+        &self,
+        _grfkeystate: MODIFIERKEYS_FLAGS,
+        _pt: &POINTL,
+        pdweffect: *mut DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            *pdweffect = if self.can_drop.load(Ordering::Relaxed) {
+                DROPEFFECT_COPY
+            } else {
+                DROPEFFECT_NONE
+            };
+        }
+        Ok(())
+    }
+
+    fn DragLeave(&self) -> windows::core::Result<()> {
+        self.can_drop.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn Drop(
+        &self,
+        pdataobj: Ref<'_, IDataObject>,
+        _grfkeystate: MODIFIERKEYS_FLAGS,
+        _pt: &POINTL,
+        pdweffect: *mut DROPEFFECT,
+    ) -> windows::core::Result<()> {
+        unsafe { *pdweffect = DROPEFFECT_COPY };
+        let Some(obj) = pdataobj.as_ref() else {
+            return Ok(());
+        };
+        log_debug!("UI", "ole drop enter");
+
+        // Priority 1: string formats. Browsers put the link URL in
+        // CF_UNICODETEXT; the URL locator formats cover older shell
+        // sources. A non-URL text payload falls through to the file list.
+        for (cf, wide) in [
+            (CF_UNICODETEXT.0, true),
+            (CF_TEXT.0, false),
+            (registered_format(w!("UniformResourceLocatorW")), true),
+            (registered_format(w!("UniformResourceLocator")), false),
+        ] {
+            if cf == 0 {
+                continue;
+            }
+            if let Some(url) = hglobal_string(obj, cf, wide).and_then(|t| url_from_drop_text(&t))
+            {
+                log_info!("UI", "drop: link {url}");
+                post_command(Command::Load { source: Source::from_raw(&url), paused: false });
+                return Ok(());
+            }
+        }
+
+        // Priority 2: the shell file list (local media, folders, .url
+        // shortcuts) — classified by the broker exactly as before.
+        if let Ok(mut medium) = unsafe { obj.GetData(&string_format(CF_HDROP.0)) } {
+            let paths = unsafe { hdrop_paths(&medium) };
+            unsafe { ReleaseStgMedium(&mut medium) };
+            if paths.is_empty() {
+                log_warn!("UI", "drop: no usable payload — ignoring");
+            } else {
+                if paths.len() > 1 {
+                    log_info!("UI", "drop: {} paths", paths.len());
+                }
+                log_info!("UI", "drop: {}", paths[0]);
+                post_command(Command::LoadDropped(paths));
+            }
+        } else {
+            log_warn!("UI", "drop: nothing kyouko accepts — ignoring");
+        }
+        Ok(())
+    }
+}
+
+/// Pull a NUL-terminated string out of the first `TYMED_HGLOBAL` rendering
+/// of clipboard format `cf` (wide = UTF-16, otherwise ANSI). The medium is
+/// always released; `None` when the format is absent or carries no text.
+fn hglobal_string(obj: &IDataObject, cf: u16, wide: bool) -> Option<String> {
+    let Ok(mut medium) = (unsafe { obj.GetData(&string_format(cf)) }) else {
+        return None;
+    };
+    let text = unsafe { medium_string(&medium, wide) };
+    unsafe { ReleaseStgMedium(&mut medium) };
+    text
+}
+
+/// Read the HGLOBAL payload (if the medium carries one) as NUL-terminated
+/// text. GlobalSize bounds the scan; a missing terminator just takes the
+/// whole allocation.
+///
+/// # Safety
+/// `medium` must be a valid STGMEDIUM obtained from `GetData` (the caller
+/// releases it afterwards).
+unsafe fn medium_string(medium: &STGMEDIUM, wide: bool) -> Option<String> {
+    if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+        return None;
+    }
+    // SAFETY: tymed == TYMED_HGLOBAL above makes hGlobal the active member.
+    let h = unsafe { medium.u.hGlobal };
+    if h.0.is_null() {
+        return None;
+    }
+    let ptr = unsafe { GlobalLock(h) };
+    if ptr.is_null() {
+        return None;
+    }
+    let text = unsafe {
+        let bytes = GlobalSize(h);
+        if wide {
+            let units = std::slice::from_raw_parts(ptr as *const u16, bytes / 2);
+            let len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+            String::from_utf16_lossy(&units[..len])
+        } else {
+            let raw = std::slice::from_raw_parts(ptr as *const u8, bytes);
+            let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            String::from_utf8_lossy(&raw[..len]).into_owned()
+        }
+    };
+    unsafe { let _ = GlobalUnlock(h); }
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Extract every path from a CF_HDROP medium. The shell's DROPFILES handle
+/// is fed to `DragQueryFileW` directly — the same extraction the old
+/// WM_DROPFILES path used, fed from the OLE medium instead of the message.
+/// The medium itself is released by the caller (`ReleaseStgMedium`, never
+/// `DragFinish`: the shell owns this HGLOBAL).
+///
+/// # Safety
+/// `medium` must be a valid STGMEDIUM obtained from `GetData` (the caller
+/// releases it afterwards).
+unsafe fn hdrop_paths(medium: &STGMEDIUM) -> Vec<String> {
+    let mut paths = Vec::new();
+    if medium.tymed != TYMED_HGLOBAL.0 as u32 {
+        return paths;
+    }
+    // SAFETY: tymed == TYMED_HGLOBAL above makes hGlobal the active member.
+    let h = unsafe { medium.u.hGlobal };
+    if h.0.is_null() {
+        return paths;
+    }
+    let hdrop = HDROP(h.0);
     let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
-    let mut paths: Vec<String> = Vec::with_capacity(count as usize);
     for index in 0..count {
         let path_len = unsafe { DragQueryFileW(hdrop, index, None) };
         if path_len == 0 {
@@ -706,28 +948,29 @@ fn on_drop_files(_s: &mut UiState, hdrop: HDROP) {
         // excludes that terminator, so hand it the full buffer and slice the
         // terminator off afterwards.
         let mut buf = vec![0u16; path_len as usize + 1];
-        unsafe {
-            DragQueryFileW(hdrop, index, Some(&mut buf));
+        unsafe { DragQueryFileW(hdrop, index, Some(&mut buf)) };
+        let path = String::from_utf16_lossy(&buf).trim_end_matches('\0').to_string();
+        if !path.is_empty() {
+            paths.push(path);
         }
-        let path = String::from_utf16_lossy(&buf)
-            .trim_end_matches(' ')
-            .to_string();
-        if path.is_empty() {
-            continue;
-        }
-        paths.push(path);
     }
-    unsafe { DragFinish(hdrop) }; // free the shell-allocated drop structure
+    paths
+}
 
-    if paths.is_empty() {
-        log_warn!("UI", "drop: no usable paths — ignoring");
-        return;
+/// Pull a http(s) URL out of dropped text. Browsers hand over the bare URL,
+/// but some wrap it as "title\nurl" or quote it — scan whitespace-separated
+/// tokens and keep the LAST http(s) one (title first, link last; a bare URL
+/// has a single token). Anything not http(s) is rejected: local paths as
+/// text are not a drop kyouko takes.
+fn url_from_drop_text(text: &str) -> Option<String> {
+    let mut found: Option<&str> = None;
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|c| c == '"' || c == '\'');
+        if token.starts_with("http://") || token.starts_with("https://") {
+            found = Some(token);
+        }
     }
-    if paths.len() > 1 {
-        log_info!("UI", "drop: {} paths", paths.len());
-    }
-    log_info!("UI", "drop: {}", paths[0]);
-    post_command(Command::LoadDropped(paths));
+    found.map(str::to_string)
 }
 
 /// DestroyWindow from event context; WM_DESTROY does the teardown.
@@ -764,10 +1007,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_APP_TRAY => {
                 on_tray(s, lp);
-                LRESULT(0)
-            }
-            WM_DROPFILES => {
-                on_drop_files(s, HDROP(wp.0 as *mut _));
                 LRESULT(0)
             }
             WM_MENUCOMMAND => {
@@ -811,6 +1050,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                // Release the window's reference to the drop target before
+                // the OLE apartment goes away (OleUninitialize runs after
+                // the pump).
+                let _ = RevokeDragDrop(hwnd);
                 if s.timer_on {
                     let _ = KillTimer(Some(s.hwnd), TIMER_ID);
                     s.timer_on = false;

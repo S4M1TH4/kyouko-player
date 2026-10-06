@@ -14,8 +14,14 @@ description = "The mountain echo; only heard, never seen. A zero-resource, event
 # Win32 UI/tray module (step 2). No abstraction layers on top of this.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
+    "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
@@ -55,6 +61,7 @@ symphonia = { version = "0.5", default-features = false, features = [
 # architecture rests on: `select!` over multiple blocking receives (no polling)
 # and bounded queues (backpressure is our only scheduling mechanism).
 crossbeam-channel = "0.5"
+windows-core = "0.62"
 
 [profile.release]
 opt-level = 3        # "z" would starve the decode loop; 3 keeps biquads + symphonia fast
