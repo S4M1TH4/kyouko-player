@@ -81,13 +81,14 @@ impl Source {
     }
 
     /// Inverse of `raw`: URL-shaped strings stream via yt-dlp, everything
-    /// else opens as a local file. Playlist-shaped URLs (a `list=` parameter
-    /// without an explicit video id) become advancing sources at entry 1.
+    /// else opens as a local file. The format id is per-site (YouTube 140,
+    /// Bilibili 30232). Playlist-shaped URLs (a `list=` parameter without
+    /// an explicit video id) become advancing sources at entry 1.
     pub fn from_raw(raw: &str) -> Source {
         if raw.starts_with("http://") || raw.starts_with("https://") {
             Source::Youtube {
                 url: raw.to_string(),
-                format: "140".to_string(),
+                format: default_format_for(raw).to_string(),
                 playlist_index: playlist_index_of(raw),
             }
         } else {
@@ -186,18 +187,39 @@ fn is_youtube_url(url: &str) -> bool {
     url.contains("youtube.com/") || url.contains("youtu.be/")
 }
 
-/// What a dropped batch of paths resolves to. A YouTube `.url` shortcut
-/// wins over everything else in the same drop (spec prioritization);
-/// otherwise the surviving media files form the queue.
+/// Does this address stream through the Bilibili pathway? `b23.tv` is
+/// Bilibili's shortlink host (it redirects to a bilibili.com watch URL and
+/// yt-dlp resolves it directly).
+fn is_bilibili_url(url: &str) -> bool {
+    url.contains("bilibili.com/") || url.contains("b23.tv/")
+}
+
+/// Any host kyouko routes through the yt-dlp pathway.
+fn is_stream_url(url: &str) -> bool {
+    is_youtube_url(url) || is_bilibili_url(url)
+}
+
+/// yt-dlp format id a site's audio streams under. YouTube's default `140`
+/// (m4a 128k) does not exist on Bilibili — requesting it there yields an
+/// empty stream that fails symphonia's format probe — so Bilibili links
+/// select Bilibili's own DASH audio stream `30232` instead.
+fn default_format_for(url: &str) -> &'static str {
+    if is_bilibili_url(url) { "30232" } else { "140" }
+}
+
+/// What a dropped batch of paths resolves to. A `.url` shortcut for a
+/// yt-dlp site (YouTube, Bilibili) wins over everything else in the same
+/// drop (spec prioritization); otherwise the surviving media files form
+/// the queue.
 enum DroppedBatch {
     YouTube(String),
     Media(Vec<Source>),
 }
 
-/// Classify a dropped batch. YouTube `.url` shortcuts are parsed and
-/// prioritized (the first one wins over everything else in the drop);
-/// non-YouTube shortcuts are skipped with a warning; every other path is
-/// delegated to `collect_media_from_paths` (folder expansion, media
+/// Classify a dropped batch. `.url` shortcuts for streamable sites are
+/// parsed and prioritized (the first one wins over everything else in the
+/// drop); shortcuts for other hosts are skipped with a warning; every other
+/// path is delegated to `collect_media_from_paths` (folder expansion, media
 /// filtering, newest-first sort).
 fn classify_dropped(paths: &[String]) -> DroppedBatch {
     let mut rest: Vec<String> = Vec::new();
@@ -212,14 +234,14 @@ fn classify_dropped(paths: &[String]) -> DroppedBatch {
             continue;
         }
         match parse_url_shortcut(path) {
-            Some(target) if is_youtube_url(&target) => {
-                log_info!("BROKER", "dropped .url: YouTube link {target}");
+            Some(target) if is_stream_url(&target) => {
+                log_info!("BROKER", "dropped .url: stream link {target}");
                 return DroppedBatch::YouTube(target);
             }
             Some(target) => {
                 log_warn!(
                     "BROKER",
-                    "dropped .url is not a YouTube link ({target}) - skipping"
+                    "dropped .url is not a streamable link ({target}) - skipping"
                 );
             }
             None => {
@@ -2018,6 +2040,57 @@ mod tests {
         assert!(rx.try_recv().is_err(), "non-YouTube .url dispatches nothing");
         assert_eq!(broker.shared.phase(), Phase::Stopped);
         std::fs::remove_file(&shortcut).unwrap();
+    }
+
+    #[test]
+    fn bilibili_links_select_their_own_format() {
+        // Watch URL and b23.tv shortlink both carry the Bilibili DASH audio
+        // format; YouTube keeps its m4a default.
+        for url in [
+            "https://www.bilibili.com/video/BV1A3hpzAEnZ",
+            "https://b23.tv/abc123",
+            "http://www.bilibili.com/video/BVxyz?spx=1",
+        ] {
+            assert!(
+                matches!(
+                    Source::from_raw(url),
+                    Source::Youtube { format, playlist_index: None, .. }
+                        if format == "30232"
+                ),
+                "bilibili link must carry fmt 30232: {url}"
+            );
+        }
+        assert!(matches!(
+            Source::from_raw("https://youtu.be/x"),
+            Source::Youtube { format, .. } if format == "140"
+        ));
+        assert!(matches!(
+            Source::from_raw("https://example.com/page"),
+            Source::Youtube { format, .. } if format == "140"
+        ));
+    }
+
+    #[test]
+    fn dropped_bilibili_shortcut_streams_via_yt_dlp() {
+        let dir = std::env::temp_dir().join(format!("kyouko-bili-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shortcut = dir.join("bv.url");
+        std::fs::write(
+            &shortcut,
+            "[InternetShortcut]\r\nURL=https://www.bilibili.com/video/BV1A3hpzAEnZ\r\n",
+        )
+        .unwrap();
+
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::LoadDropped(vec![shortcut.to_string_lossy().into_owned()]));
+        match rx.try_recv() {
+            Ok(DecoderCmd::Load(Source::Youtube { format, playlist_index, .. })) => {
+                assert_eq!(format, "30232", "bilibili drop must not use fmt 140");
+                assert_eq!(playlist_index, None);
+            }
+            other => panic!("expected bilibili stream load, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

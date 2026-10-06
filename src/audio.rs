@@ -616,10 +616,16 @@ fn clean_title(raw: &str) -> String {
 /// Failure of any kind -> None (the panel keeps the URL; playback proceeds).
 fn fetch_title_blocking(
     url: &str,
+    format: &str,
     playlist_index: Option<usize>,
     child_slot: &Arc<Mutex<Option<Child>>>,
 ) -> Option<String> {
-    let mut args: Vec<std::ffi::OsString> = vec!["--print".into(), "title".into()];
+    // `-f {format}` alongside --print: Bilibili's stream ids differ from
+    // YouTube's, and resolving against the same format the audio child will
+    // use keeps the metadata pass honest about playability (the request
+    // never downloads; it only prints).
+    let mut args: Vec<std::ffi::OsString> =
+        vec!["--print".into(), "title".into(), "-f".into(), format.into()];
     match playlist_index {
         Some(n) => {
             args.push("--playlist-items".into());
@@ -721,8 +727,8 @@ fn play_source(
     // child would, so Stop/Skip/Shutdown kill it mid-fetch (its parked read
     // unblocks with EOF) and it is reaped immediately.
     let mut resolved_title = match &source {
-        Source::Youtube { url, playlist_index, .. } => {
-            fetch_title_blocking(url, *playlist_index, child_slot)
+        Source::Youtube { url, format, playlist_index, .. } => {
+            fetch_title_blocking(url, format, *playlist_index, child_slot)
         }
         _ => None,
     };
