@@ -27,7 +27,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, UpdateLayeredWindow, ULW_ALPHA};
 
-use crate::broker::Phase;
+use crate::broker::{EQ_BANDS, EQ_MAX_GAIN_DB, Phase};
 use crate::{log_debug, log_error, log_warn};
 
 /// `Error::from_win32` was folded away in windows-rs 0.62 — rebuild it from
@@ -44,6 +44,9 @@ pub const WINDOW_W: i32 = 200;
 /// button clicks; everywhere else = HTCAPTION → native drag), so draw and
 /// hit geometry can never drift apart.
 pub const CONTROL_BAR_H: i32 = 16;
+/// Braille equalizer rows: two fill rows above the middle baseline and two
+/// below (6 levels per row → the ±12 dB gain range exactly).
+const EQ_ROWS: usize = 4;
 /// Negative = per-em height: the glyph cell stays exact at any DPI.
 const FONT_HEIGHT: i32 = -9;
 
@@ -53,6 +56,35 @@ const W_PREV: &str = "<<";
 const W_BACK: &str = "<";
 const W_FWD: &str = ">";
 const W_NEXT: &str = ">>";
+
+/// Braille glyph holding `levels` fill steps in one cell: blank at 0, the
+/// 6-step dot progression for 1..=6, saturated full cell beyond. The
+/// progression fills the cell bottom-up: ⠠ ⠤ ⠴ ⠶ ⠾ ⠿.
+fn braille_glyph(levels: i32) -> &'static str {
+    match levels {
+        1 => "⠠",
+        2 => "⠤",
+        3 => "⠴",
+        4 => "⠶",
+        5 => "⠾",
+        6.. => "⠿",
+        _ => " ",
+    }
+}
+
+/// Braille glyph for row `row` (0 = adjacent to the middle baseline, growing
+/// outward) of a band at `level` (-12..+12 dB). Direction comes from which
+/// side of the baseline the row sits on, so negative levels use the same
+/// glyphs on the rows below the baseline.
+fn braille_row_glyph(level: i32, row: i32) -> &'static str {
+    braille_glyph(level.abs() - 6 * row)
+}
+
+/// Which of the 10 equalizer columns does a client x fall in? Pure mapping
+/// shared by drawing and hit-testing.
+fn eq_band_index(x: i32, width: i32) -> usize {
+    (x.clamp(0, width - 1) * EQ_BANDS as i32 / width) as usize
+}
 
 fn accent(phase: Phase) -> [u8; 3] {
     match phase {
@@ -68,6 +100,9 @@ pub struct Renderer {
     width: i32,
     height: i32,
     line_h: i32,
+    /// Client y where the Braille equalizer strip begins (panel text ends);
+    /// recomputed on every draw from the panel's line count.
+    eq_top: i32,
     screen_dc: HDC,
     mem_dc: HDC,
     bitmap: HBITMAP,
@@ -137,8 +172,9 @@ impl Renderer {
             }
 
             let rows = sample.lines().count() as i32;
-            // Panel text plus the playback control strip at the bottom.
-            let height = 2 * PAD + rows * line_h + CONTROL_BAR_H;
+            // Panel text, the Braille equalizer strip, and the playback
+            // control strip at the bottom.
+            let height = 2 * PAD + rows * line_h + EQ_ROWS as i32 * line_h + CONTROL_BAR_H;
 
             let mut bi = BITMAPINFO::default();
             bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
@@ -156,6 +192,7 @@ impl Renderer {
                 width: WINDOW_W,
                 height,
                 line_h,
+                eq_top: PAD + rows * line_h,
                 screen_dc,
                 mem_dc,
                 bitmap,
@@ -170,9 +207,20 @@ impl Renderer {
         (self.width, self.height)
     }
 
-    /// Paint `panel` with `phase`'s accent color. Safe to call any number of
-    /// times; each call is a full repaint of the layered surface.
-    pub fn draw(&mut self, hwnd: HWND, panel: &str, phase: Phase) {
+    /// Which equalizer band (if any) does a CLIENT-coordinate point hover?
+    /// The strip spans the Braille rows between the panel text and the
+    /// control bar; the column split is exact tenths of the window width.
+    pub fn eq_band_at(&self, x: i32, y: i32) -> Option<usize> {
+        if y < self.eq_top || y >= self.eq_top + EQ_ROWS as i32 * self.line_h {
+            return None;
+        }
+        Some(eq_band_index(x, self.width))
+    }
+
+    /// Paint `panel` with `phase`'s accent color and the 10-band gains as
+    /// the Braille equalizer. Safe to call any number of times; each call is
+    /// a full repaint of the layered surface.
+    pub fn draw(&mut self, hwnd: HWND, panel: &str, phase: Phase, eq: &[f32; EQ_BANDS]) {
         unsafe {
             let len = (self.width * self.height) as usize * 4;
             std::ptr::write_bytes(self.bits, 0, len);
@@ -181,6 +229,37 @@ impl Renderer {
             for (i, line) in panel.lines().enumerate() {
                 let wide: Vec<u16> = line.encode_utf16().collect();
                 let _ = TextOutW(self.mem_dc, PAD, PAD + i as i32 * self.line_h, &wide);
+            }
+
+            // Braille equalizer: 10 columns across the full width, filling
+            // middle-out from the invisible baseline between the two inner
+            // rows. One glyph per cell, centered in its tenth-column.
+            self.eq_top = PAD + panel.lines().count() as i32 * self.line_h;
+            let col_w = self.width / EQ_BANDS as i32;
+            let half = EQ_ROWS as i32 / 2;
+            for (band, gain) in eq.iter().enumerate() {
+                let level = gain.round().clamp(-EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB) as i32;
+                for row in 0..half {
+                    for (row_y, glyph) in [
+                        // above baseline: outer row first (top of strip)
+                        (self.eq_top + (half - 1 - row) * self.line_h, braille_row_glyph(level, row)),
+                        // below baseline: inner row first
+                        (self.eq_top + (half + row) * self.line_h, braille_row_glyph(level, row)),
+                    ] {
+                        let wide: Vec<u16> = glyph.encode_utf16().collect();
+                        if wide.is_empty() {
+                            continue;
+                        }
+                        let mut extent = SIZE::default();
+                        let _ = GetTextExtentPoint32W(self.mem_dc, &wide, &mut extent);
+                        let _ = TextOutW(
+                            self.mem_dc,
+                            band as i32 * col_w + (col_w - extent.cx) / 2,
+                            row_y,
+                            &wide,
+                        );
+                    }
+                }
             }
 
             // Playback control strip: one glyph centered in each of the four
@@ -278,5 +357,54 @@ impl Drop for Renderer {
             let _ = DeleteObject(self.font.into());
             ReleaseDC(None, self.screen_dc);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn braille_progression_matches_spec() {
+        // 0 = blank, then the 6-step dot progression, saturated beyond 6.
+        let want = [" ", "⠠", "⠤", "⠴", "⠶", "⠾", "⠿"];
+        for (levels, glyph) in want.iter().enumerate() {
+            assert_eq!(braille_glyph(levels as i32), *glyph, "levels={levels}");
+        }
+        assert_eq!(braille_glyph(7), "⠿", "beyond 6 saturates the cell");
+        assert_eq!(braille_glyph(-3), " ", "negative levels never reach a cell directly");
+    }
+
+    #[test]
+    fn band_rows_fill_middle_out() {
+        // Level 1-6: only the row adjacent to the baseline fills.
+        assert_eq!(braille_row_glyph(1, 0), "⠠");
+        assert_eq!(braille_row_glyph(5, 0), "⠾");
+        assert_eq!(braille_row_glyph(5, 1), " ", "outer row untouched below level 7");
+        // Level 7-12: inner row saturated (⠿), outer row runs the progression.
+        assert_eq!(braille_row_glyph(7, 0), "⠿");
+        assert_eq!(braille_row_glyph(7, 1), "⠠");
+        assert_eq!(braille_row_glyph(12, 1), "⠿");
+        // Negatives mirror on the rows below the baseline.
+        assert_eq!(braille_row_glyph(-3, 0), "⠴");
+        assert_eq!(braille_row_glyph(-8, 1), "⠤");
+        assert_eq!(braille_row_glyph(-9, 1), "⠴");
+        // Neutral: everything blank.
+        for row in 0..2 {
+            assert_eq!(braille_row_glyph(0, row), " ");
+        }
+    }
+
+    #[test]
+    fn eq_columns_map_by_exact_tenths() {
+        assert_eq!(eq_band_index(0, 200), 0);
+        assert_eq!(eq_band_index(19, 200), 0);
+        assert_eq!(eq_band_index(20, 200), 1);
+        assert_eq!(eq_band_index(99, 200), 4);
+        assert_eq!(eq_band_index(100, 200), 5);
+        assert_eq!(eq_band_index(199, 200), 9);
+        // Out-of-range client x clamps into the edge columns.
+        assert_eq!(eq_band_index(-50, 200), 0);
+        assert_eq!(eq_band_index(500, 200), 9);
     }
 }

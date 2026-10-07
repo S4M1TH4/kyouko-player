@@ -40,8 +40,6 @@ pub const CHUNK_CHANNEL_DEPTH: usize = 16;
 pub const EQ_BANDS: usize = 10;
 pub const EQ_BAND_HZ: [u32; EQ_BANDS] =
     [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
-pub const EQ_BAND_LABELS: [&str; EQ_BANDS] =
-    ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"];
 pub const EQ_MAX_GAIN_DB: f32 = 12.0;
 
 /// Extensions a folder scan queues. Deliberately matches the symphonia
@@ -1381,16 +1379,6 @@ fn row(content: &str) -> String {
     content.chars().take(28).collect()
 }
 
-fn band_row(labels: &[&str]) -> String {
-    labels.iter().map(|l| format!("{l:>4}")).collect()
-}
-
-fn gain_row(shared: &SharedState, start: usize) -> String {
-    (start..start + 5)
-        .map(|b| format!("{:+4.0}", shared.eq_gain_db(b)))
-        .collect()
-}
-
 /// Borderless panel — plain text lines only (the frame was removed by
 /// design); the layered window's own edges provide the boundary.
 pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
@@ -1419,14 +1407,9 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
         "eq   : {}",
         if shared.eq_enabled() { "ON" } else { "OFF" }
     )));
-    p.push('\n');
-    p.push_str(&row(&band_row(&EQ_BAND_LABELS[0..5])));
-    p.push('\n');
-    p.push_str(&row(&gain_row(shared, 0)));
-    p.push('\n');
-    p.push_str(&row(&band_row(&EQ_BAND_LABELS[5..])));
-    p.push('\n');
-    p.push_str(&row(&gain_row(shared, 5)));
+    // Band gains are NOT text rows — the window draws them as the 10-column
+    // Braille equalizer strip (ui/render.rs), tuned by hovering a column and
+    // scrolling.
     p
 }
 
@@ -2209,12 +2192,16 @@ mod tests {
     fn panel_reflects_eq_and_volume_changes() {
         let shared = SharedState::new();
         let before = render_panel(&shared, None);
-        assert!(before.contains("+0  +0  +0  +0  +0"));
-        shared.set_eq_gain(7, 8.0);
+        assert!(before.contains("eq   : ON"), "EQ defaults on: {before}");
+        // Band gains no longer render as text — they live in the Braille
+        // strip — but the ON/OFF row must follow the enable state.
+        shared.set_eq_enabled(false);
         shared.set_volume(0.3);
         let after = render_panel(&shared, None);
-        assert!(after.contains("+8"), "panel should show +8: {after}");
+        assert!(after.contains("eq   : OFF"), "panel should show EQ OFF: {after}");
         assert!(after.contains(" 30%"), "panel should show 30%: {after}");
         assert!(!after.contains(" 80%"));
+        // And the text must not carry numeric gain cells anymore.
+        assert!(!after.contains("+8"), "gains moved to the Braille strip: {after}");
     }
 }

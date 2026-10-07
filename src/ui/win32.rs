@@ -255,7 +255,8 @@ pub fn run(
         }
         (*state).tray.add(hwnd);
         // Content exists before the window is shown — no first-paint flash.
-        (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase());
+        let eq = (*state).shared.eq_gains();
+        (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase(), &eq);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         log_info!(
             "UI",
@@ -330,7 +331,8 @@ fn sync(s: &mut UiState) {
         s.last_phase = phase;
     }
     if let Some(panel) = s.broker.take_refresh() {
-        s.renderer.draw(s.hwnd, &panel, phase);
+        let eq = s.shared.eq_gains();
+        s.renderer.draw(s.hwnd, &panel, phase, &eq);
     }
 }
 
@@ -540,9 +542,10 @@ fn popup_menu(s: &mut UiState, pt: POINT) {
 /// `EQ_STRIP_ORDER` emits column-major pairs (31/1k, 62/2k, 125/4k, 250/8k,
 /// 500/16k) and MF_MENUBREAK opens a new column before each odd top row.
 /// Labels are the bare abbreviated frequency — deliberately narrow so the
-/// grid stays ~250 logical px; live gains live in the echo panel and the
-/// debug log. Tracked directly at `pt` — visually it replaces the main
-/// menu, keeping the sticky re-open mechanics identical to the volume row.
+/// grid stays ~250 logical px; live gains live in the echo panel's Braille
+/// strip and the debug log. Tracked directly at `pt` — visually it replaces
+/// the main menu, keeping the sticky re-open mechanics identical to the
+/// volume row.
 fn eq_popup(s: &mut UiState, pt: POINT) {
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return;
@@ -1095,20 +1098,42 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
-                // Wheel over the panel: ±10% volume (up = louder), same step
-                // as the tray's vol row. Routing here relies on the system
-                // "scroll inactive windows" setting (on by default) since a
-                // WS_EX_NOACTIVATE window never holds focus.
+                // WM_MOUSEWHEEL's lParam is SCREEN coordinates (unlike the
+                // mouse-button messages) — convert to client space against
+                // the window rect before geometry tests.
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rc);
+                let x = x_lparam(lp) - rc.left;
+                let y = y_lparam(lp) - rc.top;
                 let delta = wheel_delta(wp);
-                let old = s.shared.volume();
-                let new = (if delta >= 0 { old + 0.1 } else { old - 0.1 }).clamp(0.0, 1.0);
-                log_info!(
-                    "UI",
-                    "wheel volume: {}% -> {}%",
-                    (old * 100.0).round() as i32,
-                    (new * 100.0).round() as i32
-                );
-                post_command(Command::SetVolume(new));
+                if let Some(band) = s.renderer.eq_band_at(x, y) {
+                    // Over the Braille equalizer: ±1 dB on the hovered
+                    // column, clamped by SharedState at ±12 dB. The broker
+                    // applies, refreshes the panel and persists state.cfg.
+                    let old = s.shared.eq_gain_db(band);
+                    let new = old + if delta >= 0 { 1.0 } else { -1.0 };
+                    log_info!(
+                        "UI",
+                        "wheel eq[{}Hz]: {old:+.0} -> {new:+.0} dB",
+                        crate::broker::EQ_BAND_HZ[band]
+                    );
+                    post_command(Command::EqGain { band: Some(band), gain_db: new });
+                } else {
+                    // Anywhere else on the panel: ±10% master volume (same
+                    // step as the tray's vol row). Routing here relies on
+                    // the system "scroll inactive windows" setting (on by
+                    // default) since a WS_EX_NOACTIVATE window never holds
+                    // focus.
+                    let old = s.shared.volume();
+                    let new = (if delta >= 0 { old + 0.1 } else { old - 0.1 }).clamp(0.0, 1.0);
+                    log_info!(
+                        "UI",
+                        "wheel volume: {}% -> {}%",
+                        (old * 100.0).round() as i32,
+                        (new * 100.0).round() as i32
+                    );
+                    post_command(Command::SetVolume(new));
+                }
                 LRESULT(0)
             }
             WM_CLOSE => {
