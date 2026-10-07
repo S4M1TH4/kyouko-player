@@ -9,8 +9,9 @@
 //!
 //! The window is moved/sized by the caller and then purely painted through
 //! `UpdateLayeredWindow` — there is no WM_PAINT path at all. The window is
-//! also draggable from anywhere (`HTCAPTION` in the wndproc) without ever
-//! being activated.
+//! also draggable from anywhere (`HTCAPTION` in the wndproc) except the
+//! bottom playback control bar (`HTCLIENT` there), without ever being
+//! activated.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -38,8 +39,20 @@ fn last_error() -> Error {
 const PAD: i32 = 6;
 /// The 200 px the spec asks for; panel height is derived from the font.
 pub const WINDOW_W: i32 = 200;
+/// Height of the playback control strip at the window's very bottom. The
+/// wndproc hit-tests against this exact value (bottom strip = HTCLIENT →
+/// button clicks; everywhere else = HTCAPTION → native drag), so draw and
+/// hit geometry can never drift apart.
+pub const CONTROL_BAR_H: i32 = 16;
 /// Negative = per-em height: the glyph cell stays exact at any DPI.
 const FONT_HEIGHT: i32 = -9;
+
+/// Control-bar glyphs, in column order: prev track / -5s / +5s / next track.
+/// The wndproc's `WM_LBUTTONDOWN` column mapping must match this order.
+const W_PREV: &str = "<<";
+const W_BACK: &str = "<";
+const W_FWD: &str = ">";
+const W_NEXT: &str = ">>";
 
 fn accent(phase: Phase) -> [u8; 3] {
     match phase {
@@ -124,7 +137,8 @@ impl Renderer {
             }
 
             let rows = sample.lines().count() as i32;
-            let height = 2 * PAD + rows * line_h;
+            // Panel text plus the playback control strip at the bottom.
+            let height = 2 * PAD + rows * line_h + CONTROL_BAR_H;
 
             let mut bi = BITMAPINFO::default();
             bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
@@ -169,6 +183,25 @@ impl Renderer {
                 let _ = TextOutW(self.mem_dc, PAD, PAD + i as i32 * self.line_h, &wide);
             }
 
+            // Playback control strip: one glyph centered in each of the four
+            // equal columns (the wndproc maps clicks back through the same
+            // geometry). Drawn white — the alpha pass below tints it with the
+            // phase accent like every other lit pixel.
+            let bar_top = self.height - CONTROL_BAR_H;
+            let col_w = self.width / 4;
+            let text_y = bar_top + ((CONTROL_BAR_H - self.line_h) / 2).max(0);
+            for (i, label) in [W_PREV, W_BACK, W_FWD, W_NEXT].iter().enumerate() {
+                let wide: Vec<u16> = label.encode_utf16().collect();
+                let mut extent = SIZE::default();
+                let _ = GetTextExtentPoint32W(self.mem_dc, &wide, &mut extent);
+                let _ = TextOutW(
+                    self.mem_dc,
+                    i as i32 * col_w + (col_w - extent.cx) / 2,
+                    text_y,
+                    &wide,
+                );
+            }
+
             // luminance → alpha; premultiplied accent color. Pixels where GDI
             // never wrote keep a 1/255 ground plane: layered windows pass
             // mouse input (and OLE drops) straight through pixels with
@@ -186,6 +219,19 @@ impl Renderer {
                 px[1] = (u32::from(color[1]) * u32::from(lum) / 255) as u8; // G
                 px[2] = (u32::from(color[0]) * u32::from(lum) / 255) as u8; // R
                 px[3] = lum; // A
+            }
+
+            // Bar separator: a dim accent line across the bar top so the
+            // strip reads as controls, not stray glyphs. Premultiplied at
+            // ~35% into the surface, after the luminance pass.
+            let sep = (bar_top * self.width) as usize * 4;
+            for px in std::slice::from_raw_parts_mut(self.bits, len)[sep..sep + self.width as usize * 4]
+                .chunks_exact_mut(4)
+            {
+                px[0] = color[2] / 3; // B (premultiplied ~1/3 alpha)
+                px[1] = color[1] / 3; // G
+                px[2] = color[0] / 3; // R
+                px[3] = 85;
             }
 
             let blend = BLENDFUNCTION {

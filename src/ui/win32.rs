@@ -40,25 +40,27 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, NIN_SELECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer,
-    PostMessageW,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+    KillTimer, PostMessageW,
     LoadCursorW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
     SetMenuInfo, SetTimer, SetWindowLongPtrW, SetWindowsHookExW, ShowWindow,
     SystemParametersInfoW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
-    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, IDC_ARROW, MF_MENUBREAK, MF_SEPARATOR, MF_STRING,
+    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION,
+    HTCLIENT, IDC_ARROW, MF_MENUBREAK, MF_SEPARATOR, MF_STRING,
     MENUINFO,
     MENUINFO_MASK, MENUINFO_STYLE, MSG, MIM_STYLE, MNS_NOTIFYBYPOS, SPI_GETWORKAREA,
     SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, TPM_NONOTIFY,
     TPM_RIGHTBUTTON, WH_GETMESSAGE, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
     WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MENUCOMMAND,
-    WM_NCCREATE, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_TIMER,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{implement, Ref};
 
 use crate::audio::AudioOut;
 
-use super::render::Renderer;
+use super::render::{CONTROL_BAR_H, Renderer, WINDOW_W};
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status};
@@ -111,6 +113,23 @@ struct UiState {
     last_phase: Phase,
     hidden: bool,
     taskbar_created: u32,
+}
+
+/// Win32 `GET_X_LPARAM`/`GET_Y_LPARAM`: unpack the signed 16-bit halves of
+/// an LPARAM (windows-rs 0.62 dropped these helpers, so they live here).
+/// Coordinates pack as sign-extended shorts — negative values are real
+/// (multi-monitor layouts).
+fn x_lparam(lp: LPARAM) -> i32 {
+    (lp.0 & 0xFFFF) as u16 as i16 as i32
+}
+
+fn y_lparam(lp: LPARAM) -> i32 {
+    ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32
+}
+
+/// Win32 `GET_WHEEL_DELTA_WPARAM`: the high word of WM_MOUSEWHEEL's wParam.
+fn wheel_delta(wp: WPARAM) -> i16 {
+    (wp.0 >> 16) as u16 as i16
 }
 
 pub fn run(
@@ -1034,7 +1053,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 sync(s);
                 LRESULT(0)
             }
-            WM_NCHITTEST => LRESULT(HTCAPTION as isize), // drag anywhere, activate never
+            WM_NCHITTEST => {
+                // Bottom control strip = client area (button clicks reach
+                // WM_LBUTTONDOWN); everywhere else = caption, so Windows
+                // natively drag-moves the window with left-click and no
+                // custom drag state exists anywhere.
+                let y = y_lparam(lp);
+                let mut rc = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut rc);
+                if y >= rc.bottom - CONTROL_BAR_H {
+                    LRESULT(HTCLIENT as isize)
+                } else {
+                    LRESULT(HTCAPTION as isize)
+                }
+            }
+            WM_LBUTTONDOWN => {
+                // Only the control strip is HTCLIENT, so a client left-click
+                // is a bar click: four equal-width columns map to
+                // prev / -5s / +5s / next, matching the drawn glyphs.
+                let x = x_lparam(lp);
+                let y = y_lparam(lp);
+                let height = s.renderer.size().1;
+                if y >= height - CONTROL_BAR_H {
+                    let col = (x.clamp(0, WINDOW_W - 1) * 4 / WINDOW_W) as usize;
+                    log_debug!("UI", "control bar click col {col}");
+                    match col {
+                        0 => post_command(Command::PrevTrack),
+                        1 => post_command(Command::SeekRelative(-5.0)),
+                        2 => post_command(Command::SeekRelative(5.0)),
+                        _ => post_command(Command::NextTrack),
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN | WM_NCRBUTTONDOWN => {
+                // Right-click anywhere pauses/resumes. Both message flavors
+                // arrive: the bar is HTCLIENT (WM_RBUTTONDOWN), the rest of
+                // the window is HTCAPTION (WM_NCRBUTTONDOWN).
+                log_debug!("UI", "right-click: toggle pause");
+                post_command(Command::TogglePause);
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                // Wheel over the panel: ±10% volume (up = louder), same step
+                // as the tray's vol row. Routing here relies on the system
+                // "scroll inactive windows" setting (on by default) since a
+                // WS_EX_NOACTIVATE window never holds focus.
+                let delta = wheel_delta(wp);
+                let old = s.shared.volume();
+                let new = (if delta >= 0 { old + 0.1 } else { old - 0.1 }).clamp(0.0, 1.0);
+                log_info!(
+                    "UI",
+                    "wheel volume: {}% -> {}%",
+                    (old * 100.0).round() as i32,
+                    (new * 100.0).round() as i32
+                );
+                post_command(Command::SetVolume(new));
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 // Closing the echo hides it; playback continues. Quit lives in
                 // the tray menu and the terminal.

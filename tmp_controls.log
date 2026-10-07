@@ -1,0 +1,166 @@
+[  0.000s INFO     MAIN] kyouko-player 0.1.0 — the mountain echo; only heard, never seen
+[  0.001s INFO     MAIN] restored: volume 100%, eq (flat), loop OFF, last_track C:\Users\rei\Music\genie in a bottle by christina aguilera (slowed down).mp3
+[  0.001s INFO     MAIN] launch track: file(C:\Users\rei\Music\genie in a bottle by christina aguilera (slowed down).mp3) (staged paused)
+[  0.001s INFO  DECODER] online — parked on command channel (zero CPU)
+[  0.020s INFO    AUDIO] output: Speakers (Realtek(R) Audio) — 48000 Hz, 2 ch, F32
+[  0.444s INFO     MAIN] broker online — entering sleep-on-idle event loop
+[  0.444s INFO     TERM] ready — type 'help' for commands
+[  0.476s INFO     TRAY] icon registered (procedural mountain+echo, no asset)
+[  0.479s INFO       UI] echo window up: 200x118 @ (2668,12) — layered, topmost, non-activating
+[  0.479s INFO   BROKER] load [staged paused]: file(C:\Users\rei\Music\genie in a bottle by christina aguilera (slowed down).mp3)
+[  0.479s INFO   BROKER] phase: STOPPED -> LOADING (load requested)
+[  0.480s INFO  DECODER] opened: 44100 Hz, 2 ch, 228, title None
+[  0.485s INFO   BROKER] opened: file(C:\Users\rei\Music\genie in a bottle by christina aguilera (slowed down).mp3) — 44100 Hz, 2 ch, 03:48
+[  0.485s INFO   BROKER] phase: LOADING -> PAUSED  (staged — resume to play)
+[  6.827s INFO       UI] ole drag enter: accepted=true
+[  7.529s INFO       UI] drop: C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3
+[  7.529s INFO   BROKER] drop queue: 1 media files (newest first)
+[  7.529s INFO   BROKER] load: file(C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3)
+[  7.529s INFO   BROKER] phase: PAUSED  -> LOADING (load requested)
+[  7.530s INFO  DECODER] opened: 44100 Hz, 2 ch, 304, title None
+[  7.530s INFO   BROKER] opened: file(C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3) — 44100 Hz, 2 ch, 05:04
+[  7.530s INFO   BROKER] phase: LOADING -> PLAYING (stream opened)
+[  7.531s INFO    AUDIO] output running
+[  7.531s INFO       UI] 1 Hz panel timer ON (playing)
+[ 31.126s INFO   BROKER] phase: PLAYING -> PAUSED  (toggle)
+[ 31.126s INFO    AUDIO] output paused — zero CPU until resumed
+[ 31.126s INFO       UI] 1 Hz panel timer OFF — zero wake-ups until resumed
+[ 31.903s INFO   BROKER] phase: PAUSED  -> PLAYING (toggle)
+[ 31.904s INFO    AUDIO] output running
+[ 31.904s INFO       UI] 1 Hz panel timer ON (playing)
+[ 34.974s INFO       UI] wheel volume: 100% -> 90%
+[ 34.974s INFO   BROKER] volume: 90%
+[ 35.047s INFO       UI] wheel volume: 90% -> 80%
+[ 35.047s INFO   BROKER] volume: 80%
+[ 35.086s INFO       UI] wheel volume: 80% -> 70%
+[ 35.086s INFO   BROKER] volume: 70%
+[ 35.151s INFO       UI] wheel volume: 70% -> 60%
+[ 35.151s INFO   BROKER] volume: 60%
+[ 35.502s INFO       UI] wheel volume: 60% -> 50%
+[ 35.502s INFO   BROKER] volume: 50%
+[ 35.518s INFO       UI] wheel volume: 50% -> 40%
+[ 35.518s INFO   BROKER] volume: 40%
+[ 35.542s INFO       UI] wheel volume: 40% -> 30%
+[ 35.542s INFO   BROKER] volume: 30%
+[ 35.567s INFO       UI] wheel volume: 30% -> 20%
+[ 35.567s INFO   BROKER] volume: 20%
+[ 35.622s INFO       UI] wheel volume: 20% -> 10%
+[ 35.622s INFO   BROKER] volume: 10%
+[ 35.718s INFO       UI] wheel volume: 10% -> 0%
+[ 35.719s INFO   BROKER] volume: 0%
+[ 36.206s INFO       UI] wheel volume: 0% -> 10%
+[ 36.206s INFO   BROKER] volume: 10%
+[ 36.230s INFO       UI] wheel volume: 10% -> 20%
+[ 36.230s INFO   BROKER] volume: 20%
+[ 36.247s INFO       UI] wheel volume: 20% -> 30%
+[ 36.247s INFO   BROKER] volume: 30%
+[ 36.270s INFO       UI] wheel volume: 30% -> 40%
+[ 36.270s INFO   BROKER] volume: 40%
+[ 36.302s INFO       UI] wheel volume: 40% -> 50%
+[ 36.302s INFO   BROKER] volume: 50%
+[ 36.368s INFO       UI] wheel volume: 50% -> 60%
+[ 36.368s INFO   BROKER] volume: 60%
+[ 36.638s INFO       UI] wheel volume: 60% -> 70%
+[ 36.638s INFO   BROKER] volume: 70%
+[ 36.654s INFO       UI] wheel volume: 70% -> 80%
+[ 36.654s INFO   BROKER] volume: 80%
+[ 36.670s INFO       UI] wheel volume: 80% -> 90%
+[ 36.670s INFO   BROKER] volume: 90%
+[ 36.687s INFO       UI] wheel volume: 90% -> 100%
+[ 36.687s INFO   BROKER] volume: 100%
+[ 36.718s INFO       UI] wheel volume: 100% -> 100%
+[ 36.718s INFO   BROKER] volume: 100%
+[ 41.030s INFO   BROKER] seek -5.0s
+[ 41.030s INFO  DECODER] seek -5.0s -> playhead 27.4s
+[ 42.206s INFO   BROKER] seek +5.0s
+[ 42.208s INFO  DECODER] seek +5.0s -> playhead 33.6s
+[ 43.302s INFO   BROKER] navigate prev: folder track 0 -> 0 (of 0)
+[ 43.302s INFO   BROKER] load: file(C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3)
+[ 43.302s INFO   BROKER] phase: PLAYING -> LOADING (load requested)
+[ 43.302s INFO    AUDIO] output paused — zero CPU until resumed
+[ 43.303s INFO       UI] 1 Hz panel timer OFF — zero wake-ups until resumed
+[ 43.303s INFO  DECODER] opened: 44100 Hz, 2 ch, 304, title None
+[ 43.304s INFO   BROKER] opened: file(C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3) — 44100 Hz, 2 ch, 05:04
+[ 43.304s INFO   BROKER] phase: LOADING -> PLAYING (stream opened)
+[ 43.306s INFO    AUDIO] output running
+[ 43.306s INFO       UI] 1 Hz panel timer ON (playing)
+[ 44.543s INFO   BROKER] navigate: end of folder queue — stopping
+[ 44.543s INFO   BROKER] stop
+[ 44.543s INFO   BROKER] phase: PLAYING -> STOPPED (stop)
+[ 44.543s INFO    AUDIO] output paused — zero CPU until resumed
+[ 44.543s INFO       UI] 1 Hz panel timer OFF — zero wake-ups until resumed
+[ 51.097s INFO       UI] ole drag enter: accepted=true
+[ 51.496s INFO       UI] drop: 3 paths
+[ 51.496s INFO       UI] drop: C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3
+[ 51.497s INFO   BROKER] drop queue: 3 media files (newest first)
+[ 51.497s INFO   BROKER] load: file(C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3)
+[ 51.497s INFO   BROKER] phase: STOPPED -> LOADING (load requested)
+[ 51.497s INFO  DECODER] opened: 44100 Hz, 2 ch, 304, title None
+[ 51.498s INFO   BROKER] opened: file(C:\Users\rei\Music\Alstroemeria Records - Ancient.mp3) — 44100 Hz, 2 ch, 05:04
+[ 51.498s INFO   BROKER] phase: LOADING -> PLAYING (stream opened)
+[ 51.499s INFO    AUDIO] output running
+[ 51.499s INFO       UI] 1 Hz panel timer ON (playing)
+[ 52.678s INFO   BROKER] navigate next: folder track 0 -> 1 (of 2)
+[ 52.678s INFO   BROKER] load: file(C:\Users\rei\Music\A-One Break the Hierarchie.mp3)
+[ 52.678s INFO   BROKER] phase: PLAYING -> LOADING (load requested)
+[ 52.678s INFO    AUDIO] output paused — zero CPU until resumed
+[ 52.678s INFO       UI] 1 Hz panel timer OFF — zero wake-ups until resumed
+[ 52.680s INFO  DECODER] opened: 44100 Hz, 2 ch, 250, title None
+[ 52.680s INFO   BROKER] opened: file(C:\Users\rei\Music\A-One Break the Hierarchie.mp3) — 44100 Hz, 2 ch, 04:10
+[ 52.680s INFO   BROKER] phase: LOADING -> PLAYING (stream opened)
+[ 52.681s INFO    AUDIO] output running
+[ 52.681s INFO       UI] 1 Hz panel timer ON (playing)
+[ 54.326s INFO   BROKER] navigate next: folder track 1 -> 2 (of 2)
+[ 54.327s INFO   BROKER] load: file(C:\Users\rei\Music\AROUND THE WORLD (MIKU VERSION).mp3)
+[ 54.327s INFO   BROKER] phase: PLAYING -> LOADING (load requested)
+[ 54.327s INFO    AUDIO] output paused — zero CPU until resumed
+[ 54.327s INFO       UI] 1 Hz panel timer OFF — zero wake-ups until resumed
+[ 54.327s INFO  DECODER] opened: 44100 Hz, 2 ch, 231, title None
+[ 54.328s INFO   BROKER] opened: file(C:\Users\rei\Music\AROUND THE WORLD (MIKU VERSION).mp3) — 44100 Hz, 2 ch, 03:51
+[ 54.328s INFO   BROKER] phase: LOADING -> PLAYING (stream opened)
+[ 54.330s INFO    AUDIO] output running
+[ 54.330s INFO       UI] 1 Hz panel timer ON (playing)
+[ 56.254s INFO   BROKER] phase: PLAYING -> PAUSED  (toggle)
+[ 56.254s INFO    AUDIO] output paused — zero CPU until resumed
+[ 56.254s INFO       UI] 1 Hz panel timer OFF — zero wake-ups until resumed
+[ 56.814s INFO   BROKER] phase: PAUSED  -> PLAYING (toggle)
+[ 56.814s INFO    AUDIO] output running
+[ 56.814s INFO       UI] 1 Hz panel timer ON (playing)
+[ 57.670s INFO       UI] wheel volume: 100% -> 90%
+[ 57.670s INFO   BROKER] volume: 90%
+[ 57.686s INFO       UI] wheel volume: 90% -> 80%
+[ 57.686s INFO   BROKER] volume: 80%
+[ 57.710s INFO       UI] wheel volume: 80% -> 70%
+[ 57.710s INFO   BROKER] volume: 70%
+[ 57.742s INFO       UI] wheel volume: 70% -> 60%
+[ 57.742s INFO   BROKER] volume: 60%
+[ 57.790s INFO       UI] wheel volume: 60% -> 50%
+[ 57.790s INFO   BROKER] volume: 50%
+[ 61.086s INFO       UI] wheel volume: 50% -> 60%
+[ 61.086s INFO   BROKER] volume: 60%
+[ 61.110s INFO       UI] wheel volume: 60% -> 70%
+[ 61.110s INFO   BROKER] volume: 70%
+[ 61.142s INFO       UI] wheel volume: 70% -> 80%
+[ 61.142s INFO   BROKER] volume: 80%
+[ 61.174s INFO       UI] wheel volume: 80% -> 90%
+[ 61.174s INFO   BROKER] volume: 90%
+[ 61.230s INFO       UI] wheel volume: 90% -> 100%
+[ 61.230s INFO   BROKER] volume: 100%
+[ 62.054s INFO       UI] wheel volume: 100% -> 90%
+[ 62.054s INFO   BROKER] volume: 90%
+[ 62.110s INFO       UI] wheel volume: 90% -> 80%
+[ 62.110s INFO   BROKER] volume: 80%
+[ 69.046s INFO   BROKER] seek +5.0s
+[ 69.047s INFO  DECODER] seek +5.0s -> playhead 19.2s
+[ 72.326s INFO   BROKER] seek -5.0s
+[ 72.326s INFO  DECODER] seek -5.0s -> playhead 17.4s
+[ 83.534s INFO   BROKER] phase: PLAYING -> PAUSED  (toggle)
+[ 83.534s INFO    AUDIO] output paused — zero CPU until resumed
+[ 83.534s INFO       UI] 1 Hz panel timer OFF — zero wake-ups until resumed
+[150.065s INFO     TERM] stdin closed — parking thread forever (zero polling)
+[150.065s INFO   BROKER] quit — shutting decoder down (kills yt-dlp child)
+[150.066s INFO   BROKER] phase: PAUSED  -> STOPPED (quit)
+[150.067s INFO  DECODER] offline
+[150.436s INFO       UI] pump over — presentation released
+[150.436s INFO     MAIN] event loop over — reaping decoder
+[150.436s INFO     MAIN] shutdown complete — echo faded
