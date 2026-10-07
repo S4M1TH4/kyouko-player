@@ -1804,6 +1804,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
     fn load_dropped_with_no_media_leaves_state_untouched() {
         let (mut broker, _, rx) = broker_with_sink();
         broker.handle_command(Command::LoadDropped(vec![

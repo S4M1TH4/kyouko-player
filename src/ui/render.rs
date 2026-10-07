@@ -73,11 +73,28 @@ fn braille_glyph(levels: i32) -> &'static str {
 }
 
 /// Braille glyph for row `row` (0 = adjacent to the middle baseline, growing
-/// outward) of a band at `level` (-12..+12 dB). Direction comes from which
-/// side of the baseline the row sits on, so negative levels use the same
-/// glyphs on the rows below the baseline.
+/// outward) of a band at `level` (-12..+12 dB) on the row's own side of the
+/// baseline. Direction comes from which side of the baseline the row sits
+/// on, so negative levels use the same glyphs on the rows below the baseline.
 fn braille_row_glyph(level: i32, row: i32) -> &'static str {
     braille_glyph(level.abs() - 6 * row)
+}
+
+/// Glyph for physical strip row `strip_row` (0 = top of the strip,
+/// `EQ_ROWS - 1` = bottom) of a band at `level`. Encodes the side
+/// exclusivity: positive levels light only the rows above the baseline,
+/// negative levels only the rows below, and level 0 leaves every row blank.
+/// Rows fill middle-out: `braille_row_glyph` maps the mirrored pair to the
+/// inner-row-first progression in both directions.
+fn eq_strip_glyph(level: i32, strip_row: usize) -> &'static str {
+    let half = EQ_ROWS / 2;
+    if level > 0 && strip_row < half {
+        braille_row_glyph(level, (half - 1 - strip_row) as i32)
+    } else if level < 0 && strip_row >= half {
+        braille_row_glyph(level, (strip_row - half) as i32)
+    } else {
+        " "
+    }
 }
 
 /// Which of the 10 equalizer columns does a client x fall in? Pure mapping
@@ -233,32 +250,26 @@ impl Renderer {
 
             // Braille equalizer: 10 columns across the full width, filling
             // middle-out from the invisible baseline between the two inner
-            // rows. One glyph per cell, centered in its tenth-column.
+            // rows. One glyph per cell, centered in its tenth-column. Side
+            // exclusivity and fill direction live in `eq_strip_glyph`.
             self.eq_top = PAD + panel.lines().count() as i32 * self.line_h;
             let col_w = self.width / EQ_BANDS as i32;
-            let half = EQ_ROWS as i32 / 2;
             for (band, gain) in eq.iter().enumerate() {
                 let level = gain.round().clamp(-EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB) as i32;
-                for row in 0..half {
-                    for (row_y, glyph) in [
-                        // above baseline: outer row first (top of strip)
-                        (self.eq_top + (half - 1 - row) * self.line_h, braille_row_glyph(level, row)),
-                        // below baseline: inner row first
-                        (self.eq_top + (half + row) * self.line_h, braille_row_glyph(level, row)),
-                    ] {
-                        let wide: Vec<u16> = glyph.encode_utf16().collect();
-                        if wide.is_empty() {
-                            continue;
-                        }
-                        let mut extent = SIZE::default();
-                        let _ = GetTextExtentPoint32W(self.mem_dc, &wide, &mut extent);
-                        let _ = TextOutW(
-                            self.mem_dc,
-                            band as i32 * col_w + (col_w - extent.cx) / 2,
-                            row_y,
-                            &wide,
-                        );
+                for strip_row in 0..EQ_ROWS {
+                    let glyph = eq_strip_glyph(level, strip_row);
+                    if glyph == " " {
+                        continue;
                     }
+                    let wide: Vec<u16> = glyph.encode_utf16().collect();
+                    let mut extent = SIZE::default();
+                    let _ = GetTextExtentPoint32W(self.mem_dc, &wide, &mut extent);
+                    let _ = TextOutW(
+                        self.mem_dc,
+                        band as i32 * col_w + (col_w - extent.cx) / 2,
+                        self.eq_top + strip_row as i32 * self.line_h,
+                        &wide,
+                    );
                 }
             }
 
@@ -373,6 +384,50 @@ mod tests {
         }
         assert_eq!(braille_glyph(7), "⠿", "beyond 6 saturates the cell");
         assert_eq!(braille_glyph(-3), " ", "negative levels never reach a cell directly");
+    }
+
+    #[test]
+    fn eq_strip_sides_are_mutually_exclusive() {
+        // Positive gains light only the rows above the baseline.
+        for strip_row in 2..EQ_ROWS {
+            assert_eq!(eq_strip_glyph(5, strip_row), " ", "+5 lower row {strip_row}");
+        }
+        // Negative gains light only the rows below the baseline.
+        for strip_row in 0..2 {
+            assert_eq!(eq_strip_glyph(-5, strip_row), " ", "-5 upper row {strip_row}");
+        }
+        // Zero leaves the whole strip blank (4/4 rows are the space cell).
+        for strip_row in 0..EQ_ROWS {
+            assert_eq!(eq_strip_glyph(0, strip_row), " ", "level 0 row {strip_row}");
+        }
+    }
+
+    #[test]
+    fn eq_strip_positive_fills_inner_row_first() {
+        // Inner upper row (strip row 1) runs the 6-dot progression for +1..+6.
+        for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
+            assert_eq!(eq_strip_glyph(lvl as i32 + 1, 1), *glyph, "level +{}", lvl + 1);
+            assert_eq!(eq_strip_glyph(lvl as i32 + 1, 0), " ", "outer row must stay blank at +{}", lvl + 1);
+        }
+        // +7..+12: inner row saturates, outer row runs the progression.
+        for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
+            assert_eq!(eq_strip_glyph(lvl as i32 + 7, 1), "⠿", "inner saturated at +{}", lvl + 7);
+            assert_eq!(eq_strip_glyph(lvl as i32 + 7, 0), *glyph, "outer row at +{}", lvl + 7);
+        }
+    }
+
+    #[test]
+    fn eq_strip_negative_fills_inner_row_first() {
+        // Inner lower row (strip row 2) runs the 6-dot progression for -1..-6.
+        for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
+            assert_eq!(eq_strip_glyph(-(lvl as i32) - 1, 2), *glyph, "level -{}", lvl + 1);
+            assert_eq!(eq_strip_glyph(-(lvl as i32) - 1, 3), " ", "outer row must stay blank at -{}", lvl + 1);
+        }
+        // -7..-12: inner row saturates, outer (bottom-most) row fills next.
+        for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
+            assert_eq!(eq_strip_glyph(-(lvl as i32) - 7, 2), "⠿", "inner saturated at -{}", lvl + 7);
+            assert_eq!(eq_strip_glyph(-(lvl as i32) - 7, 3), *glyph, "outer row at -{}", lvl + 7);
+        }
     }
 
     #[test]
