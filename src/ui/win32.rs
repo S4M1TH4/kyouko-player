@@ -60,7 +60,7 @@ use windows::core::{implement, Ref};
 
 use crate::audio::AudioOut;
 
-use super::render::{CONTROL_BAR_H, Renderer, WINDOW_W};
+use super::render::{CONTROL_BAR_H, Renderer, StatusToggle, WINDOW_W};
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status};
@@ -1057,23 +1057,31 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_NCHITTEST => {
-                // Bottom control strip = client area (button clicks reach
-                // WM_LBUTTONDOWN); everywhere else = caption, so Windows
-                // natively drag-moves the window with left-click and no
-                // custom drag state exists anywhere.
-                let y = y_lparam(lp);
+                // Interactive zones = client area (clicks reach
+                // WM_LBUTTONDOWN): the bottom control strip, the Braille EQ
+                // strip (wheel tunes it; left-click there is a no-op), and
+                // the eq/repeat status chunks. Everywhere else = caption, so
+                // Windows natively drag-moves the window with left-click and
+                // no custom drag state exists anywhere.
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
-                if y >= rc.bottom - CONTROL_BAR_H {
+                // WM_NCHITTEST's lParam is SCREEN coordinates — convert to
+                // client space before the strip/status geometry tests.
+                let x = x_lparam(lp) - rc.left;
+                let y = y_lparam(lp) - rc.top;
+                if y >= rc.bottom - rc.top - CONTROL_BAR_H
+                    || s.renderer.eq_band_at(x, y).is_some()
+                    || s.renderer.status_toggle_at(x, y).is_some()
+                {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTCAPTION as isize)
                 }
             }
             WM_LBUTTONDOWN => {
-                // Only the control strip is HTCLIENT, so a client left-click
-                // is a bar click: four equal-width columns map to
-                // prev / -5s / +5s / next, matching the drawn glyphs.
+                // Client left-clicks arrive only over the HTCLIENT zones:
+                // the control strip (four equal-width columns map to
+                // prev / -5s / +5s / next) and the eq/repeat status chunks.
                 let x = x_lparam(lp);
                 let y = y_lparam(lp);
                 let height = s.renderer.size().1;
@@ -1086,7 +1094,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         2 => post_command(Command::SeekRelative(5.0)),
                         _ => post_command(Command::NextTrack),
                     }
+                } else if let Some(toggle) = s.renderer.status_toggle_at(x, y) {
+                    match toggle {
+                        StatusToggle::Eq => {
+                            log_debug!("UI", "status click: toggle eq");
+                            post_command(Command::ToggleEq);
+                        }
+                        StatusToggle::Repeat => {
+                            log_debug!("UI", "status click: toggle repeat");
+                            post_command(Command::ToggleLoop);
+                        }
+                    }
                 }
+                // Left-clicks on the Braille EQ strip do nothing (tuning is
+                // wheel-driven); the window never enters a drag from an
+                // HTCLIENT zone.
                 LRESULT(0)
             }
             WM_RBUTTONDOWN | WM_NCRBUTTONDOWN => {

@@ -50,6 +50,50 @@ const EQ_ROWS: usize = 4;
 /// Negative = per-em height: the glyph cell stays exact at any DPI.
 const FONT_HEIGHT: i32 = -9;
 
+/// Which clickable status chunk sits under a point?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusToggle {
+    /// The `eq   : ON/OFF` chunk (toggles `Command::ToggleEq`).
+    Eq,
+    /// The `repeat: ON/OFF` chunk (toggles `Command::ToggleLoop`).
+    Repeat,
+}
+
+/// Clickable columns (in Consolas advance units from the left pad) of the
+/// dual status line's two chunks: `eq   : ON ` spans columns 0..9 and
+/// `repeat: OFF` columns 15..25. `render_panel` in broker.rs formats the
+/// line with exactly this column table — drawing and hit-testing share it,
+/// so they can never drift apart.
+const STATUS_EQ_COLS: (i32, i32) = (0, 10);
+const STATUS_REPEAT_COLS: (i32, i32) = (15, 11);
+
+/// Which status chunk (if any) does a CLIENT-coordinate point hit? The
+/// clickable band is the last panel line's full label+state chunks; the
+/// gap between them (and the rest of the panel) stays caption (drag).
+/// Pure so hit geometry stays unit-testable without GDI.
+pub fn status_toggle_at(
+    x: i32,
+    y: i32,
+    eq_top: i32,
+    line_h: i32,
+    char_w: i32,
+) -> Option<StatusToggle> {
+    let y0 = eq_top - line_h; // last panel line: the eq/repeat status row
+    if y < y0 || y >= eq_top {
+        return None;
+    }
+    let col_x = |col: i32| PAD + col * char_w;
+    let (eq_col, eq_len) = STATUS_EQ_COLS;
+    if x >= col_x(eq_col) && x < col_x(eq_col + eq_len) {
+        return Some(StatusToggle::Eq);
+    }
+    let (rp_col, rp_len) = STATUS_REPEAT_COLS;
+    if x >= col_x(rp_col) && x < col_x(rp_col + rp_len) {
+        return Some(StatusToggle::Repeat);
+    }
+    None
+}
+
 /// Control-bar glyphs, in column order: prev track / -5s / +5s / next track.
 /// The wndproc's `WM_LBUTTONDOWN` column mapping must match this order.
 const W_PREV: &str = "<<";
@@ -117,6 +161,9 @@ pub struct Renderer {
     width: i32,
     height: i32,
     line_h: i32,
+    /// Monospace advance width of one Consolas cell — the unit behind the
+    /// status-line column table (`STATUS_*_COLS`).
+    char_w: i32,
     /// Client y where the Braille equalizer strip begins (panel text ends);
     /// recomputed on every draw from the panel's line count.
     eq_top: i32,
@@ -170,6 +217,7 @@ impl Renderer {
             let mut tm = TEXTMETRICW::default();
             GetTextMetricsW(mem_dc, &mut tm).ok()?;
             let line_h = tm.tmHeight + tm.tmExternalLeading;
+            let char_w = tm.tmAveCharWidth.max(1);
 
             let widest = sample
                 .lines()
@@ -209,6 +257,7 @@ impl Renderer {
                 width: WINDOW_W,
                 height,
                 line_h,
+                char_w,
                 eq_top: PAD + rows * line_h,
                 screen_dc,
                 mem_dc,
@@ -232,6 +281,12 @@ impl Renderer {
             return None;
         }
         Some(eq_band_index(x, self.width))
+    }
+
+    /// Which clickable status chunk (eq / repeat) does a CLIENT-coordinate
+    /// point hit, if any? Delegates to the pure column-table helper.
+    pub fn status_toggle_at(&self, x: i32, y: i32) -> Option<StatusToggle> {
+        status_toggle_at(x, y, self.eq_top, self.line_h, self.char_w)
     }
 
     /// Paint `panel` with `phase`'s accent color and the 10-band gains as
@@ -448,6 +503,39 @@ mod tests {
         for row in 0..2 {
             assert_eq!(braille_row_glyph(0, row), " ");
         }
+    }
+
+    #[test]
+    fn status_toggle_hit_regions() {
+        // Renderer-shaped geometry: 5 panel lines of 11 px, char_w 5 →
+        // eq_top = 61; the status row spans y ∈ [50, 61).
+        let (eq_top, line_h, char_w) = (PAD + 5 * 11, 11, 5);
+        let col_x = |col: i32| PAD + col * char_w;
+        let mid = eq_top - line_h / 2;
+        // eq chunk (columns 0..10) hits Eq anywhere in its band.
+        for col in [0, 5, 9] {
+            assert_eq!(
+                status_toggle_at(col_x(col), mid, eq_top, line_h, char_w),
+                Some(StatusToggle::Eq),
+                "eq chunk col {col}"
+            );
+        }
+        // The gap between the chunks (columns 10..15) stays caption (drag).
+        assert_eq!(status_toggle_at(col_x(12), mid, eq_top, line_h, char_w), None);
+        // repeat chunk (columns 15..26) hits Repeat.
+        for col in [15, 20, 25] {
+            assert_eq!(
+                status_toggle_at(col_x(col), mid, eq_top, line_h, char_w),
+                Some(StatusToggle::Repeat),
+                "repeat chunk col {col}"
+            );
+        }
+        // Beyond the repeat chunk: caption again.
+        assert_eq!(status_toggle_at(col_x(26), mid, eq_top, line_h, char_w), None);
+        // Vertically outside the status row (panel above, EQ strip below):
+        // no status hit.
+        assert_eq!(status_toggle_at(col_x(0), eq_top - line_h - 1, eq_top, line_h, char_w), None);
+        assert_eq!(status_toggle_at(col_x(0), eq_top, eq_top, line_h, char_w), None);
     }
 
     #[test]

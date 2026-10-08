@@ -1205,6 +1205,7 @@ impl Broker {
             Command::EqEnabled(on) => {
                 self.shared.set_eq_enabled(on);
                 log_info!("BROKER", "eq: {}", if on { "ON" } else { "OFF" });
+                self.refresh();
             }
             // Bypass only: eq_enabled gates the biquad pass in the decoder;
             // the saved band gains are untouched, so nothing to persist.
@@ -1212,11 +1213,13 @@ impl Broker {
                 let on = !self.shared.eq_enabled();
                 self.shared.set_eq_enabled(on);
                 log_info!("BROKER", "eq: {}", if on { "ON" } else { "OFF" });
+                self.refresh();
             }
             Command::ToggleLoop => {
                 let on = !self.shared.loop_enabled();
                 self.shared.set_loop_enabled(on);
                 log_info!("LOOP", "repeat: {}", if on { "ON" } else { "OFF" });
+                self.refresh();
                 self.persist();
             }
             // Presentation-side command: the Win32 drain intercepts this and
@@ -1403,9 +1406,15 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     p.push('\n');
     p.push_str(&row(&format!("vol  : {bar} {:>3}%", (v * 100.0).round() as u32)));
     p.push('\n');
+    // Dual status row: eq state + repeat state side-by-side. The column
+    // layout is fixed by ui/render.rs's STATUS_*_COLS hit-test table
+    // (`eq   : ON ` at columns 0..9, `repeat: OFF` at 15..25) — keep the
+    // format in sync. The compact spacing fits the 200 px window interior
+    // and the 28-char row cap.
     p.push_str(&row(&format!(
-        "eq   : {}",
-        if shared.eq_enabled() { "ON" } else { "OFF" }
+        "eq   : {:<3}     repeat: {}",
+        if shared.eq_enabled() { "ON" } else { "OFF" },
+        if shared.loop_enabled() { "ON" } else { "OFF" },
     )));
     // Band gains are NOT text rows — the window draws them as the 10-column
     // Braille equalizer strip (ui/render.rs), tuned by hovering a column and
@@ -2204,5 +2213,40 @@ mod tests {
         assert!(!after.contains(" 80%"));
         // And the text must not carry numeric gain cells anymore.
         assert!(!after.contains("+8"), "gains moved to the Braille strip: {after}");
+    }
+
+    #[test]
+    fn panel_shows_eq_and_repeat_side_by_side() {
+        let shared = SharedState::new();
+        let line = render_panel(&shared, None).lines().nth(4).unwrap().to_string();
+        // Both chunks on the 5th row: eq first, repeat after it.
+        assert!(line.starts_with("eq   : ON"), "eq chunk first: {line}");
+        assert!(line.contains("repeat: OFF"), "repeat chunk after eq: {line}");
+        // The repeat chunk sits at a fixed column regardless of the eq
+        // state width (matches render.rs's STATUS_REPEAT_COLS hit table).
+        shared.set_eq_enabled(false);
+        let off = render_panel(&shared, None).lines().nth(4).unwrap().to_string();
+        assert_eq!(off.find("repeat:"), line.find("repeat:"), "repeat column drifts: {off}");
+    }
+
+    #[test]
+    fn toggling_loop_refreshes_panel_and_persists() {
+        let (mut broker, sink, _rx) = broker_with_sink();
+        broker.handle_command(Command::ToggleLoop);
+        let panel = broker.take_refresh().expect("loop toggle marks the view dirty");
+        assert!(panel.contains("repeat: ON"), "live repeat state: {panel}");
+        assert!(sink.lock().unwrap().last().unwrap().loop_enabled);
+        // Second toggle back and the panel follows again.
+        broker.handle_command(Command::ToggleLoop);
+        let panel = broker.take_refresh().expect("second toggle also refreshes");
+        assert!(panel.contains("repeat: OFF"), "live repeat state: {panel}");
+    }
+
+    #[test]
+    fn toggling_eq_refreshes_panel() {
+        let (mut broker, _sink, _rx) = broker_with_sink();
+        broker.handle_command(Command::ToggleEq);
+        let panel = broker.take_refresh().expect("eq toggle marks the view dirty");
+        assert!(panel.contains("eq   : OFF"), "live eq state: {panel}");
     }
 }
