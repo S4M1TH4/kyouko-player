@@ -9,7 +9,7 @@
 //!   [window / tray / hotkeys] ──────────────▶ [MAIN / broker] ───────────────▶ [decoder thread]
 //!    native Win32 messages                   blocked in GetMessageW*          parked in recv()/select!
 //!                                             owns: window, tray, Stream
-//!                                                    ▲                              │ AudioChunk (bounded 16)
+//!                                                    ▲                              │ pooled AudioChunk (bounded)
 //!                                                    │ Status (bounded 16)          ▼
 //!                                                    └──────────────────── [WASAPI callback thread]
 //!                                                step 2: PostMessageW wake     try_recv pop → memcpy out
@@ -130,8 +130,12 @@ fn main() {
         });
     }
 
+    // Fix the device layout before allocating the PCM pool or starting decode.
+    let device = audio::output_device(&shared);
     let audio = audio::spawn(shared.clone(), decoder_rx, status_tx);
-    let audio_out = match audio::open_output_stream(audio.chunk_rx, audio.drained_tx, shared.clone()) {
+    let audio_out = match device.and_then(|(device, config)| {
+        audio::open_output_stream(device, config, audio.chunk_rx, audio.drained_tx, shared.clone())
+    }) {
         Ok(stream) => AudioOut::new(Some(stream)),
         Err(e) => {
             log_error!("MAIN", "audio output unavailable: {e} — running silent");

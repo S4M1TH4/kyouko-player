@@ -7,10 +7,10 @@
 //!         → volume scale
 //!         → linear resampler (only when source rate ≠ device rate)
 //!         → channel mix (only when source ≠ device layout)
-//!         → AudioChunk (4096 frames, generation-stamped) → bounded(16) channel
+//!         → pooled AudioChunk (4096 frames, generation-stamped) → bounded PCM ring
 //!
 //!   cpal/WASAPI callback (event-driven, OS-scheduled):
-//!         try_recv chunk → memcpy; silence on underrun; never blocks
+//!         try_recv chunk → copy/convert → recycle block; never allocates or blocks
 //! ```
 //!
 //! Zero-poll contract of the decoder thread:
@@ -28,12 +28,14 @@
 //! the one case the decoder can't handle itself: a network-stalled pipe read
 //! that would otherwise defer the next command indefinitely.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::process::{Child, Stdio};
 #[cfg(test)]
 use std::process::Command;
 use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -50,7 +52,7 @@ use symphonia::core::units::{Time, TimeBase};
 use symphonia::default::get_probe;
 
 use crate::broker::{
-    DecoderCmd, SharedState, Source, Status, CHUNK_CHANNEL_DEPTH, CHUNK_FRAMES, EQ_BANDS,
+    DecoderCmd, SharedState, Source, Status, CHUNK_FRAMES, EQ_BANDS,
     EQ_BAND_HZ,
 };
 use crate::log_error;
@@ -58,13 +60,111 @@ use crate::stream_buffer::StreamBuffer;
 use crate::{log_info, log_warn, log_debug};
 
 /// One decoded, EQ'd, volume-applied, resampled block of interleaved f32
-/// samples at the DEVICE rate. `generation` stamps which load produced it;
-/// the callback silently discards chunks from dead generations, which is
-/// what makes skip-while-playing click-free without draining the channel.
+/// samples at the DEVICE rate. Allocated once in the pool, then recycled.
+/// `generation` stamps which load/seek produced it; stale chunks return to
+/// the pool without ever deallocating on the real-time thread.
 pub struct AudioChunk {
     /// Interleaved f32 at the DEVICE rate and layout.
     pub data: Box<[f32]>,
+    len: usize,
     pub generation: u64,
+}
+
+impl AudioChunk {
+    fn samples(&self) -> &[f32] { &self.data[..self.len] }
+}
+
+const BUFFER_MILLIS: usize = 1500;
+const PREFILL_MILLIS: usize = 500;
+
+fn buffer_depth(rate: u32) -> usize {
+    (rate as usize * BUFFER_MILLIS / 1000).div_ceil(CHUNK_FRAMES).max(2)
+}
+
+struct BufferState {
+    ready_generation: AtomicU64,
+    eof_generation: AtomicU64,
+    underrun_frames: AtomicU64,
+}
+
+/// A fixed pool travels through two bounded rings. Only the decoder fills
+/// blocks; the callback returns them to the free ring instead of freeing them.
+struct ChunkSender {
+    ready: Sender<AudioChunk>,
+    discard: Receiver<AudioChunk>,
+    free: Receiver<AudioChunk>,
+    recycle: Sender<AudioChunk>,
+    sink_gone: Receiver<()>,
+    state: Arc<BufferState>,
+    prefill_samples: usize,
+    priming: Cell<(u64, usize)>,
+}
+
+pub struct ChunkReceiver {
+    queue: Receiver<AudioChunk>,
+    recycle: Sender<AudioChunk>,
+    // Keep recycling connected until the callback itself is destroyed, even
+    // after decoder shutdown. No buffer can be dropped by a failed try_send.
+    _free_guard: Receiver<AudioChunk>,
+    _alive: Sender<()>,
+    state: Arc<BufferState>,
+}
+
+fn chunk_channel(rate: u32, channels: usize, depth: usize) -> (ChunkSender, ChunkReceiver) {
+    let (ready, queue) = bounded(depth);
+    let (recycle, free) = bounded(depth + 1);
+    let (alive, sink_gone) = bounded(0);
+    for _ in 0..=depth {
+        recycle.send(AudioChunk {
+            data: vec![0.0; CHUNK_FRAMES * channels].into_boxed_slice(),
+            len: 0, generation: u64::MAX,
+        }).unwrap_or_else(|_| unreachable!("pool initialization"));
+    }
+    let state = Arc::new(BufferState {
+        ready_generation: AtomicU64::new(u64::MAX),
+        eof_generation: AtomicU64::new(u64::MAX),
+        underrun_frames: AtomicU64::new(0),
+    });
+    (ChunkSender {
+        ready, discard: queue.clone(), free: free.clone(), recycle: recycle.clone(), sink_gone,
+        state: state.clone(),
+        prefill_samples: (rate as usize * PREFILL_MILLIS / 1000 * channels)
+            .min(depth * CHUNK_FRAMES * channels),
+        priming: Cell::new((u64::MAX, 0)),
+    }, ChunkReceiver { queue, recycle, _free_guard: free, _alive: alive, state })
+}
+
+impl ChunkSender {
+    fn begin(&self, generation: u64) {
+        self.state.ready_generation.store(u64::MAX, Ordering::Release);
+        self.state.eof_generation.store(u64::MAX, Ordering::Release);
+        self.priming.set((generation, 0));
+        // The single producer calls this before publishing a new generation.
+        // Reclaim old queued audio here, including when WASAPI is paused.
+        while let Ok(chunk) = self.discard.try_recv() { recycle(&self.recycle, chunk); }
+    }
+
+    fn published(&self, generation: u64, samples: usize) {
+        let (previous, count) = self.priming.get();
+        let count = if previous == generation { count + samples } else { samples };
+        self.priming.set((generation, count.min(self.prefill_samples)));
+        if count >= self.prefill_samples {
+            self.state.ready_generation.store(generation, Ordering::Release);
+        }
+    }
+
+    fn finish(&self, generation: u64) {
+        self.state.eof_generation.store(generation, Ordering::Release);
+        // Short tracks must start even when they cannot fill the watermark.
+        self.state.ready_generation.store(generation, Ordering::Release);
+    }
+}
+
+fn recycle(sender: &Sender<AudioChunk>, chunk: AudioChunk) {
+    // There are exactly depth+1 buffers and depth+1 free slots. Owning this
+    // buffer proves at least one slot is free. A receiver guard prevents
+    // disconnection. This path neither allocates nor deallocates.
+    sender.try_send(chunk).unwrap_or_else(|_| unreachable!("PCM pool invariant"));
 }
 
 /// Kill switch for external source processes. Clonable handle handed to the
@@ -101,7 +201,7 @@ impl AudioControls {
 }
 
 pub struct AudioHandles {
-    pub chunk_rx: Receiver<AudioChunk>,
+    pub chunk_rx: ChunkReceiver,
     /// Signals (per generation) when the output callback has drained all
     /// buffered audio — used at end-of-track so the tail plays out fully.
     pub drained_tx: Sender<u64>,
@@ -114,7 +214,9 @@ pub fn spawn(
     cmds: Receiver<DecoderCmd>,
     status_tx: Sender<Status>,
 ) -> AudioHandles {
-    let (chunk_tx, chunk_rx) = bounded::<AudioChunk>(CHUNK_CHANNEL_DEPTH);
+    let rate = match shared.sample_rate() { 0 => 48_000, n => n };
+    let channels = match shared.device_channels() { 0 => 2, n => n as usize };
+    let (chunk_tx, chunk_rx) = chunk_channel(rate, channels, buffer_depth(rate));
     let (drained_tx, drained_rx) = bounded::<u64>(4);
     let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let buffer_slot: BufferSlot = Arc::new(Mutex::new(None));
@@ -171,14 +273,9 @@ impl AudioOut {
     }
 }
 
-/// Open the WASAPI output at the device's native rate/format and wire the
-/// chunk channel into its callback. The stream comes back **paused**; the
-/// presentation layer plays/pauses it with `AudioOut` on phase transitions.
-pub fn open_output_stream(
-    chunk_rx: Receiver<AudioChunk>,
-    drained_tx: Sender<u64>,
-    shared: Arc<SharedState>,
-) -> Result<cpal::Stream, String> {
+/// Select the native device layout before the decoder/pool starts. The UI
+/// later plays/pauses its stream with AudioOut on phase transitions.
+pub fn output_device(shared: &SharedState) -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
 
     let host = cpal::default_host();
@@ -198,6 +295,18 @@ pub fn open_output_stream(
         "output: {name} — {device_rate} Hz, {device_channels} ch, {:?}",
         supported.sample_format()
     );
+    Ok((device, supported))
+}
+
+pub fn open_output_stream(
+    device: cpal::Device,
+    supported: cpal::SupportedStreamConfig,
+    chunk_rx: ChunkReceiver,
+    drained_tx: Sender<u64>,
+    shared: Arc<SharedState>,
+) -> Result<cpal::Stream, String> {
+    use cpal::traits::DeviceTrait;
+    let device_channels = supported.channels().max(1);
 
     let config = cpal::StreamConfig {
         channels: device_channels,
@@ -209,29 +318,22 @@ pub fn open_output_stream(
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream(
             &config,
-            popper(chunk_rx, drained_tx, Arc::clone(&shared), device_channels),
+            popper::<f32>(chunk_rx, drained_tx, Arc::clone(&shared), device_channels),
             err_cb,
             None,
         ),
-        cpal::SampleFormat::I16 => {
-            // Rare WASAPI setups report i16; pop in f32, convert on the way out.
-            let mut scratch: Vec<f32> = Vec::new();
-            let mut inner =
-                popper(chunk_rx, drained_tx, Arc::clone(&shared), device_channels);
-            device.build_output_stream(
-                &config,
-                move |data: &mut [i16], info| {
-                    scratch.clear();
-                    scratch.resize(data.len(), 0.0);
-                    inner(&mut scratch, info);
-                    for (d, &s) in data.iter_mut().zip(scratch.iter()) {
-                        *d = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                    }
-                },
-                err_cb,
-                None,
-            )
-        }
+        cpal::SampleFormat::I16 => device.build_output_stream(
+            &config,
+            popper::<i16>(chunk_rx, drained_tx, Arc::clone(&shared), device_channels),
+            err_cb,
+            None,
+        ),
+        cpal::SampleFormat::U16 => device.build_output_stream(
+            &config,
+            popper::<u16>(chunk_rx, drained_tx, Arc::clone(&shared), device_channels),
+            err_cb,
+            None,
+        ),
         other => return Err(format!("unsupported device sample format {other:?}")),
     }
     .map_err(|e| format!("build output stream: {e}"))?;
@@ -242,56 +344,93 @@ pub fn open_output_stream(
     Ok(stream)
 }
 
-/// The realtime callback. Owns the receive side of the chunk channel plus a
-/// partially-consumed chunk (chunks are 4096 frames; device buffers are
-/// ~480). Realtime rules honored: no locks held across calls we make, no
-/// allocation in steady state, try_recv only, silence on underrun.
-fn popper(
-    chunk_rx: Receiver<AudioChunk>,
+/// Conversion is direct into the device's slice: integer devices need no
+/// temporary Vec, even when WASAPI changes the callback size.
+trait OutputSample: Copy + Send + 'static {
+    fn from_pcm(sample: f32) -> Self;
+}
+impl OutputSample for f32 {
+    fn from_pcm(sample: f32) -> Self { sample }
+}
+impl OutputSample for i16 {
+    fn from_pcm(sample: f32) -> Self { (sample.clamp(-1.0, 1.0) * 32767.0) as i16 }
+}
+impl OutputSample for u16 {
+    fn from_pcm(sample: f32) -> Self { ((sample.clamp(-1.0, 1.0) + 1.0) * 32767.5).round() as u16 }
+}
+
+struct PcmOutput {
+    chunks: ChunkReceiver,
+    current: Option<AudioChunk>,
+    pos: usize,
+    started: u64,
+}
+
+impl PcmOutput {
+    fn new(chunks: ChunkReceiver) -> Self {
+        Self { chunks, current: None, pos: 0, started: u64::MAX }
+    }
+
+    fn render<T: OutputSample>(&mut self, data: &mut [T], shared: &SharedState, channels: usize) {
+        let generation = shared.generation();
+        let mut written = 0;
+        while written < data.len() {
+            // A load/seek may race this callback. Leave freshly queued audio
+            // for the next invocation instead of discarding its new generation
+            // using this invocation's older snapshot.
+            if shared.generation() != generation { break; }
+            if self.current.as_ref().is_some_and(|chunk| chunk.generation != generation || self.pos >= chunk.len) {
+                recycle(&self.chunks.recycle, self.current.take().unwrap());
+                self.pos = 0;
+            }
+            if self.current.is_none() {
+                match self.chunks.queue.try_recv() {
+                    Ok(chunk) => { self.current = Some(chunk); continue; }
+                    Err(_) => break,
+                }
+            }
+            // Consume stale generations above even during priming, so a full
+            // old queue cannot prevent a newly loaded/seeked source filling.
+            if self.chunks.state.ready_generation.load(Ordering::Acquire) != generation { break; }
+            self.started = generation;
+            let chunk = self.current.as_ref().unwrap();
+            let n = (chunk.len - self.pos).min(data.len() - written);
+            for (dst, &src) in data[written..written + n].iter_mut().zip(&chunk.samples()[self.pos..self.pos + n]) {
+                *dst = T::from_pcm(src);
+            }
+            self.pos += n;
+            written += n;
+        }
+        data[written..].fill(T::from_pcm(0.0));
+        if shared.generation() != generation { return; }
+        // Silence while priming or starved must not move the track playhead.
+        shared.add_frames_played((written / channels) as u64);
+        let eof = self.chunks.state.eof_generation.load(Ordering::Acquire) == generation;
+        if written < data.len() && self.started == generation && !eof {
+            self.chunks.state.underrun_frames.fetch_add(((data.len() - written) / channels) as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn drained(&self, generation: u64) -> bool {
+        self.chunks.state.eof_generation.load(Ordering::Acquire) == generation
+            && self.current.as_ref().is_none_or(|chunk| chunk.generation != generation || self.pos >= chunk.len)
+            && self.chunks.queue.is_empty()
+    }
+}
+
+/// No I/O, heap allocation/free, logging or state locks. All sample storage
+/// was allocated before playback; only bounded nonblocking ring operations,
+/// conversion and atomic playhead/diagnostic updates occur here.
+fn popper<T: OutputSample>(
+    chunk_rx: ChunkReceiver,
     drained_tx: Sender<u64>,
     shared: Arc<SharedState>,
     channels: u16,
-) -> impl FnMut(&mut [f32], &cpal::OutputCallbackInfo) + Send + 'static {
-    let mut current: Box<[f32]> = Box::new([]);
-    let mut pos = 0usize;
-    let mut gen_seen = u64::MAX;
-    move |data: &mut [f32], _info| {
-        let gen_now = shared.generation();
-        if gen_now != gen_seen {
-            // Track changed (or first callback): stale audio is dropped here,
-            // which is what makes skip-while-playing seamless.
-            current = Box::new([]);
-            pos = 0;
-            gen_seen = gen_now;
-        }
-        let mut written = 0usize;
-        while written < data.len() {
-            if pos < current.len() {
-                let n = (current.len() - pos).min(data.len() - written);
-                data[written..written + n].copy_from_slice(&current[pos..pos + n]);
-                pos += n;
-                written += n;
-            } else {
-                match chunk_rx.try_recv() {
-                    Ok(chunk) if chunk.generation == gen_now => {
-                        current = chunk.data;
-                        pos = 0;
-                    }
-                    Ok(_) => {} // chunk from a dead generation — discard
-                    Err(_) => break, // underrun: the rest stays silence
-                }
-            }
-        }
-        for sample in &mut data[written..] {
-            *sample = 0.0;
-        }
-        shared.add_frames_played((data.len() / channels as usize) as u64);
-        // Tail-drain signal: everything this generation produced has been
-        // handed to the device. The decoder only listens for this at EOF;
-        // mid-track signals land in a tiny bounded channel and are dropped.
-        if pos >= current.len() && chunk_rx.is_empty() {
-            let _ = drained_tx.try_send(gen_now);
-        }
+) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) + Send + 'static {
+    let mut output = PcmOutput::new(chunk_rx);
+    move |data, _info| {
+        output.render(data, &shared, channels as usize);
+        if output.drained(shared.generation()) { let _ = drained_tx.try_send(shared.generation()); }
     }
 }
 
@@ -315,7 +454,7 @@ fn run_decoder(
     shared: Arc<SharedState>,
     cmds: Receiver<DecoderCmd>,
     status_tx: Sender<Status>,
-    chunk_tx: Sender<AudioChunk>,
+    chunk_tx: ChunkSender,
     drained_rx: Receiver<u64>,
     child_slot: Arc<Mutex<Option<Child>>>,
     buffer_slot: BufferSlot,
@@ -672,40 +811,69 @@ enum SendOutcome {
     Stopped,
     NewSource(Source),
     /// A seek arrived while parked waiting for chunk space.
-    SeekRelative(f64, AudioChunk),
+    SeekRelative(f64),
     Shutdown,
     SinkGone,
 }
 
-/// Send one chunk with backpressure. Parks in `select!` while the channel is
-/// full — the OS wakes us when either space appears or a command arrives.
+/// Copy into a free block and publish with backpressure. Parks in `select!`
+/// for a free block/ready slot OR a command, so pause never burns idle CPU.
 fn send_chunk(
-    chunk_tx: &Sender<AudioChunk>,
+    chunk_tx: &ChunkSender,
     cmds: &Receiver<DecoderCmd>,
-    chunk: AudioChunk,
+    samples: &[f32],
+    generation: u64,
 ) -> SendOutcome {
-    let mut chunk = chunk;
+    if matches!(chunk_tx.sink_gone.try_recv(), Err(TryRecvError::Disconnected)) {
+        return SendOutcome::SinkGone;
+    }
+    // All allocation is done when the pool is created. While every block is
+    // owned by the output, park on free space OR a decoder command.
+    let mut chunk = select! {
+        recv(chunk_tx.free) -> block => match block {
+            Ok(block) => block,
+            Err(_) => return SendOutcome::SinkGone,
+        },
+        recv(chunk_tx.sink_gone) -> _ => return SendOutcome::SinkGone,
+        recv(cmds) -> msg => return send_command(msg),
+    };
+    chunk.data[..samples.len()].copy_from_slice(samples);
+    chunk.len = samples.len();
+    chunk.generation = generation;
     loop {
-        match chunk_tx.try_send(chunk) {
-            Ok(()) => return SendOutcome::Sent,
+        match chunk_tx.ready.try_send(chunk) {
+            Ok(()) => {
+                chunk_tx.published(generation, samples.len());
+                return SendOutcome::Sent;
+            }
             Err(TrySendError::Full(c)) => {
                 chunk = c;
                 select! {
-                    send(chunk_tx, chunk) -> res => match res {
-                        Ok(()) => return SendOutcome::Sent,
+                    send(chunk_tx.ready, chunk) -> res => match res {
+                        Ok(()) => {
+                            chunk_tx.published(generation, samples.len());
+                            return SendOutcome::Sent;
+                        }
                         Err(_send_err) => return SendOutcome::SinkGone,
                     },
-                    recv(cmds) -> msg => match msg {
-                        Ok(DecoderCmd::Stop) => return SendOutcome::Stopped,
-                        Ok(DecoderCmd::Shutdown) => return SendOutcome::Shutdown,
-                        Ok(DecoderCmd::Load(s)) => return SendOutcome::NewSource(s),
-                        Ok(DecoderCmd::SeekRelative(d)) => return SendOutcome::SeekRelative(d, chunk),
-                        Err(_) => return SendOutcome::Shutdown,
+                    recv(cmds) -> msg => {
+                        recycle(&chunk_tx.recycle, chunk);
+                        return send_command(msg);
                     },
+                    recv(chunk_tx.sink_gone) -> _ => return SendOutcome::SinkGone,
                 }
             }
             Err(TrySendError::Disconnected(_)) => return SendOutcome::SinkGone,
         }
+    }
+}
+
+fn send_command(msg: Result<DecoderCmd, crossbeam_channel::RecvError>) -> SendOutcome {
+    match msg {
+        Ok(DecoderCmd::Stop) => SendOutcome::Stopped,
+        Ok(DecoderCmd::Shutdown) | Err(_) => SendOutcome::Shutdown,
+        Ok(DecoderCmd::Load(source)) => SendOutcome::NewSource(source),
+        Ok(DecoderCmd::SeekRelative(delta)) => SendOutcome::SeekRelative(delta),
     }
 }
 
@@ -847,7 +1015,7 @@ fn play_source(
     shared: &Arc<SharedState>,
     cmds: &Receiver<DecoderCmd>,
     status_tx: &Sender<Status>,
-    chunk_tx: &Sender<AudioChunk>,
+    chunk_tx: &ChunkSender,
     drained_rx: &Receiver<u64>,
     child_slot: &Arc<Mutex<Option<Child>>>,
     buffer_slot: &BufferSlot,
@@ -855,6 +1023,7 @@ fn play_source(
     source: Source,
 ) -> PlayExit {
     let mut generation = shared.generation();
+    chunk_tx.begin(generation);
     let cached = cache
         .as_ref()
         .filter(|cached| cached.source == source && cached.buffer.complete());
@@ -959,6 +1128,7 @@ fn play_source(
                         &mut resampler,
                         &mut generation,
                     ) {
+                        chunk_tx.begin(generation);
                         let _ = status_tx.send(Status::Seeked);
                         crate::ui::wake_status();
                     }
@@ -1101,16 +1271,13 @@ fn play_source(
 
             // Emit fixed-size chunks; backpressure parks in send_chunk.
             while pending.len() >= chunk_samples {
-                let rest = pending.split_off(chunk_samples);
-                let data = std::mem::replace(&mut pending, rest).into_boxed_slice();
-                let chunk = AudioChunk { data, generation };
-                match send_chunk(chunk_tx, cmds, chunk) {
-                    SendOutcome::Sent => {}
+                match send_chunk(chunk_tx, cmds, &pending[..chunk_samples], generation) {
+                    SendOutcome::Sent => { pending.drain(..chunk_samples); }
                     SendOutcome::Stopped => {
                         exit = PlayExit::Stopped;
                         break 'play;
                     }
-                    SendOutcome::SeekRelative(delta, chunk) => {
+                    SendOutcome::SeekRelative(delta) => {
                         if seek_relative(
                             &mut track,
                             shared,
@@ -1120,15 +1287,12 @@ fn play_source(
                             &mut resampler,
                             &mut generation,
                         ) {
+                            chunk_tx.begin(generation);
                             let _ = status_tx.send(Status::Seeked);
                             crate::ui::wake_status();
                             continue 'play;
                         }
-                        // A refused seek must not discard the chunk we were
-                        // waiting to send (for example, an undownloaded target).
-                        let mut restored = chunk.data.into_vec();
-                        restored.append(&mut pending);
-                        pending = restored;
+                        // A refused seek leaves pending samples intact.
                     }
                     SendOutcome::NewSource(s) => {
                         exit = PlayExit::NewSource(s);
@@ -1163,16 +1327,14 @@ fn play_source(
         // EOF: flush the short tail chunk so nothing is lost, then wait for the
         // output callback to hand everything to the device before Finished.
         if matches!(exit, PlayExit::Eof) && !pending.is_empty() && pending.len() < chunk_samples {
-            let data = std::mem::take(&mut pending).into_boxed_slice();
-            let mut chunk = AudioChunk { data, generation };
             loop {
-                match send_chunk(chunk_tx, cmds, chunk) {
-                    SendOutcome::Sent => break,
+                match send_chunk(chunk_tx, cmds, &pending, generation) {
+                    SendOutcome::Sent => { pending.clear(); break; }
                     SendOutcome::Stopped => {
                         exit = PlayExit::Stopped;
                         break;
                     }
-                    SendOutcome::SeekRelative(d, returned) => {
+                    SendOutcome::SeekRelative(d) => {
                         if seek_relative(
                             &mut track,
                             shared,
@@ -1182,11 +1344,11 @@ fn play_source(
                             &mut resampler,
                             &mut generation,
                         ) {
+                            chunk_tx.begin(generation);
                             let _ = status_tx.send(Status::Seeked);
                             crate::ui::wake_status();
                             continue 'decode;
                         }
-                        chunk = returned;
                     }
                     SendOutcome::NewSource(s) => {
                         exit = PlayExit::NewSource(s);
@@ -1205,9 +1367,10 @@ fn play_source(
         }
         match exit {
             PlayExit::Eof => {
-                // Clear signals emitted before EOF (the callback reports "drained"
-                // whenever it catches up mid-track); then wait for the fresh one.
+                // Arm EOF after clearing old signals; mid-track starvation is
+                // never mistaken for successful completion.
                 while drained_rx.try_recv().is_ok() {}
+                chunk_tx.finish(generation);
                 loop {
                     select! {
                         recv(drained_rx) -> g => match g {
@@ -1244,6 +1407,7 @@ fn play_source(
                             Ok(DecoderCmd::Load(s)) => return PlayExit::NewSource(s),
                             Ok(DecoderCmd::SeekRelative(delta)) => {
                                 if seek_relative(&mut track, shared, delta, &mut pending, &mut eq, &mut resampler, &mut generation) {
+                                    chunk_tx.begin(generation);
                                     let _ = status_tx.send(Status::Seeked);
                                     crate::ui::wake_status();
                                     continue 'decode;
@@ -1432,6 +1596,308 @@ impl LinearResampler {
 mod tests {
     use super::*;
 
+    fn push_pcm(sender: &ChunkSender, cmds: &Receiver<DecoderCmd>, samples: &[f32], generation: u64) {
+        assert!(matches!(send_chunk(sender, cmds, samples, generation), SendOutcome::Sent));
+    }
+
+    #[test]
+    fn pcm_ring_primes_half_a_second_and_absorbs_a_half_second_producer_stall() {
+        for rate in [44_100, 48_000, 96_000, 192_000] {
+            let shared = SharedState::new();
+            shared.set_sample_rate(rate);
+            let depth = buffer_depth(rate);
+            assert!(depth * CHUNK_FRAMES >= rate as usize * BUFFER_MILLIS / 1000);
+            let (sender, receiver) = chunk_channel(rate, 2, depth);
+            sender.begin(shared.generation());
+            let (_cmd_tx, cmd_rx) = bounded(1);
+            let mut output = PcmOutput::new(receiver);
+            let samples = vec![0.25; CHUNK_FRAMES * 2];
+            let mut device = vec![1.0; rate as usize / 100 * 2]; // 10 ms
+            push_pcm(&sender, &cmd_rx, &samples, shared.generation());
+            output.render(&mut device, &shared, 2);
+            assert!(device.iter().all(|&sample| sample == 0.0));
+            assert_eq!(shared.position(), Duration::ZERO);
+            for _ in 1..depth { push_pcm(&sender, &cmd_rx, &samples, shared.generation()); }
+            // No producer activity at all during the next 500 ms of demand.
+            for _ in 0..50 {
+                output.render(&mut device, &shared, 2);
+                assert!(device.iter().all(|&sample| sample == 0.25));
+            }
+            assert_eq!(sender.state.underrun_frames.load(Ordering::Relaxed), 0);
+            assert_eq!(shared.position(), Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn pcm_ring_recycles_the_same_allocations_through_seek_and_changing_callback_sizes() {
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        let (sender, receiver) = chunk_channel(48_000, 2, 2);
+        let pointers: Vec<_> = sender.free.try_iter().collect();
+        let addresses: Vec<_> = pointers.iter().map(|chunk| chunk.data.as_ptr() as usize).collect();
+        for chunk in pointers { recycle(&sender.recycle, chunk); }
+        let (_cmd_tx, cmd_rx) = bounded(1);
+        let mut output = PcmOutput::new(receiver);
+        let samples = vec![0.5; CHUNK_FRAMES * 2];
+        for _ in 0..20 {
+            sender.begin(shared.generation());
+            push_pcm(&sender, &cmd_rx, &samples, shared.generation());
+            sender.finish(shared.generation());
+            let mut short = [0i16; 960];
+            output.render(&mut short, &shared, 2);
+            assert!(short.iter().all(|&sample| sample == 16383));
+            // Seek/skip invalidates the partial block; an empty callback
+            // waits silently, then a short new tail renders without old audio.
+            shared.bump_generation();
+            shared.reset_playhead();
+            sender.begin(shared.generation());
+            let mut large = [0u16; CHUNK_FRAMES * 4];
+            output.render(&mut large, &shared, 2);
+            assert!(large.iter().all(|&sample| sample == 32768));
+            push_pcm(&sender, &cmd_rx, &[0.25; 100], shared.generation());
+            sender.finish(shared.generation());
+            output.render(&mut large, &shared, 2);
+            assert!(large[..100].iter().all(|&sample| sample == 40959));
+            assert!(large[100..].iter().all(|&sample| sample == 32768));
+            assert!(output.drained(shared.generation()));
+            assert_eq!(shared.position(), Duration::from_secs_f64(50.0 / 48_000.0));
+            output.render(&mut large, &shared, 2); // return the consumed tail
+            shared.bump_generation();
+        }
+        assert_eq!(sender.free.len(), 3);
+        for chunk in sender.free.try_iter() {
+            assert!(addresses.contains(&(chunk.data.as_ptr() as usize)), "all allocations are reused");
+        }
+    }
+
+    #[test]
+    fn pcm_ring_starvation_never_advances_time_or_reports_eof() {
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (_cmd_tx, cmd_rx) = bounded(1);
+        let mut output = PcmOutput::new(receiver);
+        // Fill the watermark and consume everything while producer is held.
+        for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0); }
+        let mut data = [0.0; CHUNK_FRAMES * 2];
+        output.render(&mut data, &shared, 1);
+        let position = shared.position();
+        output.render(&mut data, &shared, 1);
+        assert_eq!(position, shared.position());
+        assert!(!output.drained(0));
+        assert_eq!(sender.state.underrun_frames.load(Ordering::Relaxed), data.len() as u64);
+        sender.finish(0);
+        assert!(output.drained(0));
+    }
+
+    thread_local! {
+        static GENERATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[derive(Clone, Copy)]
+    struct RacingSample(f32);
+    impl OutputSample for RacingSample {
+        fn from_pcm(sample: f32) -> Self {
+            // Deterministically interleave a load while copying the last old
+            // block, without timing assumptions or synthetic OS/UI input.
+            let switch = GENERATION_RACE.with(|hook| hook.borrow_mut().take());
+            if let Some(switch) = switch { switch(); }
+            Self(sample)
+        }
+    }
+
+    #[test]
+    fn load_during_callback_keeps_new_audio_and_does_not_advance_its_playhead() {
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (_cmd_tx, cmd_rx) = bounded(1);
+        push_pcm(&sender, &cmd_rx, &[0.5; 16], 0);
+        sender.finish(0);
+        let mut output = PcmOutput::new(receiver);
+        let race_shared = shared.clone();
+        GENERATION_RACE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            race_shared.bump_generation();
+            race_shared.reset_playhead();
+            sender.begin(1);
+            push_pcm(&sender, &cmd_rx, &[0.25; 16], 1);
+            sender.finish(1);
+        })));
+        let mut device = [RacingSample(1.0); 64];
+        output.render(&mut device, &shared, 1);
+        assert_eq!(shared.position(), Duration::ZERO);
+        assert_eq!(output.chunks.queue.len(), 1, "new audio must survive the stale callback");
+        output.render(&mut device, &shared, 1);
+        assert!(device[..16].iter().all(|sample| sample.0 == 0.25));
+        assert!(device[16..].iter().all(|sample| sample.0 == 0.0));
+        assert_eq!(shared.position(), Duration::from_secs_f64(16.0 / 48_000.0));
+    }
+
+    #[test]
+    fn full_pcm_ring_remains_interruptible_and_reclaims_stale_paused_audio() {
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (cmd_tx, cmd_rx) = bounded(1);
+        for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0); }
+        cmd_tx.send(DecoderCmd::SeekRelative(5.0)).unwrap();
+        assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0), SendOutcome::SeekRelative(5.0)));
+        assert_eq!(sender.free.len(), 1, "the unsent block must return to its pool");
+        sender.begin(1); // paused output never needs to run to free stale blocks
+        assert!(receiver.queue.is_empty());
+        assert_eq!(sender.free.len(), 3);
+        drop(receiver);
+        assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.0; 100], 1), SendOutcome::SinkGone));
+    }
+
+    // Count only operations on the current test thread, avoiding false
+    // positives from concurrently running decoder/UI tests.
+    struct CallbackAllocator;
+    thread_local! {
+        static ALLOC_TRACKING: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        static DEALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+    #[global_allocator]
+    static TEST_ALLOCATOR: CallbackAllocator = CallbackAllocator;
+    unsafe impl std::alloc::GlobalAlloc for CallbackAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            ALLOC_TRACKING.with(|tracking| {
+                if tracking.get() { ALLOCATIONS.with(|count| count.set(count.get() + 1)); }
+            });
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+            ALLOC_TRACKING.with(|tracking| {
+                if tracking.get() { DEALLOCATIONS.with(|count| count.set(count.get() + 1)); }
+            });
+            unsafe { std::alloc::System.dealloc(pointer, layout); }
+        }
+    }
+
+    #[test]
+    fn pcm_callback_does_not_allocate_or_free_on_first_call_seek_or_integer_output() {
+        let shared = SharedState::new();
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (_cmd_tx, cmd_rx) = bounded(1);
+        let mut output = PcmOutput::new(receiver);
+        let mut data = [0i16; CHUNK_FRAMES * 2];
+        for _ in 0..3 {
+            sender.begin(shared.generation());
+            for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], shared.generation()); }
+            sender.finish(shared.generation());
+            ALLOC_TRACKING.with(|tracking| tracking.set(true));
+            output.render(&mut data[..37], &shared, 1);
+            output.render(&mut data, &shared, 1);
+            shared.bump_generation();
+            output.render(&mut data, &shared, 1);
+            ALLOC_TRACKING.with(|tracking| tracking.set(false));
+        }
+        assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+        assert_eq!(DEALLOCATIONS.with(Cell::get), 0);
+    }
+
+    fn saved_local_tracks() -> (crate::config::PersistedState, Vec<std::path::PathBuf>) {
+        let saved = crate::config::load();
+        let folder = saved.last_folder.as_ref().expect("state.cfg needs a local folder for this diagnostic");
+        let mut files: Vec<_> = std::fs::read_dir(folder).unwrap().flatten().map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| matches!(ext.to_str(), Some("ogg" | "mp3" | "flac" | "wav" | "m4a" | "mp4"))))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "the saved folder must contain media");
+        (saved, files)
+    }
+
+    fn restore_test_controls(shared: &SharedState, saved: &crate::config::PersistedState) {
+        shared.set_volume(saved.volume);
+        for (band, gain) in saved.eq_gains.iter().enumerate() { shared.set_eq_gain(band, *gain); }
+    }
+
+    #[test]
+    #[ignore = "requires local media in the folder saved in state.cfg"]
+    fn saved_folder_full_tracks_decode_through_the_pcm_pool() {
+        let (saved, files) = saved_local_tracks();
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        shared.set_device_channels(2);
+        restore_test_controls(&shared, &saved);
+        let (cmd_tx, cmd_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let audio = spawn(shared.clone(), cmd_rx, status_tx);
+        for file in files {
+            let started = std::time::Instant::now();
+            shared.bump_generation();
+            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()))).unwrap();
+            let duration = match status_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Status::Opened { duration, .. } => duration.unwrap(),
+                other => panic!("local source failed: {other:?}"),
+            };
+            let mut frames = 0;
+            let mut peak_wait = Duration::ZERO;
+            loop {
+                let wait = std::time::Instant::now();
+                match audio.chunk_rx.queue.recv_timeout(Duration::from_millis(10)) {
+                    Ok(chunk) => {
+                        peak_wait = peak_wait.max(wait.elapsed());
+                        assert_eq!(chunk.generation, shared.generation());
+                        assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
+                        frames += chunk.len / 2;
+                        recycle(&audio.chunk_rx.recycle, chunk);
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
+                            audio.drained_tx.send(shared.generation()).unwrap();
+                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+                            break;
+                        }
+                        assert!(started.elapsed() < Duration::from_secs(30), "local decoder stalled");
+                    }
+                    Err(error) => panic!("local decoder disconnected: {error}"),
+                }
+            }
+            let seconds = frames as f64 / 48_000.0;
+            assert!((seconds - duration.as_secs_f64()).abs() < 0.1, "no decoded audio is lost");
+            assert!(started.elapsed() < duration / 10, "decoder must comfortably outpace playback");
+            println!("{}: {seconds:.3}s decoded in {:.3}s ({:.1}x realtime), peak chunk wait {:.3}ms",
+                file.display(), started.elapsed().as_secs_f64(), seconds / started.elapsed().as_secs_f64(), peak_wait.as_secs_f64() * 1000.0);
+        }
+        cmd_tx.send(DecoderCmd::Shutdown).unwrap();
+        audio.decoder.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the saved local folder and an actual output device"]
+    fn saved_folder_wasapi_output_has_no_underruns() {
+        use cpal::traits::StreamTrait;
+        let (saved, files) = saved_local_tracks();
+        let shared = SharedState::new();
+        restore_test_controls(&shared, &saved);
+        let (device, config) = output_device(&shared).unwrap();
+        let (cmd_tx, cmd_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let audio = spawn(shared.clone(), cmd_rx, status_tx);
+        let counters = audio.chunk_rx.state.clone();
+        let stream = open_output_stream(device, config, audio.chunk_rx, audio.drained_tx, shared.clone()).unwrap();
+        for file in files {
+            shared.bump_generation();
+            shared.reset_playhead();
+            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()))).unwrap();
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(10)).unwrap(), Status::Opened { .. }));
+            let before = counters.underrun_frames.load(Ordering::Relaxed);
+            stream.play().unwrap();
+            // Real WASAPI callbacks, real file reads and saved active EQ.
+            // Sleep is solely the automated observation interval, never a
+            // production scheduling mechanism; config/UI stay untouched.
+            thread::sleep(Duration::from_secs(10));
+            stream.pause().unwrap();
+            let underruns = counters.underrun_frames.load(Ordering::Relaxed) - before;
+            println!("{}: {:.3}s rendered, {underruns} underrun frames", file.display(), shared.position().as_secs_f64());
+            assert!(shared.position() > Duration::from_secs(9));
+            assert_eq!(underruns, 0);
+        }
+        cmd_tx.send(DecoderCmd::Shutdown).unwrap();
+        audio.decoder.join().unwrap();
+        drop(stream);
+    }
+
     fn pcm_wav(samples: &[i16], rate: u32) -> Vec<u8> {
         let size = (samples.len() * 2) as u32;
         let mut wav = b"RIFF".to_vec();
@@ -1495,21 +1961,21 @@ mod tests {
         let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
         let (cmd_tx, cmd_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let (chunk_tx, chunk_rx) = bounded::<AudioChunk>(4);
+        let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
         let (_drained_tx, drained_rx) = bounded(4);
         let decoder_shared = shared.clone();
         let decoder = thread::spawn(move || play_source(&decoder_shared, &cmd_rx, &status_tx, &chunk_tx, &drained_rx,
             &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), &mut cache, source));
         assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { .. }));
-        let first = chunk_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let first = chunk_rx.queue.recv_timeout(Duration::from_secs(5)).unwrap();
         // No drain notification is sent. The complete short WAV reaches the
         // final drain wait while playback still owns its downloaded reader.
         thread::sleep(Duration::from_millis(10));
         shared.set_playhead_frames(2400);
         cmd_tx.send(DecoderCmd::SeekRelative(-0.05)).unwrap();
         assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Seeked));
-        let replayed = chunk_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(first.data, replayed.data);
+        let replayed = chunk_rx.queue.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.samples(), replayed.samples());
         assert_ne!(first.generation, replayed.generation);
         cmd_tx.send(DecoderCmd::Stop).unwrap();
         assert!(matches!(decoder.join().unwrap(), PlayExit::Stopped));
@@ -1531,7 +1997,7 @@ mod tests {
         let mut cache = Some(StreamCache { source: source.clone(), buffer, title: Some("RAM title".into()) });
         let (_cmd_tx, cmd_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let (chunk_tx, chunk_rx) = bounded::<AudioChunk>(4);
+        let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
         let (drained_tx, drained_rx) = bounded(4);
         let child_slot = Arc::new(Mutex::new(None));
         let buffer_slot: BufferSlot = Arc::new(Mutex::new(None));
@@ -1543,8 +2009,11 @@ mod tests {
         let consumer = thread::spawn(move || {
             let mut rounds = Vec::new();
             while !consumer_done.load(Ordering::Acquire) {
-                match chunk_rx.recv_timeout(Duration::from_millis(5)) {
-                    Ok(chunk) => rounds.push(chunk.data.to_vec()),
+                match chunk_rx.queue.recv_timeout(Duration::from_millis(5)) {
+                    Ok(chunk) => {
+                        rounds.push(chunk.samples().to_vec());
+                        recycle(&chunk_rx.recycle, chunk);
+                    }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         let _ = drained_tx.try_send(consumer_shared.generation());
                     }
@@ -1724,11 +2193,11 @@ mod tests {
                     return Err(format!("stream did not enter Playing: {raw}"));
                 }
                 loop {
-                    let chunk = audio.chunk_rx.recv_timeout(Duration::from_secs(10))
+                    let chunk = audio.chunk_rx.queue.recv_timeout(Duration::from_secs(10))
                         .map_err(|e| format!("waiting for decoded audio: {e}"))?;
                     if chunk.generation != shared.generation() { continue; }
-                    assert!(!chunk.data.is_empty());
-                    assert!(chunk.data.iter().all(|sample| sample.is_finite()));
+                    assert!(!chunk.samples().is_empty());
+                    assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                     break;
                 }
             }
@@ -1767,7 +2236,7 @@ mod tests {
         let shared = SharedState::new();
         let (cmd_tx, cmd_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let (chunk_tx, _chunk_rx) = bounded(16);
+        let (chunk_tx, _chunk_rx) = chunk_channel(48_000, 2, 16);
         let (_drained_tx, drained_rx) = bounded(2);
         let child_slot = Arc::new(Mutex::new(None));
         let decoder_shared = shared.clone();

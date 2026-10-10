@@ -24,18 +24,11 @@ use crate::config::PersistedState;
 use crate::ui::CMD_TX;
 use crate::{log_debug, log_error, log_info, log_warn};
 
-// ── Tuning constants (consumed by the audio module in step 3) ────────────────
+// ── Audio/DSP constants ──────────────────────────────────────────────────────
 
 /// Decode granularity: ~85 ms at 48 kHz stereo. Small enough that skip/stop
 /// feel instant, large enough that per-chunk overhead vanishes.
-#[allow(dead_code)] // consumed in step 3
 pub const CHUNK_FRAMES: usize = 4096;
-
-/// ~1.4 s of buffered audio. Backpressure mechanism: when full, the decoder
-/// parks in `select!` until either the callback drains space or a command
-/// arrives. That parking is the *only* waiting the decoder ever does.
-#[allow(dead_code)] // consumed in step 3
-pub const CHUNK_CHANNEL_DEPTH: usize = 16;
 
 pub const EQ_BANDS: usize = 10;
 pub const EQ_BAND_HZ: [u32; EQ_BANDS] =
@@ -459,7 +452,7 @@ impl fmt::Display for Phase {
 // ── Cross-thread shared state ────────────────────────────────────────────────
 
 /// The only data shared across threads. Every field is an independent scalar;
-/// the audio callback reads volume/eq per chunk, writes `frames_played`, and
+/// the decoder reads volume/EQ, the audio callback writes `frames_played`, and
 /// nothing here ever needs a lock or a CAS.
 pub struct SharedState {
     phase: AtomicU8,
