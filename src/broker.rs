@@ -1457,9 +1457,9 @@ impl Broker {
                     return;
                 }
                 log_info!("BROKER", "track finished");
-                self.track = None;
-                self.shared.reset_playhead();
-                self.set_phase(Phase::Stopped, "track finished");
+                // Explicit Stop also releases the decoder's stream cache,
+                // including a repeat-toggle race at the EOF boundary.
+                self.handle_command(Command::Stop);
             }
             Status::Seeked => {
                 // The decoder already moved SharedState's playhead; this only
@@ -1867,6 +1867,7 @@ mod tests {
         open_youtube(&mut broker);
         broker.handle_status(Status::Finished);
         assert_eq!(broker.shared.phase(), Phase::Stopped);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
         assert!(rx.try_recv().is_err(), "no replay command without loop");
         assert_eq!(sink.lock().unwrap().len(), 1); // only the Opened save
     }
@@ -1985,6 +1986,7 @@ mod tests {
                     assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
                 } else {
                     broker.handle_status(Status::Finished);
+                    assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
                 }
                 assert_eq!(broker.shared.phase(), Phase::Stopped);
                 assert!(broker.track.is_none());
@@ -2027,9 +2029,7 @@ mod tests {
                 broker.yt_queue = vec!["one".into(), "two".into(), "three".into()];
             }
             broker.handle_status(Status::Finished);
-            if playlist_index.is_some() {
-                assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
-            }
+            assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
             assert_eq!(broker.shared.phase(), Phase::Stopped);
             broker.handle_command(Command::TogglePause);
             assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube {

@@ -31,7 +31,7 @@
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -40,11 +40,11 @@ use crossbeam_channel::{bounded, select, Receiver, Sender, TryRecvError, TrySend
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::{FormatReader, SeekMode, SeekTo, Track};
-use symphonia::core::io::{MediaSource, MediaSourceStream, ReadOnlySource};
+use symphonia::core::formats::{FormatReader, Packet, SeekMode, SeekTo, Track};
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use symphonia::core::units::Time;
+use symphonia::core::units::{Time, TimeBase};
 use symphonia::default::get_probe;
 
 use crate::broker::{
@@ -52,6 +52,7 @@ use crate::broker::{
     EQ_BAND_HZ,
 };
 use crate::log_error;
+use crate::stream_buffer::StreamBuffer;
 use crate::{log_info, log_warn, log_debug};
 
 /// One decoded, EQ'd, volume-applied, resampled block of interleaved f32
@@ -70,12 +71,20 @@ pub struct AudioChunk {
 #[derive(Clone)]
 pub struct AudioControls {
     child_slot: Arc<Mutex<Option<Child>>>,
+    buffer_slot: BufferSlot,
 }
+
+type BufferSlot = Arc<Mutex<Option<Weak<StreamBuffer>>>>;
 
 impl AudioControls {
     /// Kill the active yt-dlp child, if any. Safe to call any time; it is a
     /// no-op while playing local files. Idempotent.
     pub fn interrupt(&self) {
+        if let Some(buffer) = self.buffer_slot.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().and_then(Weak::upgrade)
+        {
+            buffer.cancel();
+        }
         if let Ok(mut slot) = self.child_slot.lock() {
             if let Some(child) = slot.as_mut() {
                 log_warn!("AUDIO", "interrupt: killing external source process");
@@ -106,14 +115,16 @@ pub fn spawn(
     let (chunk_tx, chunk_rx) = bounded::<AudioChunk>(CHUNK_CHANNEL_DEPTH);
     let (drained_tx, drained_rx) = bounded::<u64>(4);
     let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let buffer_slot: BufferSlot = Arc::new(Mutex::new(None));
     let decoder = thread::Builder::new()
         .name("kyouko-decoder".into())
         .spawn({
             let child_slot = Arc::clone(&child_slot);
-            move || run_decoder(shared, cmds, status_tx, chunk_tx, drained_rx, child_slot)
+            let buffer_slot = buffer_slot.clone();
+            move || run_decoder(shared, cmds, status_tx, chunk_tx, drained_rx, child_slot, buffer_slot)
         })
         .expect("spawn decoder thread");
-    AudioHandles { chunk_rx, drained_tx, decoder, controls: AudioControls { child_slot } }
+    AudioHandles { chunk_rx, drained_tx, decoder, controls: AudioControls { child_slot, buffer_slot } }
 }
 
 // ── Output stream (owned by the main thread; WASAPI event-driven) ───────────
@@ -305,8 +316,10 @@ fn run_decoder(
     chunk_tx: Sender<AudioChunk>,
     drained_rx: Receiver<u64>,
     child_slot: Arc<Mutex<Option<Child>>>,
+    buffer_slot: BufferSlot,
 ) {
     log_info!("DECODER", "online — parked on command channel (zero CPU)");
+    let mut cache: Option<StreamCache> = None;
     loop {
         let first = match cmds.recv() {
             Ok(cmd) => {
@@ -315,7 +328,7 @@ fn run_decoder(
                     DecoderCmd::Load(s) => s,
                     // Nothing is open — a seek has nothing to move.
                     DecoderCmd::SeekRelative(_) => continue,
-                    DecoderCmd::Stop => continue,
+                    DecoderCmd::Stop => { cache = None; continue; }
                     DecoderCmd::Shutdown => break,
                 }
             }
@@ -323,12 +336,18 @@ fn run_decoder(
         };
         let mut next = Some(first);
         'tracks: while let Some(source) = next.take() {
+            select_stream_cache(&mut cache, &source, shared.loop_enabled());
             let exit = play_source(
-                &shared, &cmds, &status_tx, &chunk_tx, &drained_rx, &child_slot, source,
+                &shared, &cmds, &status_tx, &chunk_tx, &drained_rx, &child_slot,
+                &buffer_slot, &mut cache, source,
             );
             match exit {
                 PlayExit::NewSource(s) => next = Some(s),
-                PlayExit::Eof | PlayExit::Stopped | PlayExit::Failed => break 'tracks,
+                PlayExit::Eof => {
+                    if !shared.loop_enabled() { cache = None; }
+                    break 'tracks;
+                }
+                PlayExit::Stopped | PlayExit::Failed => { cache = None; break 'tracks; }
                 PlayExit::Shutdown | PlayExit::SinkGone => {
                     log_info!("DECODER", "offline");
                     return;
@@ -339,6 +358,56 @@ fn run_decoder(
     log_info!("DECODER", "offline");
 }
 
+struct StreamCache {
+    source: Source,
+    buffer: Arc<StreamBuffer>,
+    title: Option<String>,
+}
+
+/// Release the previous allocation before starting another source. Reuse
+/// only a completed, successful buffer for the exact looping track.
+fn select_stream_cache(cache: &mut Option<StreamCache>, source: &Source, looping: bool) {
+    if !looping || cache.as_ref().is_some_and(|cached| cached.source != *source || !cached.buffer.complete()) {
+        *cache = None;
+    }
+}
+
+struct DownloadWorker {
+    buffer: Arc<StreamBuffer>,
+    worker: Option<JoinHandle<()>>,
+    slot: BufferSlot,
+}
+
+impl DownloadWorker {
+    fn start(mut input: impl Read + Send + 'static, slot: &BufferSlot) -> Result<Self, String> {
+        let buffer = StreamBuffer::new();
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&buffer));
+        let producer = buffer.clone();
+        let worker = thread::Builder::new().name("kyouko-buffer".into()).spawn(move || {
+            let result = (|| {
+                let mut chunk = [0u8; 32 * 1024];
+                loop {
+                    let count = input.read(&mut chunk)?;
+                    if count == 0 { return Ok(()); }
+                    producer.append(&chunk[..count])?;
+                }
+            })();
+            producer.finish(result);
+        }).map_err(|e| format!("cannot start stream buffer: {e}"))?;
+        Ok(Self { buffer, worker: Some(worker), slot: slot.clone() })
+    }
+}
+
+impl Drop for DownloadWorker {
+    fn drop(&mut self) {
+        self.buffer.cancel();
+        // ActiveTrack declares ChildGuard before this worker: the pipe's
+        // process is killed/reaped before joining a blocked producer.
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 /// Everything needed to pull decoded audio from one source. Dropping it kills
 /// and reaps any yt-dlp child — the orphan-proof guarantee.
 struct ActiveTrack {
@@ -346,14 +415,20 @@ struct ActiveTrack {
     decoder: Box<dyn Decoder>,
     track_id: u32,
     sample_rate: u32,
+    time_base: Option<TimeBase>,
     channels: usize,
-    /// False for non-seekable sources (yt-dlp stdout pipes).
+    /// Container seek support; streams read from a seekable RAM reader.
     seekable: bool,
     duration: Option<Duration>,
     title: Option<String>,
     /// yt-dlp's stderr tail, kept mid-track so decode failures show why.
     err_tail: Option<Arc<Mutex<Vec<u8>>>>,
     _child: Option<ChildGuard>,
+    // Drop order is important: kill the child, then join its pipe reader.
+    _download: Option<DownloadWorker>,
+    stream_buffer: Option<Arc<StreamBuffer>>,
+    seek_packet: Option<Packet>,
+    next_ts: u64,
 }
 
 impl ActiveTrack {
@@ -421,9 +496,12 @@ fn yt_dlp_args(format: &str, playlist_index: Option<usize>, url: &str) -> Vec<st
     a
 }
 
-fn open_track(source: &Source, child_slot: &Arc<Mutex<Option<Child>>>) -> Result<ActiveTrack, String> {
+fn open_track(
+    source: &Source, child_slot: &Arc<Mutex<Option<Child>>>,
+    buffer_slot: &BufferSlot, cached: Option<Arc<StreamBuffer>>,
+) -> Result<ActiveTrack, String> {
     let mut err_tail: Option<Arc<Mutex<Vec<u8>>>> = None;
-    match open_track_inner(source, child_slot, &mut err_tail) {
+    match open_track_inner(source, child_slot, buffer_slot, cached, &mut err_tail) {
         Ok(t) => Ok(t),
         Err(e) => {
             if let Some(tail) = err_tail {
@@ -451,14 +529,23 @@ fn log_stderr_tail(tail: &Arc<Mutex<Vec<u8>>>) {
 fn open_track_inner(
     source: &Source,
     child_slot: &Arc<Mutex<Option<Child>>>,
+    buffer_slot: &BufferSlot,
+    cached: Option<Arc<StreamBuffer>>,
     err_tail_out: &mut Option<Arc<Mutex<Vec<u8>>>>,
 ) -> Result<ActiveTrack, String> {
+    let mut download = None;
+    let mut stream_buffer = cached;
     let (mss, child_guard): (MediaSourceStream, Option<ChildGuard>) = match source {
         Source::File(path) => {
             let file = File::open(path).map_err(|e| format!("open: {e}"))?;
             // MediaSourceStream does its own buffering (buffer_len option).
             let mss = MediaSourceStream::new(Box::new(file), Default::default());
             (mss, None)
+        }
+        Source::Youtube { .. } if stream_buffer.is_some() => {
+            let reader = stream_buffer.as_ref().unwrap().reader();
+            log_info!("DECODER", "replay from RAM — no title resolution or network download");
+            (MediaSourceStream::new(Box::new(reader), Default::default()), None)
         }
         Source::Youtube { url, format, playlist_index } => {
             log_info!(
@@ -500,10 +587,10 @@ fn open_track_inner(
             let guard = ChildGuard { slot: Arc::clone(child_slot) };
             *child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
             *err_tail_out = Some(err_tail);
-            let mss = MediaSourceStream::new(
-                Box::new(ReadOnlySource::new(stdout)),
-                Default::default(),
-            );
+            let producer = DownloadWorker::start(stdout, buffer_slot)?;
+            let mss = MediaSourceStream::new(Box::new(producer.buffer.reader()), Default::default());
+            stream_buffer = Some(producer.buffer.clone());
+            download = Some(producer);
             (mss, Some(guard))
         }
     };
@@ -514,7 +601,7 @@ fn open_track_inner(
             hint.with_extension(ext);
         }
     }
-    let seekable = mss.is_seekable();
+    let seekable = mss.is_seekable() || stream_buffer.is_some();
     let probed = get_probe()
         .format(&hint, mss, &Default::default(), &MetadataOptions::default())
         .map_err(|e| format!("probe: {e}"))?;
@@ -527,6 +614,7 @@ fn open_track_inner(
         .ok_or("no audio track in source")?;
     let track_id = track.id;
     let sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let time_base = track.codec_params.time_base;
     let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(0);
     if sample_rate == 0 {
         return Err(format!("track has no usable sample rate ({sample_rate} Hz)"));
@@ -561,6 +649,7 @@ fn open_track_inner(
         decoder,
         track_id,
         sample_rate,
+        time_base,
         channels,
         seekable,
         duration,
@@ -569,6 +658,10 @@ fn open_track_inner(
         // why yt-dlp died; on the success path it is simply dropped.
         err_tail: std::mem::take(err_tail_out),
         _child: child_guard,
+        _download: download,
+        stream_buffer,
+        seek_packet: None,
+        next_ts: 0,
     })
 }
 
@@ -577,7 +670,7 @@ enum SendOutcome {
     Stopped,
     NewSource(Source),
     /// A seek arrived while parked waiting for chunk space.
-    SeekRelative(f64),
+    SeekRelative(f64, AudioChunk),
     Shutdown,
     SinkGone,
 }
@@ -604,7 +697,7 @@ fn send_chunk(
                         Ok(DecoderCmd::Stop) => return SendOutcome::Stopped,
                         Ok(DecoderCmd::Shutdown) => return SendOutcome::Shutdown,
                         Ok(DecoderCmd::Load(s)) => return SendOutcome::NewSource(s),
-                        Ok(DecoderCmd::SeekRelative(d)) => return SendOutcome::SeekRelative(d),
+                        Ok(DecoderCmd::SeekRelative(d)) => return SendOutcome::SeekRelative(d, chunk),
                         Err(_) => return SendOutcome::Shutdown,
                     },
                 }
@@ -678,8 +771,8 @@ fn fetch_title_blocking(
 }
 
 /// Seek the open track by `delta` seconds (clamped at 0). Local files use
-/// symphonia's native container seek; a non-seekable source (yt-dlp pipe)
-/// refuses gracefully. Returns true when the playhead moved. Resets codec
+/// symphonia's native container seek; streams seek through downloaded RAM
+/// only, without HTTP requests. Returns true when the playhead moved. Resets codec
 /// state, stale buffers, the chunk generation and the playhead so decoding
 /// resumes seamlessly at the new position.
 #[allow(clippy::too_many_arguments)]
@@ -693,29 +786,52 @@ fn seek_relative(
     generation: &mut u64,
 ) -> bool {
     if !track.seekable {
-        log_info!("DECODER", "Seeking not supported for live streams");
+        log_info!("DECODER", "container does not support seeking");
         return false;
     }
-    let target = (shared.position().as_secs_f64() + delta).max(0.0);
+    if !delta.is_finite() { return false; }
+    let previous = shared.position().as_secs_f64();
+    let mut target = (previous + delta).max(0.0);
+    if let Some(duration) = track.duration { target = target.min(duration.as_secs_f64()); }
+    let buffer = track.stream_buffer.clone();
+    let _downloaded_seek = buffer.as_ref().map(|buffer| buffer.downloaded_seek());
     let to = SeekTo::Time {
         time: Time { seconds: target as u64, frac: target.fract() },
         track_id: Some(track.track_id),
     };
     let device_rate = shared.sample_rate().max(1);
-    match track.format.seek(SeekMode::Coarse, to) {
-        Ok(_) => {
+    let seek_result = track.format.seek(SeekMode::Coarse, to).and_then(|seeked| {
+        // Some containers only update a sample offset during seek. Verify
+        // its bytes are already available now, while RAM-only reads are
+        // enforced, and keep that packet for the next decode iteration.
+        let packet = track.format.next_packet()?;
+        Ok((seeked, packet))
+    });
+    if seek_result.is_err() {
+        let _ = track.format.seek(SeekMode::Coarse, SeekTo::TimeStamp {
+            ts: track.next_ts, track_id: track.track_id,
+        });
+    }
+    match seek_result {
+        Ok((seeked, packet)) => {
+            track.next_ts = packet.ts().saturating_add(packet.dur());
+            track.seek_packet = Some(packet);
+            let actual = track.time_base.map(|base| {
+                let time = base.calc_time(seeked.actual_ts);
+                time.seconds as f64 + time.frac
+            }).unwrap_or(target);
             track.decoder.reset();
             pending.clear();
             eq.built = false; // biquad state is stale past the seek
             *resampler = None; // fractional carry is stale past the seek
             shared.bump_generation(); // in-flight stale chunks are discarded by the callback
             *generation = shared.generation(); // fresh chunks carry the new one
-            shared.set_playhead_frames((target * device_rate as f64).round() as u64);
-            log_info!("DECODER", "seek {delta:+.1}s -> playhead {:.1}s", target);
+            shared.set_playhead_frames((actual * device_rate as f64).round() as u64);
+            log_info!("DECODER", "seek {delta:+.1}s -> playhead {:.1}s (RAM for streams)", actual);
             true
         }
         Err(SymphoniaError::Unsupported(_)) => {
-            log_info!("DECODER", "Seeking not supported for live streams");
+            log_info!("DECODER", "container does not support this seek");
             false
         }
         Err(e) => {
@@ -732,18 +848,31 @@ fn play_source(
     chunk_tx: &Sender<AudioChunk>,
     drained_rx: &Receiver<u64>,
     child_slot: &Arc<Mutex<Option<Child>>>,
+    buffer_slot: &BufferSlot,
+    cache: &mut Option<StreamCache>,
     source: Source,
 ) -> PlayExit {
     let mut generation = shared.generation();
+    let cached = cache
+        .as_ref()
+        .filter(|cached| cached.source == source && cached.buffer.complete());
+    let replay_buffer = cached.map(|cached| cached.buffer.clone());
     // Single-shot, SEQUENTIAL title resolution: one yt-dlp at a time, ever.
     // The prefetch child lives in the same ChildGuard slot as the audio
     // child would, so Stop/Skip/Shutdown kill it mid-fetch (its parked read
     // unblocks with EOF) and it is reaped immediately.
-    let mut resolved_title = match &source {
-        Source::Youtube { url, format, playlist_index, .. } => {
-            fetch_title_blocking(url, format, *playlist_index, child_slot)
+    let mut resolved_title = if let Some(cached) = cached {
+        cached.title.clone()
+    } else {
+        match &source {
+            Source::Youtube {
+                url,
+                format,
+                playlist_index,
+                ..
+            } => fetch_title_blocking(url, format, *playlist_index, child_slot),
+            _ => None,
         }
-        _ => None,
     };
     // The prefetch may have been killed by an interrupt for a NEWER command
     // (Stop / Skip) — honor it here instead of spawning a doomed audio child.
@@ -754,21 +883,29 @@ fn play_source(
         Ok(DecoderCmd::SeekRelative(_)) | Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => return PlayExit::Shutdown,
     }
-    let mut track = match open_track(&source, child_slot) {
+    let mut track = match open_track(&source, child_slot, buffer_slot, replay_buffer) {
         Ok(t) => t,
         Err(reason) => {
             log_error!("DECODER", "open failed: {reason}");
-            let _ = status_tx.send(Status::Failed { source, reason, generation });
+            let _ = status_tx.send(Status::Failed {
+                source,
+                reason,
+                generation,
+            });
             crate::ui::wake_status();
             return PlayExit::Failed;
         }
     };
+    let replay_title = track.title.clone().or_else(|| resolved_title.clone());
     log_info!(
         "DECODER",
         "opened: {} Hz, {} ch{}, title {:?}",
         track.sample_rate,
         track.channels,
-        track.duration.map(|d| format!(", {}", d.as_secs_f32() as u32)).unwrap_or_default(),
+        track
+            .duration
+            .map(|d| format!(", {}", d.as_secs_f32() as u32))
+            .unwrap_or_default(),
         track.title
     );
 
@@ -790,169 +927,27 @@ fn play_source(
     let mut mix_buf: Vec<f32> = Vec::new();
     let mut bad_packets: u64 = 0;
     let mut opened = false;
-    let mut exit = PlayExit::Eof;
-    let mut failure_reason = None;
+    'decode: loop {
+        let mut exit = PlayExit::Eof;
+        let mut failure_reason = None;
 
-    'play: loop {
-        // Command check between packets: the loop only runs while doing real
-        // work, so this is work-time checking, not idle polling.
-        match cmds.try_recv() {
-            Ok(DecoderCmd::Stop) => {
-                exit = PlayExit::Stopped;
-                break 'play;
-            }
-            Ok(DecoderCmd::Shutdown) => {
-                exit = PlayExit::Shutdown;
-                break 'play;
-            }
-            Ok(DecoderCmd::Load(s)) => {
-                exit = PlayExit::NewSource(s);
-                break 'play;
-            }
-            Ok(DecoderCmd::SeekRelative(delta)) => {
-                if seek_relative(
-                    &mut track,
-                    shared,
-                    delta,
-                    &mut pending,
-                    &mut eq,
-                    &mut resampler,
-                    &mut generation,
-                ) {
-                    let _ = status_tx.send(Status::Seeked);
-                    crate::ui::wake_status();
-                }
-                continue;
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                exit = PlayExit::Shutdown;
-                break 'play;
-            }
-        }
-
-        let packet = match track.format.next_packet() {
-            Ok(p) => p,
-            Err(SymphoniaError::IoError(ref e)) if e.kind() == ErrorKind::UnexpectedEof => {
-                break 'play; // natural end — exit stays Eof
-            }
-            Err(SymphoniaError::ResetRequired) => {
-                log_warn!("DECODER", "stream reset — restarting through failure recovery");
-                failure_reason = Some("stream reset requires a fresh decoder".to_string());
-                exit = PlayExit::Failed;
-                break 'play;
-            }
-            Err(e) => {
-                log_error!("DECODER", "demux: {e}");
-                track.log_child_stderr();
-                exit = PlayExit::Failed;
-                break 'play;
-            }
-        };
-        if packet.track_id() != track.track_id {
-            continue; // attached streams (cover art etc.)
-        }
-
-        let decoded = match track.decoder.decode(&packet) {
-            Ok(d) => d,
-            Err(SymphoniaError::DecodeError(_)) => {
-                bad_packets += 1;
-                if bad_packets <= 3 || bad_packets % 200 == 0 {
-                    log_warn!("DECODER", "bad packet #{} — skipping", bad_packets);
-                }
-                continue;
-            }
-            Err(e) => {
-                log_error!("DECODER", "decode: {e}");
-                track.log_child_stderr();
-                exit = PlayExit::Failed;
-                break 'play;
-            }
-        };
-
-        let spec = *decoded.spec();
-        // First good packet: the decoder's spec is authoritative. Streams that
-        // withheld their layout at open (AAC-in-fMP4) resolve here, and only
-        // now does the broker hear about the track — before any chunk flows.
-        if !opened {
-            track.channels = spec.channels.count();
-            if track.sample_rate == 0 {
-                track.sample_rate = spec.rate;
-            }
-            if track.channels == 0 {
-                log_error!("DECODER", "decoded audio has no channels");
-                exit = PlayExit::Failed;
-                break 'play;
-            }
-            dst_channels = match shared.device_channels() {
-                0 => track.channels,
-                n => n as usize,
-            };
-            chunk_samples = CHUNK_FRAMES * dst_channels;
-            pending.reserve(chunk_samples * 2);
-            // Container tags win (local files); the prefetched YouTube
-            // title fills the gap.
-            let _ = status_tx.send(Status::Opened {
-                source: source.clone(),
-                sample_rate: track.sample_rate,
-                channels: track.channels as u16,
-                title: track.title.take().or_else(|| resolved_title.take()),
-                duration: track.duration,
-            });
-            crate::ui::wake_status();
-            opened = true;
-        }
-        let sb = sample_buf.get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
-        sb.copy_interleaved_ref(decoded);
-        let frames = sb.len() / track.channels;
-        if frames == 0 {
-            continue;
-        }
-
-        // EQ at the source rate, before any resampling.
-        if shared.eq_enabled() {
-            if shared.take_eq_dirty() || !eq.built {
-                eq.rebuild(&shared.eq_gains(), track.sample_rate, track.channels);
-            }
-            eq.apply(&mut sb.samples_mut()[..frames * track.channels], track.channels);
-        }
-        // Volume after EQ.
-        let vol = shared.volume();
-        if vol != 1.0 {
-            for s in &mut sb.samples_mut()[..frames * track.channels] {
-                *s *= vol;
-            }
-        }
-
-        // Resample only on rate mismatch; then mix to the device layout.
-        rate_buf.clear();
-        if track.sample_rate == dst_rate {
-            rate_buf.extend_from_slice(&sb.samples()[..frames * track.channels]);
-        } else {
-            let rs = resampler
-                .get_or_insert_with(|| LinearResampler::new(track.sample_rate, dst_rate, track.channels));
-            rs.process(&sb.samples()[..frames * track.channels], frames, &mut rate_buf);
-        }
-        if dst_channels != track.channels {
-            mix_buf.clear();
-            convert_channels(&rate_buf, track.channels, dst_channels, &mut mix_buf);
-            pending.extend_from_slice(&mix_buf);
-        } else {
-            pending.extend_from_slice(&rate_buf);
-        }
-
-        // Emit fixed-size chunks; backpressure parks in send_chunk.
-        while pending.len() >= chunk_samples {
-            let rest = pending.split_off(chunk_samples);
-            let data = std::mem::replace(&mut pending, rest).into_boxed_slice();
-            let chunk = AudioChunk { data, generation };
-            match send_chunk(chunk_tx, cmds, chunk) {
-                SendOutcome::Sent => {}
-                SendOutcome::Stopped => {
+        'play: loop {
+            // Command check between packets: the loop only runs while doing real
+            // work, so this is work-time checking, not idle polling.
+            match cmds.try_recv() {
+                Ok(DecoderCmd::Stop) => {
                     exit = PlayExit::Stopped;
                     break 'play;
                 }
-                SendOutcome::SeekRelative(delta) => {
+                Ok(DecoderCmd::Shutdown) => {
+                    exit = PlayExit::Shutdown;
+                    break 'play;
+                }
+                Ok(DecoderCmd::Load(s)) => {
+                    exit = PlayExit::NewSource(s);
+                    break 'play;
+                }
+                Ok(DecoderCmd::SeekRelative(delta)) => {
                     if seek_relative(
                         &mut track,
                         shared,
@@ -964,99 +959,312 @@ fn play_source(
                     ) {
                         let _ = status_tx.send(Status::Seeked);
                         crate::ui::wake_status();
-                        continue 'play;
                     }
+                    continue;
                 }
-                SendOutcome::NewSource(s) => {
-                    exit = PlayExit::NewSource(s);
-                    break 'play;
-                }
-                SendOutcome::Shutdown => {
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
                     exit = PlayExit::Shutdown;
                     break 'play;
                 }
-                SendOutcome::SinkGone => {
-                    log_error!("DECODER", "audio sink gone — dropping track");
-                    exit = PlayExit::SinkGone;
+            }
+
+            let packet = match track
+                .seek_packet
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| track.format.next_packet())
+            {
+                Ok(p) => p,
+                Err(SymphoniaError::IoError(ref e)) if e.kind() == ErrorKind::UnexpectedEof => {
+                    break 'play; // natural end — exit stays Eof
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    log_warn!(
+                        "DECODER",
+                        "stream reset — restarting through failure recovery"
+                    );
+                    failure_reason = Some("stream reset requires a fresh decoder".to_string());
+                    exit = PlayExit::Failed;
                     break 'play;
                 }
+                Err(e) => {
+                    log_error!("DECODER", "demux: {e}");
+                    track.log_child_stderr();
+                    exit = PlayExit::Failed;
+                    break 'play;
+                }
+            };
+            track.next_ts = packet.ts().saturating_add(packet.dur());
+            if packet.track_id() != track.track_id {
+                continue; // attached streams (cover art etc.)
             }
-        }
-    }
 
-    if matches!(exit, PlayExit::Eof) {
-        failure_reason = track._child.as_ref().and_then(ChildGuard::eof_failure)
-            .or_else(|| (!opened).then(|| "source ended without decodable audio".to_string()));
-        if let Some(reason) = &failure_reason {
-            log_error!("DECODER", "playback failed: {reason}");
-            track.log_child_stderr();
-            exit = PlayExit::Failed;
-        }
-    }
+            let decoded = match track.decoder.decode(&packet) {
+                Ok(d) => d,
+                Err(SymphoniaError::DecodeError(_)) => {
+                    bad_packets += 1;
+                    if bad_packets <= 3 || bad_packets % 200 == 0 {
+                        log_warn!("DECODER", "bad packet #{} — skipping", bad_packets);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    log_error!("DECODER", "decode: {e}");
+                    track.log_child_stderr();
+                    exit = PlayExit::Failed;
+                    break 'play;
+                }
+            };
 
-    // EOF: flush the short tail chunk so nothing is lost, then wait for the
-    // output callback to hand everything to the device before Finished.
-    if matches!(exit, PlayExit::Eof) && !pending.is_empty() && pending.len() < chunk_samples {
-        let data = std::mem::take(&mut pending).into_boxed_slice();
-        let chunk = AudioChunk { data, generation };
-        match send_chunk(chunk_tx, cmds, chunk) {
-            SendOutcome::Sent => {}
-            SendOutcome::Stopped => exit = PlayExit::Stopped,
-            SendOutcome::SeekRelative(d) => {
-                // Seeking during the final flush: playhead moves, track still
-                // ends — nothing to replay a half-flushed tail into.
-                exit = PlayExit::Stopped;
-                let _ = d;
+            let spec = *decoded.spec();
+            // First good packet: the decoder's spec is authoritative. Streams that
+            // withheld their layout at open (AAC-in-fMP4) resolve here, and only
+            // now does the broker hear about the track — before any chunk flows.
+            if !opened {
+                track.channels = spec.channels.count();
+                if track.sample_rate == 0 {
+                    track.sample_rate = spec.rate;
+                }
+                if track.channels == 0 {
+                    log_error!("DECODER", "decoded audio has no channels");
+                    exit = PlayExit::Failed;
+                    break 'play;
+                }
+                dst_channels = match shared.device_channels() {
+                    0 => track.channels,
+                    n => n as usize,
+                };
+                chunk_samples = CHUNK_FRAMES * dst_channels;
+                pending.reserve(chunk_samples * 2);
+                // Container tags win (local files); the prefetched YouTube
+                // title fills the gap.
+                let _ = status_tx.send(Status::Opened {
+                    source: source.clone(),
+                    sample_rate: track.sample_rate,
+                    channels: track.channels as u16,
+                    title: track.title.take().or_else(|| resolved_title.take()),
+                    duration: track.duration,
+                });
+                crate::ui::wake_status();
+                opened = true;
             }
-            SendOutcome::NewSource(s) => exit = PlayExit::NewSource(s),
-            SendOutcome::Shutdown => exit = PlayExit::Shutdown,
-            SendOutcome::SinkGone => exit = PlayExit::SinkGone,
-        }
-    }
-    match exit {
-        PlayExit::Eof => {
-            // Clear signals emitted before EOF (the callback reports "drained"
-            // whenever it catches up mid-track); then wait for the fresh one.
-            while drained_rx.try_recv().is_ok() {}
-            loop {
-                select! {
-                    recv(drained_rx) -> g => match g {
-                        Ok(g) if g == generation => {
-                            // A child may close stdout just before its exit
-                            // code becomes available. Check again after the
-                            // buffered tail drains rather than reporting a
-                            // failed HTTP stream as successful completion.
-                            if let Some(reason) = track._child.as_ref().and_then(ChildGuard::eof_failure) {
-                                track.log_child_stderr();
-                                drop(track);
-                                let _ = status_tx.send(Status::Failed { source, reason, generation });
-                                crate::ui::wake_status();
-                                return PlayExit::Failed;
-                            }
-                            let _ = status_tx.send(Status::Finished);
+            let sb = sample_buf
+                .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
+            sb.copy_interleaved_ref(decoded);
+            let frames = sb.len() / track.channels;
+            if frames == 0 {
+                continue;
+            }
+
+            // EQ at the source rate, before any resampling.
+            if shared.eq_enabled() {
+                if shared.take_eq_dirty() || !eq.built {
+                    eq.rebuild(&shared.eq_gains(), track.sample_rate, track.channels);
+                }
+                eq.apply(
+                    &mut sb.samples_mut()[..frames * track.channels],
+                    track.channels,
+                );
+            }
+            // Volume after EQ.
+            let vol = shared.volume();
+            if vol != 1.0 {
+                for s in &mut sb.samples_mut()[..frames * track.channels] {
+                    *s *= vol;
+                }
+            }
+
+            // Resample only on rate mismatch; then mix to the device layout.
+            rate_buf.clear();
+            if track.sample_rate == dst_rate {
+                rate_buf.extend_from_slice(&sb.samples()[..frames * track.channels]);
+            } else {
+                let rs = resampler.get_or_insert_with(|| {
+                    LinearResampler::new(track.sample_rate, dst_rate, track.channels)
+                });
+                rs.process(
+                    &sb.samples()[..frames * track.channels],
+                    frames,
+                    &mut rate_buf,
+                );
+            }
+            if dst_channels != track.channels {
+                mix_buf.clear();
+                convert_channels(&rate_buf, track.channels, dst_channels, &mut mix_buf);
+                pending.extend_from_slice(&mix_buf);
+            } else {
+                pending.extend_from_slice(&rate_buf);
+            }
+
+            // Emit fixed-size chunks; backpressure parks in send_chunk.
+            while pending.len() >= chunk_samples {
+                let rest = pending.split_off(chunk_samples);
+                let data = std::mem::replace(&mut pending, rest).into_boxed_slice();
+                let chunk = AudioChunk { data, generation };
+                match send_chunk(chunk_tx, cmds, chunk) {
+                    SendOutcome::Sent => {}
+                    SendOutcome::Stopped => {
+                        exit = PlayExit::Stopped;
+                        break 'play;
+                    }
+                    SendOutcome::SeekRelative(delta, chunk) => {
+                        if seek_relative(
+                            &mut track,
+                            shared,
+                            delta,
+                            &mut pending,
+                            &mut eq,
+                            &mut resampler,
+                            &mut generation,
+                        ) {
+                            let _ = status_tx.send(Status::Seeked);
                             crate::ui::wake_status();
-                            return PlayExit::Eof;
+                            continue 'play;
                         }
-                        _ => continue,
-                    },
-                    recv(cmds) -> msg => match msg {
-                        Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
-                        Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
-                        Ok(DecoderCmd::Load(s)) => return PlayExit::NewSource(s),
-                        Ok(DecoderCmd::SeekRelative(_)) => {} // tail is draining; nothing to move
-                        Err(_) => return PlayExit::Shutdown,
-                    },
+                        // A refused seek must not discard the chunk we were
+                        // waiting to send (for example, an undownloaded target).
+                        let mut restored = chunk.data.into_vec();
+                        restored.append(&mut pending);
+                        pending = restored;
+                    }
+                    SendOutcome::NewSource(s) => {
+                        exit = PlayExit::NewSource(s);
+                        break 'play;
+                    }
+                    SendOutcome::Shutdown => {
+                        exit = PlayExit::Shutdown;
+                        break 'play;
+                    }
+                    SendOutcome::SinkGone => {
+                        log_error!("DECODER", "audio sink gone — dropping track");
+                        exit = PlayExit::SinkGone;
+                        break 'play;
+                    }
                 }
             }
         }
-        PlayExit::Failed => {
-            let reason = failure_reason.unwrap_or_else(|| "decode failed".into());
-            drop(track); // reap the old child before the broker can retry
-            let _ = status_tx.send(Status::Failed { source, reason, generation });
-            crate::ui::wake_status();
-            PlayExit::Failed
+
+        if matches!(exit, PlayExit::Eof) {
+            failure_reason = track
+                ._child
+                .as_ref()
+                .and_then(ChildGuard::eof_failure)
+                .or_else(|| (!opened).then(|| "source ended without decodable audio".to_string()));
+            if let Some(reason) = &failure_reason {
+                log_error!("DECODER", "playback failed: {reason}");
+                track.log_child_stderr();
+                exit = PlayExit::Failed;
+            }
         }
-        other => other,
+
+        // EOF: flush the short tail chunk so nothing is lost, then wait for the
+        // output callback to hand everything to the device before Finished.
+        if matches!(exit, PlayExit::Eof) && !pending.is_empty() && pending.len() < chunk_samples {
+            let data = std::mem::take(&mut pending).into_boxed_slice();
+            let mut chunk = AudioChunk { data, generation };
+            loop {
+                match send_chunk(chunk_tx, cmds, chunk) {
+                    SendOutcome::Sent => break,
+                    SendOutcome::Stopped => {
+                        exit = PlayExit::Stopped;
+                        break;
+                    }
+                    SendOutcome::SeekRelative(d, returned) => {
+                        if seek_relative(
+                            &mut track,
+                            shared,
+                            d,
+                            &mut pending,
+                            &mut eq,
+                            &mut resampler,
+                            &mut generation,
+                        ) {
+                            let _ = status_tx.send(Status::Seeked);
+                            crate::ui::wake_status();
+                            continue 'decode;
+                        }
+                        chunk = returned;
+                    }
+                    SendOutcome::NewSource(s) => {
+                        exit = PlayExit::NewSource(s);
+                        break;
+                    }
+                    SendOutcome::Shutdown => {
+                        exit = PlayExit::Shutdown;
+                        break;
+                    }
+                    SendOutcome::SinkGone => {
+                        exit = PlayExit::SinkGone;
+                        break;
+                    }
+                }
+            }
+        }
+        match exit {
+            PlayExit::Eof => {
+                // Clear signals emitted before EOF (the callback reports "drained"
+                // whenever it catches up mid-track); then wait for the fresh one.
+                while drained_rx.try_recv().is_ok() {}
+                loop {
+                    select! {
+                        recv(drained_rx) -> g => match g {
+                            Ok(g) if g == generation => {
+                                // A child may close stdout just before its exit
+                                // code becomes available. Check again after the
+                                // buffered tail drains rather than reporting a
+                                // failed HTTP stream as successful completion.
+                                if let Some(reason) = track._child.as_ref().and_then(ChildGuard::eof_failure) {
+                                    track.log_child_stderr();
+                                    drop(track);
+                                    let _ = status_tx.send(Status::Failed { source, reason, generation });
+                                    crate::ui::wake_status();
+                                    return PlayExit::Failed;
+                                }
+                                // Store the same allocation before notifying the
+                                // broker; its repeat Load will reopen at byte 0.
+                                if shared.loop_enabled() {
+                                    if let Some(buffer) = track.stream_buffer.as_ref().filter(|buffer| buffer.complete()) {
+                                        *cache = Some(StreamCache {
+                                            source: source.clone(), buffer: buffer.clone(), title: replay_title.clone(),
+                                        });
+                                    }
+                                }
+                                let _ = status_tx.send(Status::Finished);
+                                crate::ui::wake_status();
+                                return PlayExit::Eof;
+                            }
+                            _ => continue,
+                        },
+                        recv(cmds) -> msg => match msg {
+                            Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
+                            Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
+                            Ok(DecoderCmd::Load(s)) => return PlayExit::NewSource(s),
+                            Ok(DecoderCmd::SeekRelative(delta)) => {
+                                if seek_relative(&mut track, shared, delta, &mut pending, &mut eq, &mut resampler, &mut generation) {
+                                    let _ = status_tx.send(Status::Seeked);
+                                    crate::ui::wake_status();
+                                    continue 'decode;
+                                }
+                            }
+                            Err(_) => return PlayExit::Shutdown,
+                        },
+                    }
+                }
+            }
+            PlayExit::Failed => {
+                let reason = failure_reason.unwrap_or_else(|| "decode failed".into());
+                drop(track); // reap the old child before the broker can retry
+                let _ = status_tx.send(Status::Failed {
+                    source,
+                    reason,
+                    generation,
+                });
+                crate::ui::wake_status();
+                return PlayExit::Failed;
+            }
+            other => return other,
+        }
     }
 }
 
@@ -1222,6 +1430,204 @@ impl LinearResampler {
 mod tests {
     use super::*;
 
+    fn pcm_wav(samples: &[i16], rate: u32) -> Vec<u8> {
+        let size = (samples.len() * 2) as u32;
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&(36 + size).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&size.to_le_bytes());
+        for sample in samples { wav.extend_from_slice(&sample.to_le_bytes()); }
+        wav
+    }
+
+    #[test]
+    fn track_change_or_repeat_off_releases_the_previous_stream_allocation() {
+        let source = Source::from_raw("https://youtu.be/cache");
+        for next in [Source::from_raw("https://youtu.be/next"), source.clone()] {
+            let buffer = StreamBuffer::new();
+            buffer.append(b"cached track").unwrap();
+            buffer.finish(Ok(()));
+            let weak = Arc::downgrade(&buffer);
+            let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
+            select_stream_cache(&mut cache, &source, true);
+            assert!(weak.upgrade().is_some());
+            select_stream_cache(&mut cache, &next, next != source);
+            assert!(cache.is_none());
+            assert!(weak.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn downloader_releases_bytes_and_joins_before_the_next_track() {
+        let slot: BufferSlot = Arc::new(Mutex::new(None));
+        let download = DownloadWorker::start(std::io::Cursor::new(b"one downloaded track".to_vec()), &slot).unwrap();
+        let weak = Arc::downgrade(&download.buffer);
+        let mut reader = download.buffer.reader();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"one downloaded track");
+        drop(reader);
+        drop(download);
+        assert!(weak.upgrade().is_none());
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn cached_stream_seek_works_while_final_audio_is_draining() {
+        use crate::broker::Phase;
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        shared.set_phase(Phase::Playing);
+        let source = Source::Youtube { url: "ram-test://tail".into(), format: "140".into(), playlist_index: None };
+        let buffer = StreamBuffer::new();
+        buffer.append(&pcm_wav(&vec![8192; 4096], 48_000)).unwrap();
+        buffer.finish(Ok(()));
+        let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
+        let (cmd_tx, cmd_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let (chunk_tx, chunk_rx) = bounded::<AudioChunk>(4);
+        let (_drained_tx, drained_rx) = bounded(4);
+        let decoder_shared = shared.clone();
+        let decoder = thread::spawn(move || play_source(&decoder_shared, &cmd_rx, &status_tx, &chunk_tx, &drained_rx,
+            &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), &mut cache, source));
+        assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { .. }));
+        let first = chunk_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // No drain notification is sent. The complete short WAV reaches the
+        // final drain wait while playback still owns its downloaded reader.
+        thread::sleep(Duration::from_millis(10));
+        shared.set_playhead_frames(2400);
+        cmd_tx.send(DecoderCmd::SeekRelative(-0.05)).unwrap();
+        assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Seeked));
+        let replayed = chunk_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.data, replayed.data);
+        assert_ne!(first.generation, replayed.generation);
+        cmd_tx.send(DecoderCmd::Stop).unwrap();
+        assert!(matches!(decoder.join().unwrap(), PlayExit::Stopped));
+    }
+
+    #[test]
+    fn loop_replays_from_ram_without_spawning_any_source_process() {
+        use crate::broker::Phase;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        shared.set_loop_enabled(true);
+        shared.set_phase(Phase::Playing);
+        let source = Source::Youtube { url: "ram-test://offline".into(), format: "140".into(), playlist_index: None };
+        let buffer = StreamBuffer::new();
+        buffer.append(&pcm_wav(&vec![8192; 4096], 48_000)).unwrap();
+        buffer.finish(Ok(()));
+        let weak = Arc::downgrade(&buffer);
+        let mut cache = Some(StreamCache { source: source.clone(), buffer, title: Some("RAM title".into()) });
+        let (_cmd_tx, cmd_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let (chunk_tx, chunk_rx) = bounded::<AudioChunk>(4);
+        let (drained_tx, drained_rx) = bounded(4);
+        let child_slot = Arc::new(Mutex::new(None));
+        let buffer_slot: BufferSlot = Arc::new(Mutex::new(None));
+        let done = Arc::new(AtomicBool::new(false));
+        // A virtual output callback drains chunks and signals the same EOF
+        // event as WASAPI. No UI, network, or audio device is used.
+        let consumer_shared = shared.clone();
+        let consumer_done = done.clone();
+        let consumer = thread::spawn(move || {
+            let mut rounds = Vec::new();
+            while !consumer_done.load(Ordering::Acquire) {
+                match chunk_rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(chunk) => rounds.push(chunk.data.to_vec()),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        let _ = drained_tx.try_send(consumer_shared.generation());
+                    }
+                    Err(_) => break,
+                }
+            }
+            rounds
+        });
+        let decoder_shared = shared.clone();
+        let decoder = thread::spawn(move || {
+            for _ in 0..2 {
+                assert!(matches!(play_source(&decoder_shared, &cmd_rx, &status_tx, &chunk_tx, &drained_rx,
+                    &child_slot, &buffer_slot, &mut cache, source.clone()), PlayExit::Eof));
+                assert!(child_slot.lock().unwrap().is_none(), "repeat must not spawn yt-dlp");
+                assert!(buffer_slot.lock().unwrap().is_none(), "repeat must not spawn a downloader");
+            }
+            drop(cache);
+        });
+        for _ in 0..2 {
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Status::Opened { title: Some(title), .. } if title == "RAM title"));
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+        }
+        decoder.join().unwrap();
+        done.store(true, Ordering::Release);
+        let rounds = consumer.join().unwrap();
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(rounds[0], rounds[1], "both plays decode identical cached bytes from offset zero");
+        assert!(weak.upgrade().is_none(), "the last cache owner must release all bytes");
+    }
+
+    #[test]
+    fn all_streaming_platforms_seek_a_downloaded_memory_container() {
+        for url in ["https://youtu.be/test", "https://www.bilibili.com/video/BVtest", "https://www.nicovideo.jp/watch/sm1"] {
+            let buffer = StreamBuffer::new();
+            buffer.append(&pcm_wav(&vec![8192; 48_000], 48_000)).unwrap();
+            buffer.finish(Ok(()));
+            let mut track = open_track(&Source::from_raw(url), &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)), Some(buffer)).unwrap();
+            let shared = SharedState::new();
+            shared.set_sample_rate(48_000);
+            let mut generation = shared.generation();
+            let mut pending = vec![1.0];
+            let mut eq = EqChain::new();
+            let mut resampler = None;
+            assert!(seek_relative(&mut track, &shared, 0.5, &mut pending, &mut eq, &mut resampler, &mut generation));
+            assert!(shared.position() <= Duration::from_millis(500));
+            assert!(shared.position() >= Duration::from_millis(450), "container seek returns the actual packet timestamp");
+            assert!(pending.is_empty());
+            assert!(seek_relative(&mut track, &shared, -10.0, &mut pending, &mut eq, &mut resampler, &mut generation));
+            assert_eq!(shared.position(), Duration::ZERO);
+            assert!(track._child.is_none());
+            assert!(track._download.is_none());
+        }
+    }
+
+    #[test]
+    fn progressive_aac_mp4_starts_and_seeks_before_download_finishes() {
+        let buffer = StreamBuffer::new();
+        // Intentionally leave the producer unfinished: MP4 must probe via
+        // its progressive path, not require a final HTTP/file length.
+        let data = include_bytes!("../tests/fixtures/silence.m4a");
+        let payload = data.windows(4).position(|bytes| bytes == b"mdat").unwrap() + 4;
+        let prefix = payload + (data.len() - payload) / 2;
+        buffer.append(&data[..prefix]).unwrap();
+        let mut track = open_track(&Source::from_raw("https://youtu.be/progressive"),
+            &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), Some(buffer.clone())).unwrap();
+        let packet = track.format.next_packet().unwrap();
+        assert!(track.decoder.decode(&packet).is_ok());
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        let mut generation = shared.generation();
+        assert!(seek_relative(&mut track, &shared, 0.05, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation));
+        assert!(!buffer.complete());
+        assert!(shared.position() > Duration::from_millis(20));
+        assert!(!seek_relative(&mut track, &shared, 0.2, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation),
+            "undownloaded sample bytes must be refused without waiting");
+        assert!(seek_relative(&mut track, &shared, -5.0, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation));
+        assert_eq!(shared.position(), Duration::ZERO);
+        assert!(track.decoder.decode(&track.seek_packet.take().unwrap()).is_ok());
+        buffer.append(&data[prefix..]).unwrap();
+        buffer.finish(Ok(()));
+        assert!(seek_relative(&mut track, &shared, 0.2, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation));
+    }
+
     #[test]
     fn zero_gain_eq_is_exact_passthrough() {
         let mut eq = EqChain::new();
@@ -1314,7 +1720,7 @@ mod tests {
         let child_slot = Arc::new(Mutex::new(None));
         let decoder_shared = shared.clone();
         let decoder = thread::spawn(move || {
-            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, child_slot);
+            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, child_slot, Arc::new(Mutex::new(None)));
         });
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
             cmd_tx.clone(), Arc::new(|| {}),

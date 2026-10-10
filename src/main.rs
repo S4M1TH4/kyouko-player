@@ -42,6 +42,7 @@ mod audio;
 mod broker;
 mod config;
 mod logging;
+mod stream_buffer;
 mod terminal;
 mod ui;
 
