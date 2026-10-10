@@ -338,14 +338,14 @@ fn advance_playlist(source: &Source) -> Option<Source> {
     }
 }
 
-/// Input side: terminal now, tray menu / global hotkeys later. All of them
+/// Input side: terminal, floating window, and tray icon. All of them
 /// converge here — the broker is the single decision point.
 #[derive(Clone, Debug)]
 pub enum Command {
     /// `paused: true` stages the source in the decoder (buffered, resume is
     /// instant) while the output stays stopped — used for last-track restore.
     Load { source: Source, paused: bool },
-    /// Flip between Playing and Paused (tray menu + terminal `r`).
+    /// Flip between Playing and Paused (window/tray clicks + terminal `r`).
     TogglePause,
     /// Jump the playhead by a signed offset in seconds (terminal `.` / `,`).
     SeekRelative(f64),
@@ -368,7 +368,7 @@ pub enum Command {
     JumpToTrack(usize),
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
-    /// Terminal `vol`, tray vol row (+/-10% steps) all land here.
+    /// Terminal `vol` and window wheel (+/-10% steps) all land here.
     SetVolume(f32),
     /// Band gain in dB, clamped to ±12. `None` = all bands.
     EqGain { band: Option<usize>, gain_db: f32 },
@@ -1222,8 +1222,7 @@ impl Broker {
                 self.refresh();
                 self.persist();
             }
-            // Presentation-side command: the Win32 drain intercepts this and
-            // toggles the window; it never reaches here in normal flow.
+            // Presentation-only: intercepted by the Win32 command drain.
             Command::ToggleWindow => {
                 log_debug!("BROKER", "window toggle is presentation-side");
             }

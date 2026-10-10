@@ -106,7 +106,7 @@ fn main() {
 
     // The four message arteries. Bounded everywhere: a full queue is the
     // scheduler — senders block (park), nobody ever spins.
-    let (cmd_tx, cmd_rx) = bounded::<Command>(32); // stdin (→ step 2: tray menu too)
+    let (cmd_tx, cmd_rx) = bounded::<Command>(32); // terminal, window, and tray icon
     let (decoder_tx, decoder_rx) = bounded::<DecoderCmd>(8); // broker → decoder
     let (status_tx, status_rx) = bounded::<Status>(16); // decoder → broker
     CMD_TX.set(cmd_tx.clone()).ok();

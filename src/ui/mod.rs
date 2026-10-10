@@ -7,7 +7,7 @@
 //! loop { GetMessageW }                        // parks in the kernel, zero CPU
 //!   WM_APP_BROKER  → drain cmd_rx (try_recv)  → broker.handle_command → sync()
 //!   WM_APP_STATUS  → drain status_rx          → broker.handle_status  → sync()
-//!   WM_APP_TRAY    → left-click: show/hide, right-click: menu (quit)
+//!   WM_APP_TRAY    → left-click: pause/resume; right-click: Show/Hide Echo + Quit
 //!   WM_TIMER (1 Hz, ONLY while Playing) → broker.tick() → sync()
 //! ```
 //!
@@ -36,7 +36,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::audio::AudioOut;
 use crate::broker::{Broker, Command, Status};
 
-/// Write end of the command channel, parked in a static so tray-menu choices
+/// Write end of the command channel, parked in a static so UI interactions
 /// and the console control handler (both outside the normal producer path)
 /// can inject commands. `main` fills it before spawning any threads.
 pub static CMD_TX: OnceLock<Sender<Command>> = OnceLock::new();
