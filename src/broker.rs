@@ -224,7 +224,14 @@ fn default_format_for(url: &str) -> &'static str {
 /// the queue.
 enum DroppedBatch {
     YouTube(String),
-    Media(Vec<Source>),
+    Media(LocalBatch),
+}
+
+/// Queue contents plus the last successfully scanned folder in this batch.
+#[derive(Default)]
+struct LocalBatch {
+    files: Vec<Source>,
+    last_folder: Option<String>,
 }
 
 /// Classify a dropped batch. `.url` shortcuts for streamable sites are
@@ -261,8 +268,8 @@ fn classify_dropped(paths: &[String]) -> DroppedBatch {
         }
     }
     match collect_media_from_paths(&rest) {
-        Some(files) if !files.is_empty() => DroppedBatch::Media(files),
-        _ => DroppedBatch::Media(Vec::new()),
+        Some(batch) => DroppedBatch::Media(batch),
+        None => DroppedBatch::Media(LocalBatch::default()),
     }
 }
 
@@ -271,12 +278,22 @@ fn classify_dropped(paths: &[String]) -> DroppedBatch {
 /// scan; loose files are filtered by extension; the merged list is re-sorted
 /// by mtime so drops and scans interleave predictably. `None` when nothing
 /// in the batch is playable.
-fn collect_media_from_paths(paths: &[String]) -> Option<Vec<Source>> {
+fn collect_media_from_paths(paths: &[String]) -> Option<LocalBatch> {
     let mut files: Vec<Source> = Vec::new();
+    let mut last_folder = None;
     for path in paths {
         let p = Path::new(path);
         if p.is_dir() {
-            files.extend(scan_folder(path));
+            let Ok(absolute) = std::path::absolute(p) else {
+                log_warn!("BROKER", "cannot resolve folder path: {path}");
+                continue;
+            };
+            let absolute = absolute.to_string_lossy().into_owned();
+            let folder_files = scan_folder(&absolute);
+            if !folder_files.is_empty() {
+                files.extend(folder_files);
+                last_folder = Some(absolute);
+            }
         } else if p.is_file() && is_media_path(p) {
             files.push(Source::File(path.clone()));
         } else {
@@ -287,7 +304,7 @@ fn collect_media_from_paths(paths: &[String]) -> Option<Vec<Source>> {
         return None;
     }
     files.sort_by(|a, b| mtime_of(source_path(b)).cmp(&mtime_of(source_path(a))));
-    Some(files)
+    Some(LocalBatch { files, last_folder })
 }
 
 /// The path behind a file source (queue entries are always `Source::File`).
@@ -345,6 +362,9 @@ pub enum Command {
     /// `paused: true` stages the source in the decoder (buffered, resume is
     /// instant) while the output stays stopped — used for last-track restore.
     Load { source: Source, paused: bool },
+    /// Startup-only history restore: rescan a valid folder, then stage its
+    /// saved track (or the first entry) paused. Fall back to last_track.
+    RestoreState { last_folder: Option<String>, last_track: Option<String> },
     /// Flip between Playing and Paused (window/tray clicks + terminal `r`).
     TogglePause,
     /// Jump the playhead by a signed offset in seconds (terminal `.` / `,`).
@@ -654,6 +674,8 @@ pub struct Broker {
     /// Raw form of the most recently OPENED source — survives Stop/Finished
     /// (where `track` is cleared) so a volume tweak never erases last_track.
     last_source_raw: Option<String>,
+    /// Active folder context survives queue navigation, Stop, and repeat.
+    last_folder: Option<String>,
     /// The source a LOADING load will open (no track exists yet) — lets
     /// navigation work while metadata/probe is still in flight.
     pending_source: Option<Source>,
@@ -682,6 +704,7 @@ impl Broker {
             view_dirty: false,
             stage_paused: false,
             last_source_raw: None,
+            last_folder: None,
             pending_source: None,
             local_queue: Vec::new(),
             queue_index: None,
@@ -694,7 +717,7 @@ impl Broker {
     }
 
     /// Install the persistence sink. Fired on the save triggers: volume,
-    /// EQ gains, opened track, Quit.
+    /// EQ gains, folder ingestion, opened track, Quit.
     pub fn with_saver(mut self, saver: Arc<dyn Fn(PersistedState) + Send + Sync>) -> Self {
         self.saver = Some(saver);
         self
@@ -706,6 +729,7 @@ impl Broker {
             volume: self.shared.volume(),
             eq_gains: self.shared.eq_gains(),
             last_track: self.last_source_raw.clone(),
+            last_folder: self.last_folder.clone(),
             loop_enabled: self.shared.loop_enabled(),
         }
     }
@@ -714,6 +738,43 @@ impl Broker {
         if let Some(saver) = &self.saver {
             saver(self.persist_snapshot());
             log_debug!("BROKER", "state persisted to disk");
+        }
+    }
+
+    fn restore_startup(&mut self, last_folder: Option<String>, last_track: Option<String>) {
+        self.last_source_raw = last_track.clone();
+        if let Some(folder) = last_folder {
+            let batch = Path::new(&folder).is_dir()
+                .then(|| collect_media_from_paths(std::slice::from_ref(&folder)))
+                .flatten();
+            if let Some(batch) = batch {
+                // Match resolved paths so relative paths, case,
+                // and alternate spellings do not lose the saved selection.
+                let saved_path = last_track.as_deref()
+                    .and_then(|p| std::fs::canonicalize(p).ok());
+                let index = saved_path.as_ref().and_then(|saved| {
+                    batch.files.iter().position(|source| {
+                        std::fs::canonicalize(source_path(source)).ok().as_ref() == Some(saved)
+                    })
+                }).unwrap_or(0);
+                self.last_folder = batch.last_folder;
+                self.local_queue = batch.files;
+                self.queue_index = Some(index);
+                self.yt_queue.clear();
+                self.yt_queue_url = None;
+                log_info!(
+                    "BROKER",
+                    "restored folder queue: {} tracks from {folder}, selected {}",
+                    self.local_queue.len(), index + 1
+                );
+                self.begin_load(self.local_queue[index].clone(), true);
+                return;
+            }
+            log_warn!("BROKER", "saved folder unavailable or contains no supported media: {folder}");
+        }
+        self.last_folder = None;
+        if let Some(raw) = last_track {
+            self.handle_command(Command::Load { source: Source::from_raw(&raw), paused: true });
         }
     }
 
@@ -923,6 +984,9 @@ impl Broker {
     pub fn handle_command(&mut self, cmd: Command) -> Flow {
         log_debug!("BROKER", "command: {cmd:?}");
         match cmd {
+            Command::RestoreState { last_folder, last_track } => {
+                self.restore_startup(last_folder, last_track);
+            }
             Command::LoadDropped(paths) => {
                 // Classify the batch first: a YouTube .url shortcut wins over
                 // everything else in the same drop; otherwise the surviving
@@ -937,14 +1001,18 @@ impl Broker {
                             paused: false,
                         });
                     }
-                    DroppedBatch::Media(files) if !files.is_empty() => {
+                    DroppedBatch::Media(batch) if !batch.files.is_empty() => {
                         log_info!(
                             "BROKER",
                             "drop queue: {} media files (newest first)",
-                            files.len()
+                            batch.files.len()
                         );
-                        self.local_queue = files;
+                        self.last_folder = batch.last_folder;
+                        self.local_queue = batch.files;
                         self.queue_index = Some(0);
+                        self.yt_queue.clear();
+                        self.yt_queue_url = None;
+                        self.persist();
                         let first = self.local_queue[0].clone();
                         self.begin_load(first, false);
                     }
@@ -999,17 +1067,19 @@ impl Broker {
                     }
                     if Path::new(path).is_dir() {
                         match collect_media_from_paths(std::slice::from_ref(path)) {
-                            Some(files) => {
+                            Some(batch) => {
                                 log_info!(
                                     "BROKER",
                                     "folder queue: {} tracks from {path}",
-                                    files.len()
+                                    batch.files.len()
                                 );
-                                self.local_queue = files;
+                                self.last_folder = batch.last_folder;
+                                self.local_queue = batch.files;
                                 self.queue_index = Some(0);
                                 // A folder load supersedes any YouTube listing.
                                 self.yt_queue.clear();
                                 self.yt_queue_url = None;
+                                self.persist();
                                 source = self.local_queue[0].clone();
                                 queue_managed = true;
                             }
@@ -1025,6 +1095,7 @@ impl Broker {
                     }
                 }
                 if !queue_managed {
+                    self.last_folder = None;
                     // A direct file load becomes a one-entry queue; a YouTube
                     // load supersedes any local queue.
                     match &source {
@@ -1049,18 +1120,7 @@ impl Broker {
                         }
                     }
                 }
-                log_info!(
-                    "BROKER",
-                    "load{}: {source}",
-                    if paused { " [staged paused]" } else { "" }
-                );
-                self.stage_paused = paused;
-                self.track = None;
-                self.pending_source = Some(source.clone());
-                self.shared.reset_playhead();
-                self.shared.bump_generation();
-                self.set_phase(Phase::Loading, "load requested");
-                self.send_decoder(DecoderCmd::Load(source));
+                self.begin_load(source, paused);
             }
             Command::SeekRelative(delta) => {
                 log_info!("BROKER", "seek {delta:+.1}s");
@@ -1301,8 +1361,10 @@ impl Broker {
                 });
                 if let Some(Some(source)) = replay {
                     log_info!("LOOP", "repeat: replaying {source}");
-                    self.handle_command(Command::Load { source, paused: false });
-                    return; // handle_command already refreshed the panel
+                    // Replaying a queue entry must retain its folder context.
+                    self.begin_load(source, false);
+                    self.refresh();
+                    return;
                 }
                 // 2. Playlist progression: a finished playlist entry advances
                 //    to the next index via a fresh (sequential, single-process)
@@ -1681,7 +1743,7 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         std::fs::create_dir(dir.join("nested")).unwrap();
 
-        let (mut broker, _, rx) = broker_with_sink();
+        let (mut broker, sink, rx) = broker_with_sink();
         let dir_path = dir.to_string_lossy().into_owned();
         broker.handle_command(Command::Load {
             source: Source::File(dir_path.clone()),
@@ -1690,6 +1752,8 @@ mod tests {
         // The folder scan queued both media files (newest first) and the
         // decoder was handed the newest one.
         assert_eq!(broker.local_queue.len(), 2);
+        assert_eq!(sink.lock().unwrap().last().unwrap().last_folder.as_deref(), Some(dir_path.as_str()),
+            "folder saved before the decoder opens a track");
         assert_eq!(broker.queue_index, Some(0));
         assert!(broker.local_queue[0].display_name().contains("New"));
         assert!(broker.local_queue[1].display_name().contains("Old"));
@@ -1707,7 +1771,99 @@ mod tests {
         };
         assert!(p1.contains("01"));
 
+        // Persist the selected track, then restart after adding a newer file.
+        broker.handle_status(Status::Opened {
+            source: Source::File(p1.clone()), sample_rate: 48_000, channels: 2,
+            title: None, duration: None,
+        });
+        broker.shared.set_loop_enabled(true);
+        broker.handle_status(Status::Finished);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        assert_eq!(broker.local_queue.len(), 2, "repeat retains the folder queue");
+        broker.handle_command(Command::Stop);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        let saved = broker.persist_snapshot();
+        assert_eq!(saved.last_folder.as_deref(), Some(dir_path.as_str()));
+        let latest = dir.join("03 - Latest.wav");
+        std::fs::write(&latest, b"x").unwrap();
+        std::fs::OpenOptions::new().write(true).open(&latest).unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(120)).unwrap();
+        let (mut restarted, _, restarted_rx) = broker_with_sink();
+        restarted.handle_command(Command::RestoreState {
+            last_folder: saved.last_folder, last_track: saved.last_track,
+        });
+        assert_eq!(restarted.local_queue.len(), 3, "restart rescans current contents");
+        assert_eq!(restarted.local_queue[0].raw(), latest.to_string_lossy());
+        assert_eq!(restarted.queue_index, Some(2), "selection follows track path, not old index");
+        assert!(matches!(restarted_rx.try_recv(), Ok(DecoderCmd::Load(Source::File(p))) if p == p1));
+        restarted.handle_status(Status::Opened {
+            source: Source::File(p1), sample_rate: 48_000, channels: 2,
+            title: None, duration: None,
+        });
+        assert_eq!(restarted.shared.phase(), Phase::Paused);
+        assert!(format_queue(&restarted.local_queue, restarted.queue_index).contains("local queue (3 tracks)"));
+
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dropped_relative_folder_persists_and_restores_first_when_saved_track_is_missing() {
+        let relative = format!("target/kyouko-folder-test-{}", std::process::id());
+        let absolute = std::path::absolute(&relative).unwrap();
+        std::fs::create_dir_all(&absolute).unwrap();
+        let file = absolute.join("Song.mp3");
+        std::fs::write(&file, b"x").unwrap();
+        let (mut broker, sink, rx) = broker_with_sink();
+        broker.yt_queue_url = Some("https://youtube.com/playlist?list=old".into());
+        broker.handle_command(Command::LoadDropped(vec![relative]));
+        let saved = sink.lock().unwrap().last().unwrap().clone();
+        assert_eq!(saved.last_folder.as_deref(), absolute.to_str());
+        assert!(broker.yt_queue_url.is_none());
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        // An unplayable batch must keep the existing folder and saved state.
+        let saves = sink.lock().unwrap().len();
+        broker.handle_command(Command::LoadDropped(vec!["missing.txt".into()]));
+        assert_eq!(broker.last_folder, saved.last_folder);
+        assert_eq!(sink.lock().unwrap().len(), saves);
+
+        let (mut restarted, _, restart_rx) = broker_with_sink();
+        restarted.handle_command(Command::RestoreState {
+            last_folder: saved.last_folder,
+            last_track: Some(absolute.join("removed.mp3").to_string_lossy().into_owned()),
+        });
+        assert_eq!(restarted.queue_index, Some(0));
+        assert!(restarted.stage_paused);
+        assert!(matches!(restart_rx.try_recv(), Ok(DecoderCmd::Load(Source::File(p))) if Path::new(&p) == file));
+        // Explicit file input replaces the folder context, including a file
+        // inside the same directory. Opened persists that replacement.
+        restarted.handle_command(Command::Load { source: Source::File(file.to_string_lossy().into_owned()), paused: false });
+        assert!(restarted.last_folder.is_none());
+        broker.handle_command(Command::LoadDropped(vec![file.to_string_lossy().into_owned()]));
+        assert!(sink.lock().unwrap().last().unwrap().last_folder.is_none());
+        std::fs::remove_dir_all(absolute).unwrap();
+    }
+
+    #[test]
+    fn startup_without_playable_folder_falls_back_to_last_track() {
+        let empty = std::env::temp_dir().join(format!("kyouko-restore-{}-empty", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        for folder in [None, Some(empty.to_string_lossy().into_owned()),
+            Some(empty.join("missing").to_string_lossy().into_owned())] {
+            let (mut broker, _, rx) = broker_with_sink();
+            let raw = "https://www.bilibili.com/video/BVtest";
+            broker.handle_command(Command::RestoreState {
+                last_folder: folder, last_track: Some(raw.into()),
+            });
+            assert!(broker.last_folder.is_none());
+            assert_eq!(broker.persist_snapshot().last_track.as_deref(), Some(raw));
+            assert!(broker.stage_paused);
+            assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { format, .. })) if format == "30232"));
+        }
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::RestoreState { last_folder: Some(empty.to_string_lossy().into_owned()), last_track: None });
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        assert!(rx.try_recv().is_err());
+        std::fs::remove_dir_all(empty).unwrap();
     }
 
     #[test]
@@ -1766,9 +1922,11 @@ mod tests {
             "Z:\\missing\\drive\\track.flac".to_string(),
             older.to_string_lossy().into_owned(),
         ];
-        let Some(queue) = collect_media_from_paths(&paths) else {
+        let Some(batch) = collect_media_from_paths(&paths) else {
             panic!("mixed drop must resolve");
         };
+        assert_eq!(batch.last_folder.as_deref(), Some(sub.to_str().unwrap()));
+        let queue = batch.files;
         assert_eq!(queue.len(), 3, "older + newer + inner (notes/missing filtered)");
         // Newest first across the whole merged batch.
         assert!(queue[0].display_name().contains("newer.flac"));
@@ -1835,6 +1993,7 @@ mod tests {
         let (mut broker, _, _rx) = broker_with_sink();
         broker.local_queue = vec![Source::File("C:\\album\\only.mp3".into())];
         broker.queue_index = Some(0);
+        broker.last_folder = Some(r"C:\album".into());
         broker.handle_command(Command::Load {
             source: Source::Youtube {
                 url: "https://youtu.be/x".into(),
@@ -1845,6 +2004,7 @@ mod tests {
         });
         assert!(broker.local_queue.is_empty());
         assert_eq!(broker.queue_index, None);
+        assert_eq!(broker.last_folder, None);
     }
 
     #[test]

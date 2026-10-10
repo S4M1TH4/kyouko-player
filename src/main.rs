@@ -97,11 +97,12 @@ fn main() {
     };
     log_info!(
         "MAIN",
-        "restored: volume {:.0}%, eq ({}), loop {}, last_track {}",
+        "restored: volume {:.0}%, eq ({}), loop {}, last_track {}, last_folder {}",
         restored.volume * 100.0,
         eq_desc,
         if restored.loop_enabled { "ON" } else { "OFF" },
-        restored.last_track.as_deref().unwrap_or("<none>")
+        restored.last_track.as_deref().unwrap_or("<none>"),
+        restored.last_folder.as_deref().unwrap_or("<none>")
     );
 
     // The four message arteries. Bounded everywhere: a full queue is the
@@ -111,24 +112,17 @@ fn main() {
     let (status_tx, status_rx) = bounded::<Status>(16); // decoder → broker
     CMD_TX.set(cmd_tx.clone()).ok();
 
-    // Launch track: an explicit CLI argument plays right away; otherwise a
-    // persisted last_track is STAGED in the decoder — buffered, resume is
-    // instant — with the output left stopped (paused, 0% CPU).
-    let initial = match std::env::args().nth(1) {
-        Some(arg) => Some((Source::from_raw(&arg), false)),
-        None => restored
-            .last_track
-            .as_deref()
-            .map(Source::from_raw)
-            .map(|s| (s, true)),
-    };
-    if let Some((source, paused)) = initial {
-        log_info!(
-            "MAIN",
-            "launch track: {source} ({})",
-            if paused { "staged paused" } else { "autoplay" }
-        );
-        let _ = cmd_tx.send(Command::Load { source, paused });
+    // Explicit CLI input takes precedence. Otherwise the broker rebuilds
+    // the saved folder queue and stages its last track paused (0% CPU idle).
+    if let Some(arg) = std::env::args().nth(1) {
+        let source = Source::from_raw(&arg);
+        log_info!("MAIN", "launch track: {source} (autoplay)");
+        let _ = cmd_tx.send(Command::Load { source, paused: false });
+    } else if restored.last_folder.is_some() || restored.last_track.is_some() {
+        let _ = cmd_tx.send(Command::RestoreState {
+            last_folder: restored.last_folder,
+            last_track: restored.last_track,
+        });
     }
 
     let audio = audio::spawn(shared.clone(), decoder_rx, status_tx);
@@ -148,7 +142,7 @@ fn main() {
     let shutdown_link = link.clone();
 
     // Persistence sink: the broker calls it on every save trigger
-    // (volume / EQ gains / opened track / Quit). Fire-and-forget writes on
+    // (volume / EQ gains / folder ingestion / opened track / Quit). Writes on
     // the broker thread — no locks, no background flusher thread.
     let saver: Arc<dyn Fn(PersistedState) + Send + Sync> =
         Arc::new(|state| config::store(&state));
