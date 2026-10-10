@@ -1,4 +1,4 @@
-//! The Windows presentation pump: 200 px layered window, tray integration,
+//! The Windows presentation pump: 80 px layered window, tray integration,
 //! and a `GetMessageW` loop that parks in the kernel whenever nothing is
 //! happening. Every channel push from any thread arrives here as exactly one
 //! posted message — data in channels, wake-ups in the window queue.
@@ -141,7 +141,7 @@ pub fn run(
     let shared = broker.shared();
 
     unsafe {
-        // Crisp text: 200 px means 200 physical pixels, never scaled.
+        // Crisp text: 80 px means 80 physical pixels, never scaled.
         if let Err(e) =
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
         {

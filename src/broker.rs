@@ -1384,35 +1384,41 @@ fn row(content: &str) -> String {
 
 /// Borderless panel — plain text lines only (the frame was removed by
 /// design); the layered window's own edges provide the boundary.
+///
+/// Compact 80 px layout: the window interior fits ~14 Consolas cells, so
+/// every line is tuned to that budget and the title truncates. The dual
+/// status row's column layout is fixed by ui/render.rs's STATUS_*_COLS
+/// hit-test table — keep the two in sync.
 pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     let timeline = match track.and_then(|t| t.duration) {
-        Some(d) => format!("{} / {}", fmt_mmss(shared.position()), fmt_mmss(d)),
-        None => format!("{} / --:--", fmt_mmss(shared.position())),
+        Some(d) => format!("{}/{}", fmt_mmss(shared.position()), fmt_mmss(d)),
+        None => format!("{}/--:--", fmt_mmss(shared.position())),
     };
     let title = match track {
         Some(t) => t.title.clone().unwrap_or_else(|| t.source.display_name().to_string()),
         None => "(none)".into(),
     };
     let v = shared.volume();
-    let cells = ((v * 10.0).round() as usize).min(10);
-    let bar = format!("{}{}", "|".repeat(cells), "-".repeat(10 - cells));
+    // Half-resolution bar: a 10-cell bar plus a label no longer fits 80 px.
+    let cells = ((v * 5.0).round() as usize).min(5);
+    let bar = format!("{}{}", "|".repeat(cells), "-".repeat(5 - cells));
 
-    let mut p = String::with_capacity(400);
-    p.push_str(&row(&format!("KYOUKO    {}", shared.phase())));
+    let mut p = String::with_capacity(200);
+    p.push_str(&row(&format!("KYOUKO {}", shared.phase())));
     p.push('\n');
-    p.push_str(&row(&format!("time : {timeline}")));
+    p.push_str(&row(&timeline));
     p.push('\n');
-    p.push_str(&row(&format!("track: {title}")));
+    p.push_str(&row(&title.chars().take(14).collect::<String>()));
     p.push('\n');
-    p.push_str(&row(&format!("vol  : {bar} {:>3}%", (v * 100.0).round() as u32)));
+    p.push_str(&row(&format!("vol {bar} {:>3}%", (v * 100.0).round() as u32)));
     p.push('\n');
     // Dual status row: eq state + repeat state side-by-side. The column
     // layout is fixed by ui/render.rs's STATUS_*_COLS hit-test table
-    // (`eq   : ON ` at columns 0..9, `repeat: OFF` at 15..25) — keep the
-    // format in sync. The compact spacing fits the 200 px window interior
-    // and the 28-char row cap.
+    // (`eq:ON ` at columns 0..6, `rep:OFF` at 7..14) — keep the format in
+    // sync. The eq state is padded to 3 cells so `rep:` starts at a fixed
+    // column regardless of ON/OFF width.
     p.push_str(&row(&format!(
-        "eq   : {:<3}     repeat: {}",
+        "eq:{:<3} rep:{}",
         if shared.eq_enabled() { "ON" } else { "OFF" },
         if shared.loop_enabled() { "ON" } else { "OFF" },
     )));
@@ -2202,13 +2208,13 @@ mod tests {
     fn panel_reflects_eq_and_volume_changes() {
         let shared = SharedState::new();
         let before = render_panel(&shared, None);
-        assert!(before.contains("eq   : ON"), "EQ defaults on: {before}");
+        assert!(before.contains("eq:ON"), "EQ defaults on: {before}");
         // Band gains no longer render as text — they live in the Braille
         // strip — but the ON/OFF row must follow the enable state.
         shared.set_eq_enabled(false);
         shared.set_volume(0.3);
         let after = render_panel(&shared, None);
-        assert!(after.contains("eq   : OFF"), "panel should show EQ OFF: {after}");
+        assert!(after.contains("eq:OFF"), "panel should show EQ OFF: {after}");
         assert!(after.contains(" 30%"), "panel should show 30%: {after}");
         assert!(!after.contains(" 80%"));
         // And the text must not carry numeric gain cells anymore.
@@ -2220,13 +2226,17 @@ mod tests {
         let shared = SharedState::new();
         let line = render_panel(&shared, None).lines().nth(4).unwrap().to_string();
         // Both chunks on the 5th row: eq first, repeat after it.
-        assert!(line.starts_with("eq   : ON"), "eq chunk first: {line}");
-        assert!(line.contains("repeat: OFF"), "repeat chunk after eq: {line}");
+        assert!(line.starts_with("eq:ON"), "eq chunk first: {line}");
+        assert!(line.contains("rep:OFF"), "repeat chunk after eq: {line}");
         // The repeat chunk sits at a fixed column regardless of the eq
         // state width (matches render.rs's STATUS_REPEAT_COLS hit table).
         shared.set_eq_enabled(false);
         let off = render_panel(&shared, None).lines().nth(4).unwrap().to_string();
-        assert_eq!(off.find("repeat:"), line.find("repeat:"), "repeat column drifts: {off}");
+        assert_eq!(off.find("rep:"), line.find("rep:"), "repeat column drifts: {off}");
+        // Every panel line stays within the 80 px text budget (14 cells).
+        for line in render_panel(&shared, None).lines() {
+            assert!(line.chars().count() <= 14, "panel line too wide: {line}");
+        }
     }
 
     #[test]
@@ -2234,12 +2244,12 @@ mod tests {
         let (mut broker, sink, _rx) = broker_with_sink();
         broker.handle_command(Command::ToggleLoop);
         let panel = broker.take_refresh().expect("loop toggle marks the view dirty");
-        assert!(panel.contains("repeat: ON"), "live repeat state: {panel}");
+        assert!(panel.contains("rep:ON"), "live repeat state: {panel}");
         assert!(sink.lock().unwrap().last().unwrap().loop_enabled);
         // Second toggle back and the panel follows again.
         broker.handle_command(Command::ToggleLoop);
         let panel = broker.take_refresh().expect("second toggle also refreshes");
-        assert!(panel.contains("repeat: OFF"), "live repeat state: {panel}");
+        assert!(panel.contains("rep:OFF"), "live repeat state: {panel}");
     }
 
     #[test]
@@ -2247,6 +2257,6 @@ mod tests {
         let (mut broker, _sink, _rx) = broker_with_sink();
         broker.handle_command(Command::ToggleEq);
         let panel = broker.take_refresh().expect("eq toggle marks the view dirty");
-        assert!(panel.contains("eq   : OFF"), "live eq state: {panel}");
+        assert!(panel.contains("eq:OFF"), "live eq state: {panel}");
     }
 }

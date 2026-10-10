@@ -19,11 +19,13 @@ use std::ptr::null_mut;
 use windows::core::{w, Error, HRESULT, Result};
 use windows::Win32::Foundation::{GetLastError, COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GetDC,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, FillRect,
+    GdiFlush, GetDC, GetStockObject,
     GetTextExtentPoint32W, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
     TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
     BLENDFUNCTION, BI_RGB, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, FF_MODERN,
-    FIXED_PITCH, HBITMAP, HDC, HFONT, OUT_TT_PRECIS, TEXTMETRICW, TRANSPARENT,
+    FIXED_PITCH, HBITMAP, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, TEXTMETRICW, TRANSPARENT,
+    WHITE_BRUSH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, UpdateLayeredWindow, ULW_ALPHA};
 
@@ -36,9 +38,11 @@ fn last_error() -> Error {
     unsafe { Error::from_hresult(HRESULT::from_win32(GetLastError().0)) }
 }
 
-const PAD: i32 = 6;
-/// The 200 px the spec asks for; panel height is derived from the font.
-pub const WINDOW_W: i32 = 200;
+const PAD: i32 = 3;
+/// The 80 px compact floating window; panel height is derived from the font.
+/// At the 9 px Consolas em this leaves room for ~14 text cells per line, so
+/// the panel formats in `render_panel` are tuned to that budget.
+pub const WINDOW_W: i32 = 80;
 /// Height of the playback control strip at the window's very bottom. The
 /// wndproc hit-tests against this exact value (bottom strip = HTCLIENT →
 /// button clicks; everywhere else = HTCAPTION → native drag), so draw and
@@ -53,19 +57,20 @@ const FONT_HEIGHT: i32 = -9;
 /// Which clickable status chunk sits under a point?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusToggle {
-    /// The `eq   : ON/OFF` chunk (toggles `Command::ToggleEq`).
+    /// The `eq:ON/OFF` chunk (toggles `Command::ToggleEq`).
     Eq,
-    /// The `repeat: ON/OFF` chunk (toggles `Command::ToggleLoop`).
+    /// The `rep:ON/OFF` chunk (toggles `Command::ToggleLoop`).
     Repeat,
 }
 
 /// Clickable columns (in Consolas advance units from the left pad) of the
-/// dual status line's two chunks: `eq   : ON ` spans columns 0..9 and
-/// `repeat: OFF` columns 15..25. `render_panel` in broker.rs formats the
-/// line with exactly this column table — drawing and hit-testing share it,
-/// so they can never drift apart.
-const STATUS_EQ_COLS: (i32, i32) = (0, 10);
-const STATUS_REPEAT_COLS: (i32, i32) = (15, 11);
+/// dual status line's two chunks: `eq:ON ` spans columns 0..6 and
+/// `rep:OFF` columns 7..14. `render_panel` in broker.rs formats the line
+/// with exactly this column table — drawing and hit-testing share it, so
+/// they can never drift apart. Both chunks sit at fixed columns regardless
+/// of ON/OFF width (the eq state is padded to 3 cells).
+const STATUS_EQ_COLS: (i32, i32) = (0, 6);
+const STATUS_REPEAT_COLS: (i32, i32) = (7, 7);
 
 /// Which status chunk (if any) does a CLIENT-coordinate point hit? The
 /// clickable band is the last panel line's full label+state chunks; the
@@ -118,27 +123,73 @@ fn braille_glyph(levels: i32) -> &'static str {
 
 /// Braille glyph for row `row` (0 = adjacent to the middle baseline, growing
 /// outward) of a band at `level` (-12..+12 dB) on the row's own side of the
-/// baseline. Direction comes from which side of the baseline the row sits
-/// on, so negative levels use the same glyphs on the rows below the baseline.
+/// baseline. Positive cells fill bottom-up; negative cells fill top-down,
+/// so individual dots also grow away from the baseline on both sides.
 fn braille_row_glyph(level: i32, row: i32) -> &'static str {
-    braille_glyph(level.abs() - 6 * row)
+    let levels = level.abs() - 6 * row;
+    if level < 0 {
+        match levels {
+            1 => "⠈",
+            2 => "⠉",
+            3 => "⠙",
+            4 => "⠛",
+            5 => "⠻",
+            6.. => "⠿",
+            _ => " ",
+        }
+    } else {
+        braille_glyph(levels)
+    }
 }
 
 /// Glyph for physical strip row `strip_row` (0 = top of the strip,
 /// `EQ_ROWS - 1` = bottom) of a band at `level`. Encodes the side
 /// exclusivity: positive levels light only the rows above the baseline,
 /// negative levels only the rows below, and level 0 leaves every row blank.
-/// Rows fill middle-out: `braille_row_glyph` maps the mirrored pair to the
-/// inner-row-first progression in both directions.
+/// These are physical GDI rows, ordered top-to-bottom; they are not the
+/// side-relative row indices accepted by `braille_row_glyph`.
 fn eq_strip_glyph(level: i32, strip_row: usize) -> &'static str {
-    let half = EQ_ROWS / 2;
-    if level > 0 && strip_row < half {
-        braille_row_glyph(level, (half - 1 - strip_row) as i32)
-    } else if level < 0 && strip_row >= half {
-        braille_row_glyph(level, (strip_row - half) as i32)
-    } else {
-        " "
+    match strip_row {
+        0 if level >= 7 => braille_row_glyph(level, 1), // outer positive: +7..+12
+        1 if level >= 1 => braille_row_glyph(level, 0), // inner positive: +1..+6
+        2 if level <= -1 => braille_row_glyph(level, 0), // inner negative: -1..-6
+        3 if level <= -7 => braille_row_glyph(level, 1), // outer negative: -7..-12
+        _ => " ",
     }
+}
+
+/// GDI cell origin and glyph for one physical row. Truncate toward zero so
+/// fractional gains cannot light the inner/outer rows before ±1/±7 dB.
+/// The DIB is top-down and the DC uses pixel coordinates, so increasing the
+/// physical row index always increases Y by exactly one text line.
+fn eq_strip_row(gain_db: f32, strip_row: usize, eq_top: i32, line_h: i32) -> (i32, &'static str) {
+    let level = gain_db.clamp(-EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB) as i32;
+    (eq_top + strip_row as i32 * line_h, eq_strip_glyph(level, strip_row))
+}
+
+/// Rasterize the six Unicode Braille bits as separate dots, rather than
+/// relying on font fallback at a 9px em (where adjacent dots merge). Bits
+/// 0..2 are the left column, top-to-bottom; bits 3..5 are the right column.
+/// A one-pixel gap separates 2px dots, with the grid centered in its cell.
+fn braille_dot_rect(glyph: &str, dot: usize, cell: RECT) -> Option<RECT> {
+    if dot >= 6 {
+        return None;
+    }
+    let mask = (glyph.chars().next()? as u32).checked_sub(0x2800)?;
+    if mask & (1 << dot) == 0 {
+        return None;
+    }
+    let width = cell.right - cell.left;
+    let height = cell.bottom - cell.top;
+    let dot_size = 2.min((width - 1) / 2).min((height - 2) / 3);
+    if dot_size < 1 {
+        return None;
+    }
+    let left = cell.left + (width - (2 * dot_size + 1)) / 2
+        + (dot / 3) as i32 * (dot_size + 1);
+    let top = cell.top + (height - (3 * dot_size + 2)) / 2
+        + (dot % 3) as i32 * (dot_size + 1);
+    Some(RECT { left, top, right: left + dot_size, bottom: top + dot_size })
 }
 
 /// Which of the 10 equalizer columns does a client x fall in? Pure mapping
@@ -289,6 +340,36 @@ impl Renderer {
         status_toggle_at(x, y, self.eq_top, self.line_h, self.char_w)
     }
 
+    /// Draw all four physical rows explicitly. Rasterize each glyph's exact
+    /// Braille mask inside its cell so all six levels stay visibly distinct.
+    fn draw_eq_strip(&self, eq: &[f32; EQ_BANDS]) {
+        unsafe {
+            let col_w = self.width / EQ_BANDS as i32;
+            let brush = HBRUSH(GetStockObject(WHITE_BRUSH).0);
+            // Top-to-bottom: outer positive, inner positive, inner negative,
+            // outer negative. The invisible baseline is between rows 1 and 2.
+            for strip_row in 0..EQ_ROWS {
+                for (band, gain_db) in eq.iter().enumerate() {
+                    let (y, glyph) = eq_strip_row(*gain_db, strip_row, self.eq_top, self.line_h);
+                    if glyph == " " {
+                        continue;
+                    }
+                    let cell = RECT {
+                        left: band as i32 * col_w,
+                        top: y,
+                        right: (band as i32 + 1) * col_w,
+                        bottom: y + self.line_h,
+                    };
+                    for dot in 0..6 {
+                        if let Some(rect) = braille_dot_rect(glyph, dot, cell) {
+                            let _ = FillRect(self.mem_dc, &rect, brush);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Paint `panel` with `phase`'s accent color and the 10-band gains as
     /// the Braille equalizer. Safe to call any number of times; each call is
     /// a full repaint of the layered surface.
@@ -305,28 +386,10 @@ impl Renderer {
 
             // Braille equalizer: 10 columns across the full width, filling
             // middle-out from the invisible baseline between the two inner
-            // rows. One glyph per cell, centered in its tenth-column. Side
-            // exclusivity and fill direction live in `eq_strip_glyph`.
+            // rows. Side exclusivity, the glyph, and its physical Y come
+            // from the same pure mapping exercised by the row tests.
             self.eq_top = PAD + panel.lines().count() as i32 * self.line_h;
-            let col_w = self.width / EQ_BANDS as i32;
-            for (band, gain) in eq.iter().enumerate() {
-                let level = gain.round().clamp(-EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB) as i32;
-                for strip_row in 0..EQ_ROWS {
-                    let glyph = eq_strip_glyph(level, strip_row);
-                    if glyph == " " {
-                        continue;
-                    }
-                    let wide: Vec<u16> = glyph.encode_utf16().collect();
-                    let mut extent = SIZE::default();
-                    let _ = GetTextExtentPoint32W(self.mem_dc, &wide, &mut extent);
-                    let _ = TextOutW(
-                        self.mem_dc,
-                        band as i32 * col_w + (col_w - extent.cx) / 2,
-                        self.eq_top + strip_row as i32 * self.line_h,
-                        &wide,
-                    );
-                }
-            }
+            self.draw_eq_strip(eq);
 
             // Playback control strip: one glyph centered in each of the four
             // equal columns (the wndproc maps clicks back through the same
@@ -345,6 +408,14 @@ impl Renderer {
                     text_y,
                     &wide,
                 );
+            }
+
+            // Complete batched GDI writes before touching the DIB through its
+            // raw pointer; otherwise text can race the alpha pass or clearing
+            // the next frame, leaving stale/duplicated pixels.
+            if !GdiFlush().as_bool() {
+                log_error!("RENDER", "GDI drawing batch failed");
+                return;
             }
 
             // luminance → alpha; premultiplied accent color. Pixels where GDI
@@ -442,6 +513,188 @@ mod tests {
     }
 
     #[test]
+    fn eq_physical_rows_have_their_own_glyph_and_gdi_y() {
+        // Physical GDI order: outer +, inner +, inner -, outer -.
+        // Fixed coordinates represent five 11px panel lines plus 3px padding.
+        for (gain_db, glyphs) in [
+            (-12.0, [" ", " ", "⠿", "⠿"]),
+            (-11.0, [" ", " ", "⠿", "⠻"]),
+            (-10.0, [" ", " ", "⠿", "⠛"]),
+            (-9.0, [" ", " ", "⠿", "⠙"]),
+            (-8.0, [" ", " ", "⠿", "⠉"]),
+            (-7.0, [" ", " ", "⠿", "⠈"]),
+            (-6.0, [" ", " ", "⠿", " "]),
+            (-5.0, [" ", " ", "⠻", " "]),
+            (-4.0, [" ", " ", "⠛", " "]),
+            (-3.0, [" ", " ", "⠙", " "]),
+            (-2.0, [" ", " ", "⠉", " "]),
+            (-1.0, [" ", " ", "⠈", " "]),
+            (0.0, [" ", " ", " ", " "]),
+            (1.0, [" ", "⠠", " ", " "]),
+            (5.0, [" ", "⠾", " ", " "]),
+            (6.0, [" ", "⠿", " ", " "]),
+            (7.0, ["⠠", "⠿", " ", " "]),
+            (12.0, ["⠿", "⠿", " ", " "]),
+        ] {
+            assert_eq!(eq_strip_row(gain_db, 0, 58, 11), (58, glyphs[0]), "gain {gain_db}, physical row 0");
+            assert_eq!(eq_strip_row(gain_db, 1, 58, 11), (69, glyphs[1]), "gain {gain_db}, physical row 1");
+            assert_eq!(eq_strip_row(gain_db, 2, 58, 11), (80, glyphs[2]), "gain {gain_db}, physical row 2");
+            assert_eq!(eq_strip_row(gain_db, 3, 58, 11), (91, glyphs[3]), "gain {gain_db}, physical row 3");
+        }
+    }
+
+    #[test]
+    fn eq_fractional_gains_do_not_cross_row_thresholds_early() {
+        for (gain_db, expected) in [
+            (-6.99, [" ", " ", "⠿", " "]),
+            (-0.99, [" ", " ", " ", " "]),
+            (-0.0, [" ", " ", " ", " "]),
+            (0.99, [" ", " ", " ", " "]),
+            (6.99, [" ", "⠿", " ", " "]),
+        ] {
+            let glyphs = [0, 1, 2, 3].map(|row| eq_strip_row(gain_db, row, 58, 11).1);
+            assert_eq!(glyphs, expected, "gain {gain_db}");
+        }
+    }
+
+    #[test]
+    fn gdi_eq_pixels_stay_in_their_physical_cells_after_gain_changes() {
+        // Render into a real top-down GDI DIB without creating a window or
+        // injecting input. Exercise the same strip drawing as the live UI.
+        let renderer = Renderer::new("KYOUKO STOPPED\n00:00/--:--\n(none)\nvol ||||-  80%\neq:ON  rep:OFF").unwrap();
+        let len = (renderer.width * renderer.height) as usize * 4;
+        let band = 3;
+        let col_w = renderer.width / EQ_BANDS as i32;
+        for (gain_db, expected_lit_rows) in [
+            (5.0, [false, true, false, false]),
+            (-5.0, [false, false, true, false]),
+            (12.0, [true, true, false, false]),
+            (-12.0, [false, false, true, true]),
+            (0.0, [false, false, false, false]),
+        ] {
+            let mut gains = [0.0; EQ_BANDS];
+            gains[band] = gain_db;
+            unsafe {
+                std::ptr::write_bytes(renderer.bits, 0, len);
+                SetTextColor(renderer.mem_dc, COLORREF(0x00FF_FFFF));
+                renderer.draw_eq_strip(&gains);
+                assert!(GdiFlush().as_bool());
+                let pixels = std::slice::from_raw_parts(renderer.bits, len);
+                let mut lit_rows = [false; EQ_ROWS];
+                for (pixel_index, pixel) in pixels.chunks_exact(4).enumerate() {
+                    if pixel[..3].iter().all(|channel| *channel == 0) {
+                        continue;
+                    }
+                    let x = pixel_index as i32 % renderer.width;
+                    let y = pixel_index as i32 / renderer.width;
+                    assert!(x >= band as i32 * col_w && x < (band as i32 + 1) * col_w,
+                        "gain {gain_db} spilled into another band at ({x}, {y})");
+                    assert!(y >= renderer.eq_top && y < renderer.eq_top + EQ_ROWS as i32 * renderer.line_h,
+                        "gain {gain_db} spilled outside the strip at ({x}, {y})");
+                    let physical_row = ((y - renderer.eq_top) / renderer.line_h) as usize;
+                    lit_rows[physical_row] = true;
+                }
+                assert_eq!(lit_rows, expected_lit_rows, "GDI pixels at gain {gain_db}");
+            }
+        }
+    }
+
+    #[test]
+    fn gdi_braille_levels_have_separate_visible_dots() {
+        let renderer = Renderer::new("one\ntwo\nthree\nfour\nfive").unwrap();
+        let len = (renderer.width * renderer.height) as usize * 4;
+        let col_w = renderer.width / EQ_BANDS as i32;
+        let mut masks = Vec::new();
+        for level in 1..=6 {
+            let mut gains = [0.0; EQ_BANDS];
+            gains[3] = level as f32;
+            unsafe {
+                std::ptr::write_bytes(renderer.bits, 0, len);
+                SetTextColor(renderer.mem_dc, COLORREF(0x00FF_FFFF));
+                renderer.draw_eq_strip(&gains);
+                assert!(GdiFlush().as_bool());
+                let pixels = std::slice::from_raw_parts(renderer.bits, len);
+                let mut mask = Vec::new();
+                for y in renderer.eq_top + renderer.line_h..renderer.eq_top + 2 * renderer.line_h {
+                    for x in 3 * col_w..4 * col_w {
+                        let offset = ((y * renderer.width + x) * 4) as usize;
+                        let lit = pixels[offset..offset + 3].iter().any(|v| *v != 0);
+                        mask.push(lit);
+                    }
+                }
+                // A level must contain that many separate dot components;
+                // distinguishable masks alone still accept merged strokes.
+                let mut unseen = mask.clone();
+                let mut dots = 0;
+                for start in 0..unseen.len() {
+                    if !unseen[start] { continue; }
+                    dots += 1;
+                    let mut pending = vec![start];
+                    unseen[start] = false;
+                    while let Some(pixel) = pending.pop() {
+                        let x = pixel as i32 % col_w;
+                        let y = pixel as i32 / col_w;
+                        for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                            if nx < 0 || nx >= col_w || ny < 0 || ny >= renderer.line_h { continue; }
+                            let next = (ny * col_w + nx) as usize;
+                            if unseen[next] {
+                                unseen[next] = false;
+                                pending.push(next);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(dots, level, "GDI merged the Braille dots at level {level}");
+                masks.push(mask);
+            }
+        }
+        for level in 1..6 {
+            assert_ne!(masks[level - 1], masks[level], "GDI renders levels {level} and {} identically", level + 1);
+        }
+    }
+
+    #[test]
+    fn gdi_negative_dots_grow_downward_and_keep_the_inner_row_full() {
+        let renderer = Renderer::new("one\ntwo\nthree\nfour\nfive").unwrap();
+        let len = (renderer.width * renderer.height) as usize * 4;
+        let col_w = renderer.width / EQ_BANDS as i32;
+        assert_eq!(col_w, 8);
+        assert!(renderer.line_h >= 8);
+        // Independent pixel positions for the requested top-down progression:
+        // top right, top left, middle right, middle left, bottom right, bottom left.
+        let dot_order = [(3, 0), (0, 0), (3, 3), (0, 3), (3, 6), (0, 6)];
+        for magnitude in 1usize..=12 {
+            let mut gains = [0.0; EQ_BANDS];
+            gains[3] = -(magnitude as f32);
+            unsafe {
+                std::ptr::write_bytes(renderer.bits, 0, len);
+                renderer.draw_eq_strip(&gains);
+                assert!(GdiFlush().as_bool());
+                let pixels = std::slice::from_raw_parts(renderer.bits, len);
+                let actual: Vec<_> = pixels.chunks_exact(4).enumerate()
+                    .filter(|(_, pixel)| pixel[..3].iter().any(|channel| *channel != 0))
+                    .map(|(index, _)| (index as i32 % renderer.width, index as i32 / renderer.width))
+                    .collect();
+                let mut expected = Vec::new();
+                for (physical_row, steps) in [(2, magnitude.min(6)), (3, magnitude.saturating_sub(6))] {
+                    let origin_x = 3 * col_w + (col_w - 5) / 2;
+                    let origin_y = renderer.eq_top + physical_row * renderer.line_h
+                        + (renderer.line_h - 8) / 2;
+                    for &(dot_x, dot_y) in dot_order.iter().take(steps) {
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                expected.push((origin_x + dot_x + dx, origin_y + dot_y + dy));
+                            }
+                        }
+                    }
+                }
+                expected.sort_by_key(|&(x, y)| y * renderer.width + x);
+                assert_eq!(actual, expected, "physical dot pixels at -{magnitude} dB");
+            }
+        }
+    }
+
+    #[test]
     fn eq_strip_sides_are_mutually_exclusive() {
         // Positive gains light only the rows above the baseline.
         for strip_row in 2..EQ_ROWS {
@@ -474,12 +727,12 @@ mod tests {
     #[test]
     fn eq_strip_negative_fills_inner_row_first() {
         // Inner lower row (strip row 2) runs the 6-dot progression for -1..-6.
-        for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
+        for (lvl, glyph) in ["⠈", "⠉", "⠙", "⠛", "⠻", "⠿"].iter().enumerate() {
             assert_eq!(eq_strip_glyph(-(lvl as i32) - 1, 2), *glyph, "level -{}", lvl + 1);
             assert_eq!(eq_strip_glyph(-(lvl as i32) - 1, 3), " ", "outer row must stay blank at -{}", lvl + 1);
         }
         // -7..-12: inner row saturates, outer (bottom-most) row fills next.
-        for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
+        for (lvl, glyph) in ["⠈", "⠉", "⠙", "⠛", "⠻", "⠿"].iter().enumerate() {
             assert_eq!(eq_strip_glyph(-(lvl as i32) - 7, 2), "⠿", "inner saturated at -{}", lvl + 7);
             assert_eq!(eq_strip_glyph(-(lvl as i32) - 7, 3), *glyph, "outer row at -{}", lvl + 7);
         }
@@ -495,10 +748,10 @@ mod tests {
         assert_eq!(braille_row_glyph(7, 0), "⠿");
         assert_eq!(braille_row_glyph(7, 1), "⠠");
         assert_eq!(braille_row_glyph(12, 1), "⠿");
-        // Negatives mirror on the rows below the baseline.
-        assert_eq!(braille_row_glyph(-3, 0), "⠴");
-        assert_eq!(braille_row_glyph(-8, 1), "⠤");
-        assert_eq!(braille_row_glyph(-9, 1), "⠴");
+        // Negative dots fill top-down in each row below the baseline.
+        assert_eq!(braille_row_glyph(-3, 0), "⠙");
+        assert_eq!(braille_row_glyph(-8, 1), "⠉");
+        assert_eq!(braille_row_glyph(-9, 1), "⠙");
         // Neutral: everything blank.
         for row in 0..2 {
             assert_eq!(braille_row_glyph(0, row), " ");
@@ -508,22 +761,22 @@ mod tests {
     #[test]
     fn status_toggle_hit_regions() {
         // Renderer-shaped geometry: 5 panel lines of 11 px, char_w 5 →
-        // eq_top = 61; the status row spans y ∈ [50, 61).
+        // eq_top = 58; the status row spans y ∈ [47, 58).
         let (eq_top, line_h, char_w) = (PAD + 5 * 11, 11, 5);
         let col_x = |col: i32| PAD + col * char_w;
         let mid = eq_top - line_h / 2;
-        // eq chunk (columns 0..10) hits Eq anywhere in its band.
-        for col in [0, 5, 9] {
+        // eq chunk (columns 0..6) hits Eq anywhere in its band.
+        for col in [0, 3, 5] {
             assert_eq!(
                 status_toggle_at(col_x(col), mid, eq_top, line_h, char_w),
                 Some(StatusToggle::Eq),
                 "eq chunk col {col}"
             );
         }
-        // The gap between the chunks (columns 10..15) stays caption (drag).
-        assert_eq!(status_toggle_at(col_x(12), mid, eq_top, line_h, char_w), None);
-        // repeat chunk (columns 15..26) hits Repeat.
-        for col in [15, 20, 25] {
+        // The gap between the chunks (column 6) stays caption (drag).
+        assert_eq!(status_toggle_at(col_x(6), mid, eq_top, line_h, char_w), None);
+        // repeat chunk (columns 7..14) hits Repeat.
+        for col in [7, 10, 13] {
             assert_eq!(
                 status_toggle_at(col_x(col), mid, eq_top, line_h, char_w),
                 Some(StatusToggle::Repeat),
@@ -531,7 +784,9 @@ mod tests {
             );
         }
         // Beyond the repeat chunk: caption again.
-        assert_eq!(status_toggle_at(col_x(26), mid, eq_top, line_h, char_w), None);
+        assert_eq!(status_toggle_at(col_x(14), mid, eq_top, line_h, char_w), None);
+        // The whole hit band fits inside the 80 px window.
+        assert!(col_x(14) <= WINDOW_W, "repeat chunk right edge {} clips", col_x(14));
         // Vertically outside the status row (panel above, EQ strip below):
         // no status hit.
         assert_eq!(status_toggle_at(col_x(0), eq_top - line_h - 1, eq_top, line_h, char_w), None);
@@ -540,14 +795,15 @@ mod tests {
 
     #[test]
     fn eq_columns_map_by_exact_tenths() {
-        assert_eq!(eq_band_index(0, 200), 0);
-        assert_eq!(eq_band_index(19, 200), 0);
-        assert_eq!(eq_band_index(20, 200), 1);
-        assert_eq!(eq_band_index(99, 200), 4);
-        assert_eq!(eq_band_index(100, 200), 5);
-        assert_eq!(eq_band_index(199, 200), 9);
+        // 80 px / 10 bands = 8 px per column.
+        assert_eq!(eq_band_index(0, 80), 0);
+        assert_eq!(eq_band_index(7, 80), 0);
+        assert_eq!(eq_band_index(8, 80), 1);
+        assert_eq!(eq_band_index(39, 80), 4);
+        assert_eq!(eq_band_index(40, 80), 5);
+        assert_eq!(eq_band_index(79, 80), 9);
         // Out-of-range client x clamps into the edge columns.
-        assert_eq!(eq_band_index(-50, 200), 0);
-        assert_eq!(eq_band_index(500, 200), 9);
+        assert_eq!(eq_band_index(-50, 80), 0);
+        assert_eq!(eq_band_index(500, 80), 9);
     }
 }

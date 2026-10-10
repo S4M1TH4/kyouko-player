@@ -3,7 +3,7 @@
 //! Step 2 shape — the Win32 pump:
 //!
 //! ```text
-//! create 200px layered window + procedural tray icon
+//! create 80px layered window + procedural tray icon
 //! loop { GetMessageW }                        // parks in the kernel, zero CPU
 //!   WM_APP_BROKER  → drain cmd_rx (try_recv)  → broker.handle_command → sync()
 //!   WM_APP_STATUS  → drain status_rx          → broker.handle_status  → sync()
