@@ -22,7 +22,11 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, POINTL, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect,
     MonitorFromWindow, ValidateRect, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, UnregisterHotKey,
+    HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_ESCAPE,
+    VK_OEM_2, VK_OEM_COMMA, VK_OEM_PERIOD,
+};
 use windows::Win32::System::Com::{
     DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
 };
@@ -47,8 +51,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
     CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MF_STRING, MSG,
     SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU,
-    WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE,
+    WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
     WM_NULL, WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WM_MBUTTONUP, WA_INACTIVE,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -72,6 +76,71 @@ const MENU_QUIT: usize = 2;
 const WM_TRACKLIST_CLOSED: u32 = 0x8004;
 const WM_TRACKLIST_FINISH_CLICK: u32 = 0x8005;
 const DRAWER_ALPHA: u8 = 245;
+
+const HOTKEY_SEEK_BACK: i32 = 0x100;
+const HOTKEY_SEEK_FORWARD: i32 = 0x101;
+const HOTKEY_PREV_TRACK: i32 = 0x102;
+const HOTKEY_NEXT_TRACK: i32 = 0x103;
+const HOTKEY_TOGGLE_PAUSE: i32 = 0x104;
+
+struct HotkeyBinding {
+    id: i32,
+    modifiers: HOT_KEY_MODIFIERS,
+    key: VIRTUAL_KEY,
+    label: &'static str,
+}
+
+const HOTKEY_BINDINGS: [HotkeyBinding; 5] = [
+    HotkeyBinding { id: HOTKEY_SEEK_BACK, modifiers: MOD_ALT, key: VK_OEM_COMMA, label: "Alt+," },
+    HotkeyBinding { id: HOTKEY_SEEK_FORWARD, modifiers: MOD_ALT, key: VK_OEM_PERIOD, label: "Alt+." },
+    HotkeyBinding { id: HOTKEY_PREV_TRACK, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_COMMA, label: "Alt+Shift+," },
+    HotkeyBinding { id: HOTKEY_NEXT_TRACK, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_PERIOD, label: "Alt+Shift+." },
+    HotkeyBinding { id: HOTKEY_TOGGLE_PAUSE, modifiers: MOD_ALT, key: VK_OEM_2, label: "Alt+/" },
+];
+
+fn hotkey_command(id: usize) -> Option<Command> {
+    match i32::try_from(id).ok()? {
+        HOTKEY_SEEK_BACK => Some(Command::SeekRelative(-5.0)),
+        HOTKEY_SEEK_FORWARD => Some(Command::SeekRelative(5.0)),
+        HOTKEY_PREV_TRACK => Some(Command::PrevTrack),
+        HOTKEY_NEXT_TRACK => Some(Command::NextTrack),
+        HOTKEY_TOGGLE_PAUSE => Some(Command::TogglePause),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct GlobalHotkeys {
+    hwnd: HWND,
+    registered: [bool; 5],
+}
+
+impl GlobalHotkeys {
+    fn register(&mut self, hwnd: HWND) {
+        self.unregister();
+        self.hwnd = hwnd;
+        for (slot, binding) in self.registered.iter_mut().zip(&HOTKEY_BINDINGS) {
+            match unsafe { RegisterHotKey(Some(hwnd), binding.id, binding.modifiers | MOD_NOREPEAT, binding.key.0 as u32) } {
+                Ok(()) => *slot = true,
+                Err(error) => log_warn!("UI", "cannot register hotkey {}: {error}", binding.label),
+            }
+        }
+    }
+
+    fn unregister(&mut self) {
+        for (slot, binding) in self.registered.iter_mut().zip(&HOTKEY_BINDINGS) {
+            if std::mem::take(slot) {
+                if let Err(error) = unsafe { UnregisterHotKey(Some(self.hwnd), binding.id) } {
+                    log_warn!("UI", "cannot unregister hotkey {}: {error}", binding.label);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for GlobalHotkeys {
+    fn drop(&mut self) { self.unregister(); }
+}
 
 #[derive(Default)]
 struct DrawerClickState {
@@ -149,6 +218,7 @@ struct UiState {
     last_phase: Phase,
     hidden: bool,
     taskbar_created: u32,
+    hotkeys: GlobalHotkeys,
     drawer: Option<DrawerHandle>,
     next_drawer_token: usize,
 }
@@ -252,6 +322,7 @@ pub fn run(
         last_phase: Phase::Stopped,
         hidden: false,
         taskbar_created,
+        hotkeys: GlobalHotkeys::default(),
             drawer: None,
             next_drawer_token: 0,
     }));
@@ -988,6 +1059,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         let s = &mut *state;
         match msg {
+            WM_CREATE => {
+                s.hotkeys.register(hwnd);
+                LRESULT(0)
+            }
+            WM_HOTKEY => {
+                if let Some(command) = hotkey_command(wp.0) { post_command(command); }
+                LRESULT(0)
+            }
             WM_TRACKLIST_CLOSED => {
                 if s.drawer.is_some_and(|drawer| drawer.token == wp.0) { s.drawer = None; }
                 LRESULT(0)
@@ -1141,6 +1220,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_DESTROY => {
+                s.hotkeys.unregister();
                 // Release the window's reference to the drop target before
                 // the OLE apartment goes away (OleUninitialize runs after
                 // the pump).
@@ -1167,6 +1247,74 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_hotkey_ids_route_to_the_requested_commands() {
+        assert!(matches!(hotkey_command(HOTKEY_SEEK_BACK as usize), Some(Command::SeekRelative(-5.0))));
+        assert!(matches!(hotkey_command(HOTKEY_SEEK_FORWARD as usize), Some(Command::SeekRelative(5.0))));
+        assert!(matches!(hotkey_command(HOTKEY_PREV_TRACK as usize), Some(Command::PrevTrack)));
+        assert!(matches!(hotkey_command(HOTKEY_NEXT_TRACK as usize), Some(Command::NextTrack)));
+        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_PAUSE as usize), Some(Command::TogglePause)));
+        for unknown in [0, 1, 0x105, usize::MAX, (i32::MAX as usize) + 1] {
+            assert!(hotkey_command(unknown).is_none());
+        }
+    }
+
+    #[test]
+    fn global_hotkey_bindings_use_unique_ids_and_exact_oem_keys() {
+        let expected = [(MOD_ALT.0, 0xBC), (MOD_ALT.0, 0xBE),
+            (MOD_ALT.0 | MOD_SHIFT.0, 0xBC), (MOD_ALT.0 | MOD_SHIFT.0, 0xBE), (MOD_ALT.0, 0xBF)];
+        let mut ids = std::collections::HashSet::new();
+        for (binding, (modifiers, key)) in HOTKEY_BINDINGS.iter().zip(expected) {
+            assert!(ids.insert(binding.id));
+            assert!((0..=0xBFFF).contains(&binding.id));
+            assert_eq!(binding.modifiers.0, modifiers);
+            assert_eq!(binding.key.0, key);
+            assert!(hotkey_command(binding.id as usize).is_some());
+        }
+    }
+
+    #[test]
+    fn hidden_window_registers_hotkeys_on_create_and_releases_them_on_destroy() {
+        use crate::broker::DecoderLink;
+        use windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE;
+        let shared = SharedState::new();
+        let (decoder_tx, _decoder_rx) = crossbeam_channel::bounded(8);
+        let (_command_tx, cmd_rx) = crossbeam_channel::bounded(32);
+        let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
+        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, Arc::new(|| {})));
+        let renderer = Renderer::new(broker.view()).unwrap();
+        let mut state = Box::new(UiState {
+            hwnd: HWND::default(), broker, cmd_rx, status_rx, shared, renderer,
+            tray: Tray::new(), audio_out: AudioOut::new(None), timer_on: false,
+            last_phase: Phase::Stopped, hidden: true, taskbar_created: 0,
+            hotkeys: GlobalHotkeys::default(), drawer: None, next_drawer_token: 0,
+        });
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: instance.into(),
+                lpszClassName: w!("kyouko_hotkey_test"), ..Default::default() };
+            assert_ne!(RegisterClassW(&class), 0);
+            let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("kyouko_hotkey_test"), w!(""),
+                WS_POPUP, 0, 0, 20, 20, None, None, Some(instance.into()),
+                Some(&mut *state as *mut UiState as *const c_void)).unwrap();
+            state.hwnd = hwnd;
+            assert!(!windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool());
+            let registered = state.hotkeys.registered;
+            println!("native hotkeys registered: {}/5", registered.iter().filter(|&&active| active).count());
+            DestroyWindow(hwnd).unwrap();
+            assert!(!IsWindow(Some(hwnd)).as_bool());
+            assert_eq!(state.hotkeys.registered, [false; 5]);
+            // Reacquire each available binding to prove WM_DESTROY freed it.
+            // Existing third-party shortcuts are logged and left untouched.
+            for (binding, active) in HOTKEY_BINDINGS.iter().zip(registered) {
+                if active {
+                    RegisterHotKey(None, binding.id, binding.modifiers | MOD_NOREPEAT, binding.key.0 as u32).unwrap();
+                    UnregisterHotKey(None, binding.id).unwrap();
+                }
+            }
+        }
+    }
 
     #[test]
     fn drawer_hit_test_owns_the_entire_surface_on_negative_monitors() {

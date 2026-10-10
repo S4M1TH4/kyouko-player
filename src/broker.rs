@@ -1241,8 +1241,12 @@ impl Broker {
                 self.begin_load(source, paused);
             }
             Command::SeekRelative(delta) => {
-                log_info!("BROKER", "seek {delta:+.1}s");
-                self.send_decoder(DecoderCmd::SeekRelative(delta));
+                if let Some(track) = &self.track {
+                    if let Some(delta) = bounded_seek_delta(self.shared.position(), track.duration, delta) {
+                        log_info!("BROKER", "seek {delta:+.1}s");
+                        self.send_decoder(DecoderCmd::SeekRelative(delta));
+                    }
+                }
             }
             Command::NextTrack => self.navigate(1),
             Command::PrevTrack => self.navigate(-1),
@@ -1579,6 +1583,17 @@ impl Broker {
 
 // ── Panel: the exact text the 200 px window will draw (ASCII only) ──────────
 
+/// Bound the requested target before sending a relative seek to the
+/// decoder. Unknown-duration streams still have a zero lower bound.
+fn bounded_seek_delta(position: Duration, duration: Option<Duration>, delta: f64) -> Option<f64> {
+    if !delta.is_finite() { return None; }
+    let position = position.as_secs_f64();
+    let end = duration.unwrap_or(Duration::MAX).as_secs_f64();
+    let target = (position + delta).clamp(0.0, end);
+    let bounded = target - position;
+    (bounded != 0.0).then_some(bounded)
+}
+
 fn fmt_mmss(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}", s / 60, s % 60)
@@ -1675,6 +1690,60 @@ mod tests {
             title: None,
             duration: None,
         });
+    }
+
+    #[test]
+    fn relative_seek_math_clamps_both_ends_and_unknown_duration() {
+        let secs = Duration::from_secs;
+        assert_eq!(bounded_seek_delta(secs(3), Some(secs(10)), -5.0), Some(-3.0));
+        assert_eq!(bounded_seek_delta(secs(8), Some(secs(10)), 5.0), Some(2.0));
+        assert_eq!(bounded_seek_delta(secs(5), Some(secs(10)), -5.0), Some(-5.0));
+        assert_eq!(bounded_seek_delta(secs(5), Some(secs(10)), 5.0), Some(5.0));
+        assert_eq!(bounded_seek_delta(secs(0), Some(secs(10)), -5.0), None);
+        assert_eq!(bounded_seek_delta(secs(10), Some(secs(10)), 5.0), None);
+        assert_eq!(bounded_seek_delta(secs(12), Some(secs(10)), 5.0), Some(-2.0));
+        assert_eq!(bounded_seek_delta(secs(3), None, -5.0), Some(-3.0));
+        assert_eq!(bounded_seek_delta(secs(8), None, 5.0), Some(5.0));
+        assert_eq!(bounded_seek_delta(secs(0), Some(secs(0)), 5.0), None);
+        for delta in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0] {
+            assert_eq!(bounded_seek_delta(secs(3), Some(secs(10)), delta), None);
+        }
+        assert!(bounded_seek_delta(secs(3), None, f64::MAX).unwrap().is_finite());
+    }
+
+    #[test]
+    fn seek_commands_forward_bounded_deltas_in_playing_and_paused_states() {
+        let (mut broker, sink, rx) = broker_with_sink();
+        open_youtube(&mut broker);
+        broker.shared.set_sample_rate(1000);
+        broker.track.as_mut().unwrap().duration = Some(Duration::from_secs(10));
+        let saves = sink.lock().unwrap().len();
+        for phase in [Phase::Playing, Phase::Paused] {
+            broker.shared.set_phase(phase);
+            for (position, requested, expected) in [(3, -5.0, -3.0), (8, 5.0, 2.0), (5, -5.0, -5.0), (5, 5.0, 5.0)] {
+                broker.shared.set_playhead_frames(position * 1000);
+                broker.handle_command(Command::SeekRelative(requested));
+                assert!(matches!(rx.try_recv(), Ok(DecoderCmd::SeekRelative(delta)) if delta == expected));
+                assert_eq!(broker.shared.phase(), phase);
+                assert_eq!(broker.shared.position(), Duration::from_secs(position));
+            }
+        }
+        assert_eq!(sink.lock().unwrap().len(), saves, "seeks do not write persistent state");
+    }
+
+    #[test]
+    fn invalid_or_unavailable_seeks_do_not_wake_the_decoder() {
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.handle_command(Command::SeekRelative(5.0));
+        assert!(rx.try_recv().is_err());
+        open_youtube(&mut broker);
+        broker.shared.set_sample_rate(1000);
+        broker.track.as_mut().unwrap().duration = Some(Duration::from_secs(10));
+        for (position, delta) in [(0, -5.0), (10, 5.0), (3, 0.0), (3, f64::NAN), (3, f64::INFINITY), (3, f64::NEG_INFINITY)] {
+            broker.shared.set_playhead_frames(position * 1000);
+            broker.handle_command(Command::SeekRelative(delta));
+            assert!(rx.try_recv().is_err());
+        }
     }
 
     fn fail(broker: &mut Broker, source: &Source) {
