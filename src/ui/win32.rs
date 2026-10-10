@@ -19,7 +19,7 @@ use std::sync::Arc;
 use crossbeam_channel::{Receiver, TryRecvError};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, POINTL, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, POINTL, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect,
     MonitorFromWindow, ValidateRect, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE};
@@ -44,13 +44,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, IsWindow, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
     PostMessageW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
-    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_ARROW, MF_STRING, MSG,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
+    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MF_STRING, MSG,
     SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU,
     WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
-    WM_NULL, WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WA_INACTIVE,
+    WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
+    WM_NULL, WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WM_MBUTTONUP, WA_INACTIVE,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{implement, Ref};
@@ -70,6 +70,39 @@ const TIMER_MS: u32 = 1000;
 const MENU_TOGGLE_WINDOW: usize = 1;
 const MENU_QUIT: usize = 2;
 const WM_TRACKLIST_CLOSED: u32 = 0x8004;
+const WM_TRACKLIST_FINISH_CLICK: u32 = 0x8005;
+const DRAWER_ALPHA: u8 = 245;
+
+#[derive(Default)]
+struct DrawerClickState {
+    pending: Option<(u32, TrackListClick)>,
+    close_queued: bool,
+}
+
+impl DrawerClickState {
+    fn press(&mut self, action: TrackListClick, release_message: u32) -> bool {
+        if self.busy() || action == TrackListClick::None { return false; }
+        self.pending = Some((release_message, action));
+        true
+    }
+
+    fn release(&mut self, message: u32) -> TrackListClick {
+        if self.pending.as_ref().map(|(release, _)| *release) != Some(message) {
+            return TrackListClick::None;
+        }
+        self.close_queued = true;
+        self.pending.take().unwrap().1
+    }
+
+    fn busy(&self) -> bool { self.pending.is_some() || self.close_queued }
+}
+
+fn drawer_hit_test(bounds: RECT, point: POINT) -> LRESULT {
+    LRESULT(if point.x >= bounds.left && point.x < bounds.right
+        && point.y >= bounds.top && point.y < bounds.bottom {
+        HTCLIENT as isize
+    } else { HTNOWHERE as isize })
+}
 
 #[derive(Clone, Copy)]
 struct DrawerHandle {
@@ -82,6 +115,7 @@ struct DrawerState {
     token: usize,
     owned: bool,
     closing: bool,
+    click: DrawerClickState,
     view: TrackList,
     layout: TrackListLayout,
     first: usize,
@@ -354,16 +388,20 @@ fn create_drawer(owner: HWND, token: usize, view: TrackList, layout: TrackListLa
     #[cfg(test)]
     DRAWER_STATES.fetch_add(1, Ordering::Relaxed);
     let mut drawer = Box::new(DrawerState {
-        owner, token, owned: false, closing: false, view, layout, first, wheel: 0, renderer,
+        owner, token, owned: false, closing: false, click: DrawerClickState::default(), view, layout, first, wheel: 0, renderer,
     });
     let hwnd = unsafe {
-        CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("kyouko_tracklist"), w!("Tracks"),
+        CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("kyouko_tracklist"), w!("Tracks"),
             WS_POPUP, position.0, position.1, layout.width, layout.height(),
             (!owner.is_invalid()).then_some(owner), None,
             Some(GetModuleHandleW(None)?.into()), Some(&mut *drawer as *mut DrawerState as *const c_void))?
     };
     drawer.owned = true;
     let _ = Box::into_raw(drawer);
+    if let Err(error) = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), DRAWER_ALPHA, LWA_ALPHA) } {
+        close_drawer(hwnd);
+        return Err(error);
+    }
     Ok(hwnd)
 }
 
@@ -419,7 +457,7 @@ fn refresh_tracklist(s: &UiState) {
     let Some(drawer) = s.drawer else { return; };
     unsafe {
         let state = GetWindowLongPtrW(drawer.hwnd, GWLP_USERDATA) as *mut DrawerState;
-        if state.is_null() { return; }
+        if state.is_null() || (*state).click.busy() { return; }
         let view = s.broker.track_list();
         if (*state).view == view { return; }
         let work = drawer_workarea(s.hwnd);
@@ -468,19 +506,43 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
+            // Handle activation here rather than forwarding it to the
+            // non-activating floating owner. The first click stays ours.
+            WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
+            WM_NCHITTEST => {
+                let mut bounds = RECT::default();
+                if GetWindowRect(hwnd, &mut bounds).is_err() { return LRESULT(HTNOWHERE as isize); }
+                drawer_hit_test(bounds, POINT { x: x_lparam(lp), y: y_lparam(lp) })
+            }
             WM_LBUTTONDOWN => {
                 let action = (*state).layout.click(x_lparam(lp), y_lparam(lp), (*state).first, (*state).view.titles.len());
-                match action {
-                    TrackListClick::Jump(index) => {
-                        post_command(Command::JumpToTrack(index));
-                        close_drawer(hwnd);
-                    }
-                    TrackListClick::Dismiss => close_drawer(hwnd),
-                    TrackListClick::None => {}
+                if (*state).click.press(action, WM_LBUTTONUP) && GetCapture() != hwnd {
+                    SetCapture(hwnd);
                 }
                 LRESULT(0)
             }
+            WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
+                let action = (*state).click.release(msg);
+                if action != TrackListClick::None {
+                    if let TrackListClick::Jump(index) = action {
+                        post_command(Command::JumpToTrack(index));
+                    }
+                    // Keep the unchanged surface and capture until this
+                    // mouse-up handler has returned. Destruction runs in a
+                    // later message, after the full click is consumed.
+                    if let Err(error) = PostMessageW(Some(hwnd), WM_TRACKLIST_FINISH_CLICK, WPARAM(0), LPARAM(0)) {
+                        (*state).click.close_queued = false;
+                        log_warn!("UI", "cannot queue tracklist dismissal: {error}");
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_TRACKLIST_FINISH_CLICK => {
+                if (*state).click.close_queued { close_drawer(hwnd); }
+                LRESULT(0)
+            }
             WM_MOUSEWHEEL => {
+                if (*state).click.busy() { return LRESULT(0); }
                 (*state).wheel += wheel_delta(wp) as i32;
                 let steps = (*state).wheel / 120;
                 (*state).wheel %= 120;
@@ -492,12 +554,17 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 LRESULT(0)
             }
             WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-                if (*state).layout.click(x_lparam(lp), y_lparam(lp), (*state).first, (*state).view.titles.len()) == TrackListClick::Dismiss {
-                    close_drawer(hwnd);
+                let action = (*state).layout.click(x_lparam(lp), y_lparam(lp), (*state).first, (*state).view.titles.len());
+                let release = if msg == WM_RBUTTONDOWN { WM_RBUTTONUP } else { WM_MBUTTONUP };
+                if action == TrackListClick::Dismiss && (*state).click.press(action, release) && GetCapture() != hwnd {
+                    SetCapture(hwnd);
                 }
                 LRESULT(0)
             }
-            WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => { close_drawer(hwnd); LRESULT(0) }
+            WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
+                if !(*state).click.busy() { close_drawer(hwnd); }
+                LRESULT(0)
+            }
             WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => {
                 if (*state).owned { close_drawer(hwnd); }
                 LRESULT(0)
@@ -1102,6 +1169,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn drawer_hit_test_owns_the_entire_surface_on_negative_monitors() {
+        let bounds = RECT { left: -420, top: -100, right: 0, bottom: 216 };
+        for (x, y) in [(-420, -100), (-1, -100), (-420, 215), (-1, 215), (-210, 0)] {
+            assert_eq!(drawer_hit_test(bounds, POINT { x, y }), LRESULT(HTCLIENT as isize));
+        }
+        for (x, y) in [(-421, 0), (0, 0), (-1, -101), (-1, 216)] {
+            assert_eq!(drawer_hit_test(bounds, POINT { x, y }), LRESULT(HTNOWHERE as isize));
+        }
+    }
+
+    #[test]
+    fn drawer_selection_dispatches_once_and_waits_for_the_matching_release() {
+        let layout = TrackListLayout::new(20, 1920, 1080);
+        let mut click = DrawerClickState::default();
+        assert_eq!(click.release(WM_LBUTTONUP), TrackListClick::None, "opening-click release keeps the list open");
+        assert!(!click.press(layout.click(10, 0, 0, 20), WM_LBUTTONUP));
+        assert!(!click.busy(), "header clicks do not close the list");
+        assert!(click.press(layout.click(10, layout.height() - 1, 5, 20), WM_LBUTTONUP));
+        assert!(click.busy());
+        assert!(!click.close_queued, "mouse-down only records the selection; no jump or dismissal yet");
+        assert!(!click.press(TrackListClick::Jump(1), WM_LBUTTONUP));
+        assert!(!click.press(TrackListClick::Dismiss, WM_RBUTTONUP));
+        assert_eq!(click.release(WM_RBUTTONUP), TrackListClick::None, "unrelated release cannot expose the background");
+        assert!(click.busy());
+        assert_eq!(click.release(WM_LBUTTONUP), TrackListClick::Jump(17));
+        assert!(click.close_queued, "consume mouse-up before the queued destruction");
+        assert!(click.busy());
+        assert_eq!(click.release(WM_LBUTTONUP), TrackListClick::None);
+        assert!(!click.press(TrackListClick::Jump(1), WM_LBUTTONUP), "no second selection while close is queued");
+    }
+
+    #[test]
+    fn drawer_outside_dismissal_consumes_each_button_without_a_jump() {
+        let layout = TrackListLayout::new(2, 1920, 1080);
+        for release in [WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP] {
+            for (x, y) in [(-1, 10), (layout.width, 10), (10, -1), (10, layout.height())] {
+                let mut click = DrawerClickState::default();
+                assert!(click.press(layout.click(x, y, 0, 2), release));
+                assert!(click.busy());
+                assert!(!click.close_queued);
+                assert!(!click.press(TrackListClick::Jump(1), WM_LBUTTONUP));
+                assert_eq!(click.release(release), TrackListClick::Dismiss);
+                assert!(click.close_queued);
+            }
+        }
+    }
+
+    #[test]
     fn hidden_drawer_creation_and_destruction_release_owned_state() {
         let before = DRAWER_STATES.load(Ordering::Relaxed);
         let view = TrackList { titles: vec!["Song A".into(), "Song B".into()], current: Some(1), loading: false };
@@ -1110,9 +1225,42 @@ mod tests {
         unsafe {
             assert!(IsWindow(Some(hwnd)).as_bool());
             assert!(!windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool());
+            use windows::Win32::UI::WindowsAndMessaging::{
+                GetLayeredWindowAttributes, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+            };
+            let styles = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            assert_ne!(styles & WS_EX_LAYERED.0, 0);
+            assert_ne!(styles & WS_EX_TOPMOST.0, 0);
+            assert_eq!(styles & WS_EX_TRANSPARENT.0, 0);
+            let mut alpha = 0;
+            let mut flags = Default::default();
+            GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)).unwrap();
+            assert_eq!(alpha, DRAWER_ALPHA);
+            assert_eq!(flags, LWA_ALPHA);
+            // A press and release change only the click state. The native
+            // surface stays at its original opacity and remains alive until
+            // the separate finish-click message destroys it.
+            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DrawerState;
+            assert!((*state).click.press(TrackListClick::Jump(1), WM_LBUTTONUP));
+            GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), None).unwrap();
+            assert_eq!(alpha, DRAWER_ALPHA);
+            assert!(IsWindow(Some(hwnd)).as_bool());
+            assert_eq!((*state).click.release(WM_LBUTTONUP), TrackListClick::Jump(1));
+            GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), None).unwrap();
+            assert_eq!(alpha, DRAWER_ALPHA);
+            assert!(IsWindow(Some(hwnd)).as_bool());
         }
         assert_eq!(DRAWER_STATES.load(Ordering::Relaxed), before + 1);
-        close_drawer(hwnd);
+        // Exercise only our private completion message, never synthetic
+        // mouse input. Posting cannot destroy the window synchronously.
+        unsafe {
+            PostMessageW(Some(hwnd), WM_TRACKLIST_FINISH_CLICK, WPARAM(0), LPARAM(0)).unwrap();
+            assert!(IsWindow(Some(hwnd)).as_bool());
+            let mut message = MSG::default();
+            assert!(GetMessageW(&mut message, Some(hwnd), WM_TRACKLIST_FINISH_CLICK, WM_TRACKLIST_FINISH_CLICK).0 > 0);
+            assert_eq!(message.message, WM_TRACKLIST_FINISH_CLICK);
+            DispatchMessageW(&message);
+        }
         unsafe { assert!(!IsWindow(Some(hwnd)).as_bool()); }
         assert_eq!(DRAWER_STATES.load(Ordering::Relaxed), before);
     }

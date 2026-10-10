@@ -42,7 +42,7 @@ impl StreamBuffer {
         let mut bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
         if bytes.cancelled || bytes.done {
             return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::ConnectionAborted,
                 "stream download stopped",
             ));
         }
@@ -122,8 +122,11 @@ impl Read for MemoryReader {
         let mut bytes = self.buffer.bytes.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if bytes.cancelled {
+                // read_exact and container readers automatically retry
+                // Interrupted. Cancellation is permanent for this reader;
+                // it must escape their retry loop so a new Load can run.
                 return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
+                    io::ErrorKind::ConnectionAborted,
                     "stream cancelled",
                 ));
             }
@@ -180,7 +183,7 @@ impl Seek for MemoryReader {
         };
         if bytes.cancelled {
             return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
+                io::ErrorKind::ConnectionAborted,
                 "stream cancelled",
             ));
         }
@@ -285,7 +288,7 @@ mod tests {
             *b"abc"
         );
         buffer.cancel();
-        assert_eq!(worker.join().unwrap(), io::ErrorKind::Interrupted);
+        assert_eq!(worker.join().unwrap(), io::ErrorKind::ConnectionAborted);
     }
 
     #[test]
@@ -309,6 +312,25 @@ mod tests {
         assert!(overflow.to_string().contains("60 MiB"));
         buffer.finish(Err(overflow));
         assert!(!buffer.complete());
+    }
+
+    #[test]
+    fn cancelled_exact_read_returns_instead_of_retrying_forever() {
+        let buffer = StreamBuffer::new();
+        buffer.append(b"partial").unwrap();
+        let mut reader = buffer.reader();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut bytes = [0; 16];
+            let error = reader.read_exact(&mut bytes).unwrap_err();
+            tx.send(error.kind()).unwrap();
+        });
+        buffer.cancel();
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            io::ErrorKind::ConnectionAborted);
+        worker.join().unwrap();
+        assert_eq!(buffer.reader().seek(SeekFrom::Start(0)).unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted);
     }
 
     #[test]

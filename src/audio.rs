@@ -1691,6 +1691,56 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires yt-dlp and live network access"]
+    fn live_youtube_decodes_audio() {
+        use crate::broker::{Broker, Command as PlayerCommand, DecoderLink, Phase};
+        let url = std::env::var("KYOUKO_TEST_URL")
+            .unwrap_or_else(|_| "https://www.youtube.com/watch?v=dnObAMACYrA".into());
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        shared.set_device_channels(2);
+        let (cmd_tx, cmd_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let audio = spawn(shared.clone(), cmd_rx, status_tx);
+        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
+            cmd_tx.clone(), audio.controls.clone().hook(),
+        ));
+        let result = (|| -> Result<(), String> {
+            // Changing a live, partially downloaded stream must unblock the
+            // old reader and start the next URL on the same decoder thread.
+            for raw in [&*url, "https://www.youtube.com/watch?v=jNQXAC9IVRw"] {
+                broker.handle_command(PlayerCommand::Load {
+                    source: Source::from_raw(raw), paused: false,
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while shared.phase() == Phase::Loading {
+                    let status = status_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                        .map_err(|e| format!("waiting for {raw} to open: {e}"))?;
+                    broker.handle_status(status);
+                }
+                if shared.phase() != Phase::Playing {
+                    return Err(format!("stream did not enter Playing: {raw}"));
+                }
+                loop {
+                    let chunk = audio.chunk_rx.recv_timeout(Duration::from_secs(10))
+                        .map_err(|e| format!("waiting for decoded audio: {e}"))?;
+                    if chunk.generation != shared.generation() { continue; }
+                    assert!(!chunk.data.is_empty());
+                    assert!(chunk.data.iter().all(|sample| sample.is_finite()));
+                    break;
+                }
+            }
+            Ok(())
+        })();
+        cmd_tx.send(DecoderCmd::Shutdown).unwrap();
+        audio.controls.interrupt();
+        audio.decoder.join().unwrap();
+        assert!(audio.controls.child_slot.lock().unwrap().is_none());
+        assert!(audio.controls.buffer_slot.lock().unwrap().is_none());
+        result.unwrap();
+    }
+
+    #[test]
     fn real_decoder_failures_retry_twice_per_track_then_exhaust_queue() {
         use crate::broker::{Broker, Command as PlayerCommand, DecoderLink, Phase};
         let dir = std::env::temp_dir().join(format!("kyouko-retry-{}-decoder", std::process::id()));

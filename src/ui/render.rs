@@ -62,7 +62,6 @@ pub fn track_info_at(x: i32, y: i32, line_h: i32) -> bool {
 pub const TRACKLIST_WIDTH: i32 = 420;
 pub const TRACKLIST_ROW_H: i32 = 24;
 const TRACKLIST_HEADER_H: i32 = 28;
-const TRACKLIST_FOOTER_H: i32 = 20;
 const TRACKLIST_MAX_ROWS: usize = 12;
 const TRACKLIST_BG: COLORREF = COLORREF(0x00241E1A);
 const TRACKLIST_SELECTED: COLORREF = COLORREF(0x004A6040);
@@ -82,12 +81,12 @@ pub enum TrackListClick {
 
 impl TrackListLayout {
     pub fn new(count: usize, work_width: i32, work_height: i32) -> Self {
-        let available = ((work_height - TRACKLIST_HEADER_H - TRACKLIST_FOOTER_H) / TRACKLIST_ROW_H).max(1) as usize;
+        let available = ((work_height - TRACKLIST_HEADER_H) / TRACKLIST_ROW_H).max(1) as usize;
         Self { width: TRACKLIST_WIDTH.min(work_width.max(1)), rows: count.max(1).min(available).min(TRACKLIST_MAX_ROWS) }
     }
 
     pub fn height(self) -> i32 {
-        TRACKLIST_HEADER_H + self.rows as i32 * TRACKLIST_ROW_H + TRACKLIST_FOOTER_H
+        TRACKLIST_HEADER_H + self.rows as i32 * TRACKLIST_ROW_H
     }
 
     pub fn first(self, count: usize, current: Option<usize>) -> usize {
@@ -169,9 +168,6 @@ impl TrackListRenderer {
                     FillRect(dc, &RECT { left: 0, top, right: layout.width, bottom: top + TRACKLIST_ROW_H }, self.selected);
                 }
                 text(&format!("{}. {title}", index + 1), top, TRACKLIST_ROW_H);
-            }
-            if view.titles.len() > layout.rows {
-                text("Scroll to view more", layout.height() - TRACKLIST_FOOTER_H, TRACKLIST_FOOTER_H);
             }
             SetTextColor(dc, old_color);
             SetBkMode(dc, BACKGROUND_MODE(old_mode as u32));
