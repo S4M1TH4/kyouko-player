@@ -60,6 +60,7 @@ symphonia = { version = "0.5", default-features = false, features = [
 # architecture rests on: `select!` over multiple blocking receives (no polling)
 # and bounded queues (backpressure is our only scheduling mechanism).
 crossbeam-channel = "0.5"
+serde_json = "1" # decode escaped playlist titles without splitting songs at newlines
 windows-core = "0.62"
 
 [profile.release]

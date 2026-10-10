@@ -146,6 +146,22 @@ fn format_yt_queue(titles: &[String], current: Option<usize>) -> String {
     out
 }
 
+/// Keep one title per actual playlist index, including multiline titles and
+/// unavailable entries. Plain line splitting can shift every subsequent jump.
+fn parse_playlist_titles(raw: &[u8]) -> Result<Vec<String>, String> {
+    let text = std::str::from_utf8(raw).map_err(|e| e.to_string())?;
+    let mut titles = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let (index, title) = line.split_once('\t').ok_or("missing playlist index")?;
+        let index = index.parse::<usize>().map_err(|e| e.to_string())?;
+        if index == 0 || index > 100_000 { return Err("invalid playlist index".into()); }
+        let title: String = serde_json::from_str(title).map_err(|e| e.to_string())?;
+        if titles.len() < index { titles.resize(index, "Unavailable track".to_string()); }
+        titles[index - 1] = title;
+    }
+    Ok(titles)
+}
+
 /// Does this path carry a supported media extension?
 fn is_media_path(path: &Path) -> bool {
     path.extension()
@@ -364,7 +380,7 @@ pub enum Command {
     Load { source: Source, paused: bool },
     /// Startup-only history restore: rescan a valid folder, then stage its
     /// saved track (or the first entry) paused. Fall back to last_track.
-    RestoreState { last_folder: Option<String>, last_track: Option<String> },
+    RestoreState { last_folder: Option<String>, last_track: Option<String>, last_playlist_index: Option<usize> },
     /// Flip between Playing and Paused; restart the retained track when
     /// Stopped (window/tray clicks + terminal `r`).
     TogglePause,
@@ -662,9 +678,16 @@ impl DecoderLink {
     }
 }
 
-/// The decision point. Owns the decoder link; everything else is derived
-/// state. The presentation layer (headless loop, Win32 pump) calls
-/// `handle_command` / `handle_status` and renders `view`.
+/// Immutable playlist snapshot for presentation surfaces.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackList {
+    pub titles: Vec<String>,
+    /// Zero-based highlighted entry; jump commands remain one-based.
+    pub current: Option<usize>,
+    pub loading: bool,
+}
+
+/// The presentation layer calls this single-owner state machine.
 pub struct Broker {
     shared: Arc<SharedState>,
     decoder: DecoderLink,
@@ -674,8 +697,8 @@ pub struct Broker {
     /// Load asked for a staged (paused) start: the next Opened flips to
     /// Paused instead of Playing. Consumed there, cleared on failure.
     stage_paused: bool,
-    /// Most recently OPENED source — survives Stop/Finished so playback can
-    /// restart with its exact format/playlist index and retain track history.
+    /// Most recently opened or explicitly jumped-to source — survives
+    /// Stop/Finished and immediately persists a GUI/terminal selection.
     last_opened_source: Option<Source>,
     /// Active folder context survives queue navigation, Stop, and repeat.
     last_folder: Option<String>,
@@ -688,15 +711,17 @@ pub struct Broker {
     /// When streaming playlist length is unavailable, allow one following
     /// entry after double failure, then stop if that entry also fails twice.
     failed_playlist_probe: bool,
-    /// Local folder queue (shallow scan, newest first) + position. A single
+    /// Local folder queue (shallow scan, newest first). A single
     /// file load becomes a one-entry queue; a YouTube load clears it.
     local_queue: Vec<Source>,
+    /// Zero-based position in the active local or streaming playlist.
     queue_index: Option<usize>,
     /// YouTube playlist titles resolved by a detached `--flat-playlist`
     /// fetch, plus the playlist URL they belong to. `Some(url)` with an
     /// empty vec = the fetch is still in flight.
     yt_queue: Vec<String>,
     yt_queue_url: Option<String>,
+    yt_queue_loading: bool,
 
     /// Installed by main; writes PersistedState to disk. A closure keeps the
     /// broker I/O-free (and testable).
@@ -721,6 +746,7 @@ impl Broker {
             queue_index: None,
             yt_queue: Vec::new(),
             yt_queue_url: None,
+            yt_queue_loading: false,
             saver: None,
         };
         broker.refresh();
@@ -741,6 +767,10 @@ impl Broker {
             eq_gains: self.shared.eq_gains(),
             last_track: self.last_opened_source.as_ref().map(|source| source.raw().to_string()),
             last_folder: self.last_folder.clone(),
+            last_playlist_index: self.last_opened_source.as_ref().and_then(|source| match source {
+                Source::Youtube { playlist_index, .. } => *playlist_index,
+                Source::File(_) => None,
+            }),
             loop_enabled: self.shared.loop_enabled(),
         }
     }
@@ -752,8 +782,14 @@ impl Broker {
         }
     }
 
-    fn restore_startup(&mut self, last_folder: Option<String>, last_track: Option<String>) {
-        self.last_opened_source = last_track.as_deref().map(Source::from_raw);
+    fn restore_startup(&mut self, last_folder: Option<String>, last_track: Option<String>, last_playlist_index: Option<usize>) {
+        let restored_source = last_track.as_deref().map(Source::from_raw).map(|mut source| {
+            if let Source::Youtube { playlist_index: index @ Some(_), .. } = &mut source {
+                if let Some(saved) = last_playlist_index.filter(|&n| n > 0) { *index = Some(saved); }
+            }
+            source
+        });
+        self.last_opened_source = restored_source.clone();
         if let Some(folder) = last_folder {
             let batch = Path::new(&folder).is_dir()
                 .then(|| collect_media_from_paths(std::slice::from_ref(&folder)))
@@ -784,14 +820,17 @@ impl Broker {
             log_warn!("BROKER", "saved folder unavailable or contains no supported media: {folder}");
         }
         self.last_folder = None;
-        if let Some(raw) = last_track {
-            self.handle_command(Command::Load { source: Source::from_raw(&raw), paused: true });
+        if let Some(source) = restored_source {
+            self.handle_command(Command::Load { source, paused: true });
         }
     }
 
     /// The common load tail - everything a Load does once queue management
     /// has settled which source to open.
     fn begin_load(&mut self, source: Source, paused: bool) {
+        if let Source::Youtube { playlist_index: Some(index), .. } = &source {
+            self.queue_index = index.checked_sub(1);
+        }
         self.retry_used = false;
         self.start_attempt(source, paused);
     }
@@ -836,7 +875,8 @@ impl Broker {
         self.pending_source = Some(source.clone());
         self.stage_paused = false;
         self.shared.reset_playhead();
-        let has_next = if let Some(index) = self.queue_index {
+        let has_next = if !self.local_queue.is_empty() {
+            let index = self.queue_index.unwrap_or(0);
             index + 1 < self.local_queue.len()
         } else if let Source::Youtube { playlist_index: Some(index), .. } = &source {
             if !self.yt_queue.is_empty() {
@@ -870,6 +910,31 @@ impl Broker {
         self.begin_load(source, false);
     }
 
+    fn jump_to_source(&mut self, source: Source) {
+        self.last_opened_source = Some(source.clone());
+        self.begin_load(source, false);
+        self.persist();
+        self.refresh();
+    }
+
+    /// Presentation-only snapshot. The drawer never accesses mutable queues.
+    pub fn track_list(&self) -> TrackList {
+        if self.yt_queue_url.is_some() {
+            TrackList {
+                titles: self.yt_queue.clone(),
+                current: self.current_yt_index().and_then(|n| n.checked_sub(1))
+                    .filter(|&index| index < self.yt_queue.len()),
+                loading: self.yt_queue_loading,
+            }
+        } else {
+            TrackList {
+                titles: self.local_queue.iter().map(|source| source.display_name().to_string()).collect(),
+                current: self.queue_index.filter(|&index| index < self.local_queue.len()),
+                loading: false,
+            }
+        }
+    }
+
     /// Make sure a flat-playlist metadata fetch is in flight for `url`.
     /// Spawns a detached, simulate-only yt-dlp (no stream resolution, so it
     /// self-exits after printing the index — no crawler) that reports back
@@ -881,7 +946,9 @@ impl Broker {
         }
         self.yt_queue.clear();
         self.yt_queue_url = Some(url.to_string());
+        self.yt_queue_loading = true;
         let Some(tx) = CMD_TX.get().cloned() else {
+            self.yt_queue_loading = false;
             log_warn!("BROKER", "no command channel - playlist listing unavailable");
             return;
         };
@@ -890,31 +957,28 @@ impl Broker {
             .name("kyouko-ytlist".into())
             .spawn(move || {
                 let output = StdCommand::new("yt-dlp")
-                    .args(["--flat-playlist", "--print", "title", &url])
+                    .args(["--flat-playlist", "--encoding", "utf-8", "--print",
+                        "%(playlist_index)s\t%(title|Unavailable track)j", &url])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .output();
-                match output {
+                let titles = match output {
                     Ok(out) if out.status.success() => {
-                        let titles: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                            .lines()
-                            .map(str::trim)
-                            .filter(|line| !line.is_empty())
-                            .map(String::from)
-                            .collect();
-                        if titles.is_empty() {
-                            log_warn!("TITLE", "flat-playlist fetch resolved no titles");
-                        } else {
-                            log_info!("TITLE", "playlist resolved: {} videos", titles.len());
-                            let _ = tx.send(Command::YtQueueResolved { url, titles });
+                        match parse_playlist_titles(&out.stdout) {
+                            Ok(titles) => titles,
+                            Err(error) => { log_warn!("TITLE", "playlist titles could not be decoded: {error}"); Vec::new() }
                         }
                     }
-                    Ok(_) => log_warn!("TITLE", "flat-playlist fetch exited nonzero"),
-                    Err(e) => log_warn!("TITLE", "flat-playlist fetch failed: {e}"),
-                }
+                    Ok(_) => { log_warn!("TITLE", "flat-playlist fetch exited nonzero"); Vec::new() }
+                    Err(e) => { log_warn!("TITLE", "flat-playlist fetch failed: {e}"); Vec::new() }
+                };
+                log_info!("TITLE", "playlist resolved: {} videos", titles.len());
+                let _ = tx.send(Command::YtQueueResolved { url, titles });
+                crate::ui::wake_broker();
             });
         if let Err(e) = spawned {
+            self.yt_queue_loading = false;
             log_warn!("BROKER", "playlist fetch thread failed to spawn: {e}");
         }
     }
@@ -926,7 +990,10 @@ impl Broker {
             .track
             .as_ref()
             .map(|t| t.source.clone())
-            .or_else(|| self.pending_source.clone());
+            .or_else(|| self.pending_source.clone())
+            .or_else(|| self.last_opened_source.clone().filter(|source| {
+                self.yt_queue_url.as_deref() == Some(source.raw())
+            }));
         match current {
             Some(Source::Youtube { playlist_index: Some(n), .. }) => Some(n),
             _ => None,
@@ -1033,8 +1100,8 @@ impl Broker {
     pub fn handle_command(&mut self, cmd: Command) -> Flow {
         log_debug!("BROKER", "command: {cmd:?}");
         match cmd {
-            Command::RestoreState { last_folder, last_track } => {
-                self.restore_startup(last_folder, last_track);
+            Command::RestoreState { last_folder, last_track, last_playlist_index } => {
+                self.restore_startup(last_folder, last_track, last_playlist_index);
             }
             Command::LoadDropped(paths) => {
                 // Classify the batch first: a YouTube .url shortcut wins over
@@ -1185,6 +1252,7 @@ impl Broker {
                 if self.yt_queue_url.as_deref() == Some(url.as_str()) {
                     log_info!("BROKER", "youtube playlist resolved: {} videos", titles.len());
                     self.yt_queue = titles;
+                    self.yt_queue_loading = false;
                 }
             }
             Command::ShowQueue => {
@@ -1226,6 +1294,7 @@ impl Broker {
                                     .as_ref()
                                     .map(|t| t.source.clone())
                                     .or_else(|| self.pending_source.clone())
+                                    .or_else(|| self.last_opened_source.clone())
                                     .and_then(|src| match src {
                                         Source::Youtube { url, format, .. } => {
                                             Some(Source::Youtube {
@@ -1237,10 +1306,7 @@ impl Broker {
                                         _ => None,
                                     })
                                 {
-                                    self.handle_command(Command::Load {
-                                        source: target,
-                                        paused: false,
-                                    });
+                                    self.jump_to_source(target);
                                 }
                             }
                             None => {
@@ -1261,7 +1327,8 @@ impl Broker {
                     match num.checked_sub(1).filter(|idx| *idx < self.local_queue.len()) {
                         Some(idx) => {
                             log_info!("BROKER", "jump: track {num} of {}", self.local_queue.len());
-                            self.load_queue_track(idx);
+                            self.queue_index = Some(idx);
+                            self.jump_to_source(self.local_queue[idx].clone());
                         }
                         None => {
                             log_warn!(
@@ -1386,6 +1453,10 @@ impl Broker {
         log_debug!("BROKER", "status: {st:?}");
         match st {
             Status::Opened { source, sample_rate, channels, title, duration } => {
+                if self.pending_source.as_ref().is_some_and(|pending| *pending != source) {
+                    log_debug!("BROKER", "obsolete Opened ignored after a different track was selected: {source}");
+                    return;
+                }
                 log_info!(
                     "BROKER",
                     "opened: {source} — {} Hz, {channels} ch{}",
@@ -1418,6 +1489,10 @@ impl Broker {
                 self.persist();
             }
             Status::Finished => {
+                if self.track.is_none() {
+                    log_debug!("BROKER", "obsolete Finished ignored while no selected track is open");
+                    return;
+                }
                 self.failed_playlist_probe = false;
                 // 1. mpv loop-file: replay the exact source (preserving a
                 //    custom YouTube format id when the track carries one).
@@ -1488,7 +1563,16 @@ impl Broker {
     }
 
     fn refresh(&mut self) {
-        self.view = render_panel(&self.shared, self.track.as_ref());
+        let pending = self.pending_source.as_ref().map(|source| TrackMeta {
+            source: source.clone(),
+            title: match source {
+                Source::Youtube { playlist_index: Some(index), .. } => index.checked_sub(1)
+                    .and_then(|index| self.yt_queue.get(index)).cloned(),
+                _ => None,
+            },
+            duration: None, sample_rate: 0, channels: 0,
+        });
+        self.view = render_panel(&self.shared, self.track.as_ref().or(pending.as_ref()));
         self.view_dirty = true;
     }
 }
@@ -1532,7 +1616,7 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     p.push('\n');
     p.push_str(&row(&timeline));
     p.push('\n');
-    p.push_str(&row(&title.chars().take(14).collect::<String>()));
+    p.push_str(&row(&title.chars().map(|c| if c.is_control() { ' ' } else { c }).take(14).collect::<String>()));
     p.push('\n');
     p.push_str(&row(&format!("vol {bar} {:>3}%", (v * 100.0).round() as u32)));
     p.push('\n');
@@ -2119,6 +2203,7 @@ mod tests {
         let (mut restarted, _, restarted_rx) = broker_with_sink();
         restarted.handle_command(Command::RestoreState {
             last_folder: saved.last_folder, last_track: saved.last_track,
+            last_playlist_index: saved.last_playlist_index,
         });
         assert_eq!(restarted.local_queue.len(), 3, "restart rescans current contents");
         assert_eq!(restarted.local_queue[0].raw(), latest.to_string_lossy());
@@ -2158,6 +2243,7 @@ mod tests {
         restarted.handle_command(Command::RestoreState {
             last_folder: saved.last_folder,
             last_track: Some(absolute.join("removed.mp3").to_string_lossy().into_owned()),
+            last_playlist_index: None,
         });
         assert_eq!(restarted.queue_index, Some(0));
         assert!(restarted.stage_paused);
@@ -2181,6 +2267,7 @@ mod tests {
             let raw = "https://www.bilibili.com/video/BVtest";
             broker.handle_command(Command::RestoreState {
                 last_folder: folder, last_track: Some(raw.into()),
+                last_playlist_index: None,
             });
             assert!(broker.last_folder.is_none());
             assert_eq!(broker.persist_snapshot().last_track.as_deref(), Some(raw));
@@ -2188,7 +2275,7 @@ mod tests {
             assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { format, .. })) if format == "30232"));
         }
         let (mut broker, _, rx) = broker_with_sink();
-        broker.handle_command(Command::RestoreState { last_folder: Some(empty.to_string_lossy().into_owned()), last_track: None });
+        broker.handle_command(Command::RestoreState { last_folder: Some(empty.to_string_lossy().into_owned()), last_track: None, last_playlist_index: None });
         assert_eq!(broker.shared.phase(), Phase::Stopped);
         assert!(rx.try_recv().is_err());
         std::fs::remove_dir_all(empty).unwrap();
@@ -2359,7 +2446,7 @@ mod tests {
 
     #[test]
     fn jump_to_track_validates_and_loads() {
-        let (mut broker, _, rx) = broker_with_sink();
+        let (mut broker, sink, rx) = broker_with_sink();
         broker.local_queue = vec![
             Source::File("C:\\album\\01.wav".into()),
             Source::File("C:\\album\\02.wav".into()),
@@ -2372,11 +2459,97 @@ mod tests {
             other => panic!("expected jump load, got {other:?}"),
         }
         assert_eq!(broker.queue_index, Some(1));
+        assert_eq!(broker.track_list().current, Some(1));
+        assert_eq!(sink.lock().unwrap().last().unwrap().last_track.as_deref(), Some(r"C:\album\02.wav"));
+        assert_eq!(sink.lock().unwrap().len(), 1, "selection persists before decoder Opened");
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+        assert!(broker.take_refresh().is_some());
         // Out of bounds (and zero) are rejected cleanly: nothing dispatched.
         broker.handle_command(Command::JumpToTrack(9));
         broker.handle_command(Command::JumpToTrack(0));
         assert!(rx.try_recv().is_err(), "out-of-range jumps dispatch nothing");
         assert_eq!(broker.queue_index, Some(1), "state unchanged on bad jumps");
+        assert_eq!(sink.lock().unwrap().len(), 1, "invalid selection must not persist");
+    }
+
+    #[test]
+    fn playlist_titles_keep_newlines_unicode_and_unavailable_indices() {
+        let raw = "1\t\"Song A\"\n3\t\"音楽\\nSecond line \\\"quoted\\\"\"\n";
+        let titles = parse_playlist_titles(raw.as_bytes()).unwrap();
+        assert_eq!(titles, ["Song A", "Unavailable track", "音楽\nSecond line \"quoted\""]);
+        assert!(parse_playlist_titles(b"0\t\"invalid\"\n").is_err());
+        assert!(parse_playlist_titles(b"1\tinvalid json\n").is_err());
+    }
+
+    #[test]
+    fn supplied_playlist_tracklist_jumps_and_persists_after_stop() {
+        // The automated verification run supplies the real yt-dlp metadata
+        // file. Regular offline runs use a long synthetic playlist.
+        let titles = match std::env::var_os("KYOUKO_TRACKLIST_TEST_FILE") {
+            Some(path) => parse_playlist_titles(&std::fs::read(path).unwrap()).unwrap(),
+            None => (1..=150).map(|index| format!("Song {index}")).collect(),
+        };
+        assert!(titles.len() > 12);
+        let url = "https://youtube.com/playlist?list=PLw9JTHoDqqD8y2qG6cyud4_iMzJmKd_3B";
+        let (mut broker, sink, rx) = broker_with_sink();
+        broker.handle_command(Command::Load { source: Source::from_raw(url), paused: false });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_command(Command::YtQueueResolved { url: url.into(), titles: titles.clone() });
+        broker.handle_status(Status::Opened { source: Source::from_raw(url), sample_rate: 48_000, channels: 2, title: None, duration: None });
+        broker.handle_command(Command::Stop);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        assert_eq!(broker.track_list().current, Some(0));
+        assert_eq!(broker.track_list().titles, titles);
+        let number = titles.len();
+        let saves = sink.lock().unwrap().len();
+        broker.handle_command(Command::JumpToTrack(number));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { url: target, format, playlist_index: Some(index) }))
+            if target == url && format == "140" && index == number));
+        assert_eq!(broker.queue_index, Some(number - 1));
+        assert_eq!(broker.track_list().current, Some(number - 1));
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+        assert!(broker.take_refresh().is_some());
+        let saved = sink.lock().unwrap();
+        assert_eq!(saved.len(), saves + 1);
+        assert_eq!(saved.last().unwrap().last_track.as_deref(), Some(url));
+        assert_eq!(saved.last().unwrap().last_playlist_index, Some(number));
+        drop(saved);
+        let (mut restarted, _, restarted_rx) = broker_with_sink();
+        restarted.handle_command(Command::RestoreState {
+            last_folder: None, last_track: Some(url.into()), last_playlist_index: Some(number),
+        });
+        assert!(matches!(restarted_rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(index), .. })) if index == number));
+        assert_eq!(restarted.queue_index, Some(number - 1));
+        assert!(restarted.stage_paused);
+    }
+
+    #[test]
+    fn late_opened_does_not_replace_a_gui_jump_selection() {
+        let (mut broker, _, rx) = broker_with_sink();
+        broker.local_queue = vec![Source::File("old.mp3".into()), Source::File("selected.mp3".into())];
+        broker.load_queue_track(0);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_command(Command::JumpToTrack(2));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_status(Status::Opened { source: Source::File("old.mp3".into()), sample_rate: 48_000, channels: 2, title: None, duration: None });
+        broker.handle_status(Status::Finished);
+        assert_eq!(broker.track_list().current, Some(1));
+        assert_eq!(broker.persist_snapshot().last_track.as_deref(), Some("selected.mp3"));
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+    }
+
+    #[test]
+    fn gui_jump_shows_the_selected_title_during_loading() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let url = "https://youtube.com/playlist?list=test";
+        broker.handle_command(Command::Load { source: Source::from_raw(url), paused: false });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_command(Command::YtQueueResolved { url: url.into(), titles: vec!["First".into(), "Selected\nSong".into()] });
+        broker.handle_command(Command::JumpToTrack(2));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+        assert!(broker.view().contains("Selected Song"));
+        assert_eq!(broker.view().lines().count(), 5, "multiline titles must not change floating-window geometry");
     }
 
     #[test]

@@ -123,6 +123,7 @@ fn main() {
         let _ = cmd_tx.send(Command::RestoreState {
             last_folder: restored.last_folder,
             last_track: restored.last_track,
+            last_playlist_index: restored.last_playlist_index,
         });
     }
 

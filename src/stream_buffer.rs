@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use symphonia::core::io::MediaSource;
 
-pub const MAX_STREAM_BYTES: usize = 20 * 1024 * 1024;
+pub const MAX_STREAM_BYTES: usize = 60 * 1024 * 1024;
 
 #[derive(Default)]
 struct Bytes {
@@ -51,10 +51,10 @@ impl StreamBuffer {
             .len()
             .checked_add(chunk.len())
             .filter(|&n| n <= self.limit)
-            .ok_or_else(|| io::Error::other("stream exceeds the 20 MiB RAM limit"))?;
+            .ok_or_else(|| io::Error::other("stream exceeds the 60 MiB RAM limit"))?;
         if required > bytes.data.capacity() {
             // One allocation avoids a transient old+new Vec allocation
-            // exceeding the cap when a large track grows near 20 MiB.
+            // exceeding the cap when a large track grows near 60 MiB.
             let additional = self.limit - bytes.data.len();
             bytes
                 .data
@@ -286,6 +286,29 @@ mod tests {
         );
         buffer.cancel();
         assert_eq!(worker.join().unwrap(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn default_limit_accepts_sixty_mib_then_rejects_one_more_byte() {
+        let buffer = StreamBuffer::new();
+        let chunk = vec![7; 1024 * 1024];
+        for _ in 0..60 {
+            buffer.append(&chunk).unwrap();
+        }
+        {
+            let bytes = buffer.bytes.lock().unwrap();
+            assert_eq!(bytes.data.len(), 60 * 1024 * 1024);
+            assert_eq!(bytes.data.capacity(), MAX_STREAM_BYTES);
+        }
+        let mut reader = buffer.reader();
+        reader.seek(SeekFrom::Start((MAX_STREAM_BYTES - 1) as u64)).unwrap();
+        let mut last = [0];
+        reader.read_exact(&mut last).unwrap();
+        assert_eq!(last, [7]);
+        let overflow = buffer.append(&[0]).unwrap_err();
+        assert!(overflow.to_string().contains("60 MiB"));
+        buffer.finish(Err(overflow));
+        assert!(!buffer.complete());
     }
 
     #[test]

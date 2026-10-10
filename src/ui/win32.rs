@@ -20,7 +20,9 @@ use crossbeam_channel::{Receiver, TryRecvError};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, POINTL, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::ValidateRect;
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect,
+    MonitorFromWindow, ValidateRect, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, SetFocus, VK_ESCAPE};
 use windows::Win32::System::Com::{
     DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
 };
@@ -40,25 +42,26 @@ use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, NIN_SELECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
+    GetWindowLongPtrW, GetWindowRect, IsWindow, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
     PostMessageW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
+    SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
     CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, IDC_ARROW, MF_STRING, MSG,
-    SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU,
     WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
-    WM_NULL, WM_RBUTTONUP, WM_TIMER,
+    WM_NULL, WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WA_INACTIVE,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{implement, Ref};
 
 use crate::audio::AudioOut;
 
-use super::render::{CONTROL_BAR_H, Renderer, StatusToggle, WINDOW_W};
+use super::render::{CONTROL_BAR_H, Renderer, StatusToggle, WINDOW_W,
+    TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position};
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
-use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status};
+use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status, TrackList};
 use crate::{log_debug, log_error, log_info, log_warn};
 
 const TIMER_ID: usize = 1;
@@ -66,6 +69,35 @@ const TIMER_MS: u32 = 1000;
 /// Non-zero command IDs for the two retained tray menu items.
 const MENU_TOGGLE_WINDOW: usize = 1;
 const MENU_QUIT: usize = 2;
+const WM_TRACKLIST_CLOSED: u32 = 0x8004;
+
+#[derive(Clone, Copy)]
+struct DrawerHandle {
+    hwnd: HWND,
+    token: usize,
+}
+
+struct DrawerState {
+    owner: HWND,
+    token: usize,
+    owned: bool,
+    closing: bool,
+    view: TrackList,
+    layout: TrackListLayout,
+    first: usize,
+    wheel: i32,
+    renderer: TrackListRenderer,
+}
+
+#[cfg(test)]
+static DRAWER_STATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for DrawerState {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        DRAWER_STATES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 struct UiState {
     hwnd: HWND,
@@ -83,6 +115,8 @@ struct UiState {
     last_phase: Phase,
     hidden: bool,
     taskbar_created: u32,
+    drawer: Option<DrawerHandle>,
+    next_drawer_token: usize,
 }
 
 /// Win32 `GET_X_LPARAM`/`GET_Y_LPARAM`: unpack the signed 16-bit halves of
@@ -184,6 +218,8 @@ pub fn run(
         last_phase: Phase::Stopped,
         hidden: false,
         taskbar_created,
+            drawer: None,
+            next_drawer_token: 0,
     }));
 
     let hwnd = match unsafe {
@@ -279,6 +315,199 @@ fn workarea_top_right(width: i32, _height: i32) -> (i32, i32) {
     (rc.right - width - 12, rc.top + 12)
 }
 
+fn drawer_workarea(owner: HWND) -> RECT {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        if GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return info.rcWork;
+        }
+    }
+    RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+}
+
+fn register_drawer_class() -> windows::core::Result<()> {
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(drawer_wndproc),
+            hInstance: instance.into(),
+            hCursor: LoadCursorW(None, IDC_ARROW)?,
+            lpszClassName: w!("kyouko_tracklist"),
+            ..Default::default()
+        };
+        if RegisterClassW(&class) == 0 {
+            let error = windows::Win32::Foundation::GetLastError();
+            if error != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
+                return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(error.0)));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_drawer(owner: HWND, token: usize, view: TrackList, layout: TrackListLayout, position: (i32, i32))
+    -> windows::core::Result<HWND>
+{
+    register_drawer_class()?;
+    let renderer = TrackListRenderer::new()?;
+    let first = layout.first(view.titles.len(), view.current);
+    #[cfg(test)]
+    DRAWER_STATES.fetch_add(1, Ordering::Relaxed);
+    let mut drawer = Box::new(DrawerState {
+        owner, token, owned: false, closing: false, view, layout, first, wheel: 0, renderer,
+    });
+    let hwnd = unsafe {
+        CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("kyouko_tracklist"), w!("Tracks"),
+            WS_POPUP, position.0, position.1, layout.width, layout.height(),
+            (!owner.is_invalid()).then_some(owner), None,
+            Some(GetModuleHandleW(None)?.into()), Some(&mut *drawer as *mut DrawerState as *const c_void))?
+    };
+    drawer.owned = true;
+    let _ = Box::into_raw(drawer);
+    Ok(hwnd)
+}
+
+/// No reference to DrawerState may survive the synchronous destruction:
+/// WM_NCDESTROY frees it, and releasing capture can re-enter the wndproc.
+fn close_drawer(hwnd: HWND) {
+    unsafe {
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DrawerState;
+        if state.is_null() || (*state).closing { return; }
+        (*state).closing = true;
+        if GetCapture() == hwnd { let _ = ReleaseCapture(); }
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+fn dismiss_tracklist(state: *mut UiState) {
+    if let Some(drawer) = unsafe { (*state).drawer.take() } { close_drawer(drawer.hwnd); }
+}
+
+fn toggle_tracklist(state: *mut UiState) {
+    if let Some(drawer) = unsafe { (*state).drawer.take() } {
+        if unsafe { IsWindow(Some(drawer.hwnd)).as_bool() } {
+            close_drawer(drawer.hwnd);
+            return;
+        }
+    }
+    let owner = unsafe { (*state).hwnd };
+    let view = unsafe { (*state).broker.track_list() };
+    let work = drawer_workarea(owner);
+    let layout = TrackListLayout::new(view.titles.len(), work.right - work.left, work.bottom - work.top);
+    let mut anchor = RECT::default();
+    let _ = unsafe { GetWindowRect(owner, &mut anchor) };
+    anchor.top += unsafe { (*state).renderer.track_info_y() };
+    let position = tracklist_position(anchor, work, layout);
+    let token = unsafe {
+        (*state).next_drawer_token = (*state).next_drawer_token.wrapping_add(1).max(1);
+        (*state).next_drawer_token
+    };
+    match create_drawer(owner, token, view, layout, position) {
+        Ok(hwnd) => unsafe {
+            (*state).drawer = Some(DrawerHandle { hwnd, token });
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+            SetCapture(hwnd);
+            log_info!("UI", "tracklist opened");
+        },
+        Err(error) => log_error!("UI", "cannot open tracklist: {error}"),
+    }
+}
+
+fn refresh_tracklist(s: &UiState) {
+    let Some(drawer) = s.drawer else { return; };
+    unsafe {
+        let state = GetWindowLongPtrW(drawer.hwnd, GWLP_USERDATA) as *mut DrawerState;
+        if state.is_null() { return; }
+        let view = s.broker.track_list();
+        if (*state).view == view { return; }
+        let work = drawer_workarea(s.hwnd);
+        let layout = TrackListLayout::new(view.titles.len(), work.right - work.left, work.bottom - work.top);
+        let first = if (*state).view.current != view.current {
+            layout.first(view.titles.len(), view.current)
+        } else { layout.scroll((*state).first, 0, view.titles.len()) };
+        (*state).view = view;
+        (*state).layout = layout;
+        (*state).first = first;
+        let mut anchor = RECT::default();
+        let _ = GetWindowRect(s.hwnd, &mut anchor);
+        anchor.top += s.renderer.track_info_y();
+        let (x, y) = tracklist_position(anchor, work, layout);
+        let _ = SetWindowPos(drawer.hwnd, None, x, y, layout.width, layout.height(), SWP_NOACTIVATE | SWP_NOZORDER);
+        let _ = InvalidateRect(Some(drawer.hwnd), None, false);
+    }
+}
+
+unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if msg == WM_NCCREATE {
+            let create = &*(lp.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            return LRESULT(1);
+        }
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DrawerState;
+        if state.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
+        match msg {
+            WM_NCDESTROY => {
+                let owner = (*state).owner;
+                let token = (*state).token;
+                let owned = (*state).owned;
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                if owned { drop(Box::from_raw(state)); }
+                if !owner.is_invalid() {
+                    let _ = PostMessageW(Some(owner), WM_TRACKLIST_CLOSED, WPARAM(token), LPARAM(0));
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                (*state).renderer.draw(dc, &(*state).view, (*state).layout, (*state).first);
+                let _ = EndPaint(hwnd, &paint);
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_LBUTTONDOWN => {
+                let action = (*state).layout.click(x_lparam(lp), y_lparam(lp), (*state).first, (*state).view.titles.len());
+                match action {
+                    TrackListClick::Jump(index) => {
+                        post_command(Command::JumpToTrack(index));
+                        close_drawer(hwnd);
+                    }
+                    TrackListClick::Dismiss => close_drawer(hwnd),
+                    TrackListClick::None => {}
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                (*state).wheel += wheel_delta(wp) as i32;
+                let steps = (*state).wheel / 120;
+                (*state).wheel %= 120;
+                let first = (*state).layout.scroll((*state).first, -steps * 3, (*state).view.titles.len());
+                if first != (*state).first {
+                    (*state).first = first;
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+                if (*state).layout.click(x_lparam(lp), y_lparam(lp), (*state).first, (*state).view.titles.len()) == TrackListClick::Dismiss {
+                    close_drawer(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => { close_drawer(hwnd); LRESULT(0) }
+            WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => {
+                if (*state).owned { close_drawer(hwnd); }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED | WM_CLOSE => { close_drawer(hwnd); LRESULT(0) }
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
+        }
+    }
+}
+
 /// Everything the pure core can't know about: timer lifecycle + repaint.
 /// Called after every burst of broker activity.
 fn sync(s: &mut UiState) {
@@ -302,6 +531,7 @@ fn sync(s: &mut UiState) {
         let eq = s.shared.eq_gains();
         s.renderer.draw(s.hwnd, &panel, phase, &eq);
     }
+    refresh_tracklist(s);
 }
 
 fn phase_name(p: Phase) -> &'static str {
@@ -353,11 +583,15 @@ fn on_tray(s: &mut UiState, lp: LPARAM) {
 }
 
 fn toggle_visible(s: &mut UiState) {
-    unsafe {
-        let _ = ShowWindow(s.hwnd, if s.hidden { SW_SHOWNOACTIVATE } else { SW_HIDE });
-    }
+    let drawer = s.drawer.take();
     s.hidden = !s.hidden;
-    log_info!("UI", "echo window: {}", if s.hidden { "hidden" } else { "shown" });
+    let hwnd = s.hwnd;
+    let hidden = s.hidden;
+    if let Some(drawer) = drawer { close_drawer(drawer.hwnd); }
+    unsafe {
+        let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE });
+    }
+    log_info!("UI", "echo window: {}", if hidden { "hidden" } else { "shown" });
 }
 
 /// The tray popup retains only Show/Hide Echo and Quit. Returning the command
@@ -687,6 +921,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         let s = &mut *state;
         match msg {
+            WM_TRACKLIST_CLOSED => {
+                if s.drawer.is_some_and(|drawer| drawer.token == wp.0) { s.drawer = None; }
+                LRESULT(0)
+            }
             WM_APP_BROKER => {
                 if drain_commands(s) {
                     destroy(s); // Quit processed: WM_DESTROY → PostQuitMessage
@@ -731,6 +969,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if y >= rc.bottom - rc.top - CONTROL_BAR_H
                     || s.renderer.eq_band_at(x, y).is_some()
                     || s.renderer.status_toggle_at(x, y).is_some()
+                    || s.renderer.track_info_at(x, y)
                 {
                     LRESULT(HTCLIENT as isize)
                 } else {
@@ -753,6 +992,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         2 => post_command(Command::SeekRelative(5.0)),
                         _ => post_command(Command::NextTrack),
                     }
+                } else if s.renderer.track_info_at(x, y) {
+                    toggle_tracklist(state);
                 } else if let Some(toggle) = s.renderer.status_toggle_at(x, y) {
                     match toggle {
                         StatusToggle::Eq => {
@@ -822,6 +1063,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // available through the tray menu, terminal, and console Ctrl+C.
                 let _ = ShowWindow(s.hwnd, SW_HIDE);
                 s.hidden = true;
+                dismiss_tracklist(state);
                 LRESULT(0)
             }
             WM_ENDSESSION => {
@@ -841,6 +1083,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     s.timer_on = false;
                 }
                 s.tray.remove();
+                dismiss_tracklist(state);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -851,5 +1094,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_ERASEBKGND => LRESULT(1), // layered surface paints itself
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_drawer_creation_and_destruction_release_owned_state() {
+        let before = DRAWER_STATES.load(Ordering::Relaxed);
+        let view = TrackList { titles: vec!["Song A".into(), "Song B".into()], current: Some(1), loading: false };
+        let layout = TrackListLayout::new(view.titles.len(), 1920, 1080);
+        let hwnd = create_drawer(HWND::default(), 1, view, layout, (0, 0)).unwrap();
+        unsafe {
+            assert!(IsWindow(Some(hwnd)).as_bool());
+            assert!(!windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool());
+        }
+        assert_eq!(DRAWER_STATES.load(Ordering::Relaxed), before + 1);
+        close_drawer(hwnd);
+        unsafe { assert!(!IsWindow(Some(hwnd)).as_bool()); }
+        assert_eq!(DRAWER_STATES.load(Ordering::Relaxed), before);
     }
 }

@@ -37,6 +37,8 @@ pub struct PersistedState {
     pub last_track: Option<String>,
     /// Absolute path of the active local folder, rescanned on startup.
     pub last_folder: Option<String>,
+    /// One-based entry within a streaming playlist, paired with last_track.
+    pub last_playlist_index: Option<usize>,
     /// Track repeat (mpv `loop-file` style).
     pub loop_enabled: bool,
 }
@@ -45,7 +47,7 @@ impl Default for PersistedState {
     fn default() -> Self {
         Self {
             volume: 0.8, eq_gains: [0.0; EQ_BANDS], last_track: None,
-            last_folder: None, loop_enabled: false,
+            last_folder: None, last_playlist_index: None, loop_enabled: false,
         }
     }
 }
@@ -91,10 +93,11 @@ pub fn store_to(path: &Path, state: &PersistedState) {
         eq.push_str(&format!("{gain:.2}"));
     }
     let body = format!(
-        "# kyouko-player state — rewritten automatically, safe to edit\nvolume={:.3}\neq_gains={eq}\nlast_track={}\nlast_folder={}\nloop={}\n",
+        "# kyouko-player state — rewritten automatically, safe to edit\nvolume={:.3}\neq_gains={eq}\nlast_track={}\nlast_folder={}\nlast_playlist_index={}\nloop={}\n",
         state.volume,
         state.last_track.as_deref().unwrap_or(""),
         state.last_folder.as_deref().unwrap_or(""),
+        state.last_playlist_index.map(|index| index.to_string()).unwrap_or_default(),
         if state.loop_enabled { "true" } else { "false" },
     );
     let tmp = path.with_extension("cfg.tmp");
@@ -141,6 +144,9 @@ fn parse(text: &str) -> PersistedState {
             "last_folder" => {
                 state.last_folder = if value.is_empty() { None } else { Some(value.to_string()) };
             }
+            "last_playlist_index" => {
+                state.last_playlist_index = value.parse::<usize>().ok().filter(|&index| index > 0);
+            }
             "loop" => {
                 state.loop_enabled = value.eq_ignore_ascii_case("true");
             }
@@ -166,6 +172,7 @@ mod tests {
             eq_gains: [6.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 0.0, 8.0, 0.0],
             last_track: Some(r"C:\My Music\kyouko test file.mp3".into()),
             last_folder: Some(r"C:\My Music".into()),
+            last_playlist_index: None,
             loop_enabled: true,
         };
         store_to(&path, &state);
@@ -190,6 +197,22 @@ mod tests {
         assert_eq!(legacy.last_folder, None);
         assert_eq!(legacy.last_track.as_deref(), Some(r"C:\Music\old.mp3"));
         assert_eq!(legacy.volume, 0.5);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn playlist_selection_round_trip_and_invalid_defaults() {
+        let path = temp_path("playlist-index");
+        let state = PersistedState {
+            last_track: Some("https://youtube.com/playlist?list=test".into()),
+            last_playlist_index: Some(317), ..Default::default()
+        };
+        store_to(&path, &state);
+        assert_eq!(load_from(&path), state);
+        for value in ["", "0", "-1", "invalid"] {
+            assert_eq!(parse(&format!("last_playlist_index={value}\n")).last_playlist_index, None);
+        }
+        assert_eq!(parse("last_track=legacy.mp3\n").last_playlist_index, None);
         fs::remove_file(path).unwrap();
     }
 

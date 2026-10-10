@@ -19,17 +19,17 @@ use std::ptr::null_mut;
 use windows::core::{w, Error, HRESULT, Result};
 use windows::Win32::Foundation::{GetLastError, COLORREF, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, FillRect,
+    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect,
     GdiFlush, GetDC, GetStockObject,
     GetTextExtentPoint32W, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
     TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
     BLENDFUNCTION, BI_RGB, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, FF_MODERN,
     FIXED_PITCH, HBITMAP, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, TEXTMETRICW, TRANSPARENT,
-    WHITE_BRUSH,
+    WHITE_BRUSH, BACKGROUND_MODE, DEFAULT_PITCH, FF_SWISS, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, UpdateLayeredWindow, ULW_ALPHA};
 
-use crate::broker::{EQ_BANDS, EQ_MAX_GAIN_DB, Phase};
+use crate::broker::{EQ_BANDS, EQ_MAX_GAIN_DB, Phase, TrackList};
 use crate::{log_debug, log_error, log_warn};
 
 /// `Error::from_win32` was folded away in windows-rs 0.62 — rebuild it from
@@ -53,6 +53,142 @@ pub const CONTROL_BAR_H: i32 = 16;
 const EQ_ROWS: usize = 4;
 /// Negative = per-em height: the glyph cell stays exact at any DPI.
 const FONT_HEIGHT: i32 = -9;
+
+pub fn track_info_at(x: i32, y: i32, line_h: i32) -> bool {
+    line_h > 0 && (0..WINDOW_W).contains(&x)
+        && (PAD + 2 * line_h..PAD + 3 * line_h).contains(&y)
+}
+
+pub const TRACKLIST_WIDTH: i32 = 420;
+pub const TRACKLIST_ROW_H: i32 = 24;
+const TRACKLIST_HEADER_H: i32 = 28;
+const TRACKLIST_FOOTER_H: i32 = 20;
+const TRACKLIST_MAX_ROWS: usize = 12;
+const TRACKLIST_BG: COLORREF = COLORREF(0x00241E1A);
+const TRACKLIST_SELECTED: COLORREF = COLORREF(0x004A6040);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackListLayout {
+    pub width: i32,
+    pub rows: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TrackListClick {
+    None,
+    Dismiss,
+    Jump(usize),
+}
+
+impl TrackListLayout {
+    pub fn new(count: usize, work_width: i32, work_height: i32) -> Self {
+        let available = ((work_height - TRACKLIST_HEADER_H - TRACKLIST_FOOTER_H) / TRACKLIST_ROW_H).max(1) as usize;
+        Self { width: TRACKLIST_WIDTH.min(work_width.max(1)), rows: count.max(1).min(available).min(TRACKLIST_MAX_ROWS) }
+    }
+
+    pub fn height(self) -> i32 {
+        TRACKLIST_HEADER_H + self.rows as i32 * TRACKLIST_ROW_H + TRACKLIST_FOOTER_H
+    }
+
+    pub fn first(self, count: usize, current: Option<usize>) -> usize {
+        current.unwrap_or(0).saturating_sub(self.rows / 2).min(count.saturating_sub(self.rows))
+    }
+
+    pub fn scroll(self, first: usize, delta: i32, count: usize) -> usize {
+        (first as i128 + delta as i128).clamp(0, count.saturating_sub(self.rows) as i128) as usize
+    }
+
+    pub fn click(self, x: i32, y: i32, first: usize, count: usize) -> TrackListClick {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height() {
+            return TrackListClick::Dismiss;
+        }
+        if y < TRACKLIST_HEADER_H || y >= TRACKLIST_HEADER_H + self.rows as i32 * TRACKLIST_ROW_H {
+            return TrackListClick::None;
+        }
+        let row = ((y - TRACKLIST_HEADER_H) / TRACKLIST_ROW_H) as usize;
+        match first.checked_add(row).filter(|&index| index < count) {
+            Some(index) => TrackListClick::Jump(index + 1),
+            None => TrackListClick::None,
+        }
+    }
+}
+
+pub fn tracklist_position(anchor: RECT, work: RECT, layout: TrackListLayout) -> (i32, i32) {
+    let preferred = if anchor.left - layout.width - 4 >= work.left {
+        anchor.left - layout.width - 4
+    } else { anchor.right + 4 };
+    (preferred.clamp(work.left, (work.right - layout.width).max(work.left)),
+        anchor.top.clamp(work.top, (work.bottom - layout.height()).max(work.top)))
+}
+
+/// Ordinary GDI surface for the temporary opaque, frameless track drawer.
+pub struct TrackListRenderer {
+    font: HFONT,
+    background: HBRUSH,
+    selected: HBRUSH,
+}
+
+impl TrackListRenderer {
+    pub fn new() -> Result<Self> {
+        unsafe {
+            let renderer = Self {
+                font: CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET,
+                    OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                    (DEFAULT_PITCH.0 | FF_SWISS.0) as u32, w!("Segoe UI")),
+                background: CreateSolidBrush(TRACKLIST_BG),
+                selected: CreateSolidBrush(TRACKLIST_SELECTED),
+            };
+            if renderer.font.is_invalid() || renderer.background.is_invalid() || renderer.selected.is_invalid() {
+                return Err(last_error());
+            }
+            Ok(renderer)
+        }
+    }
+
+    pub fn draw(&self, dc: HDC, view: &TrackList, layout: TrackListLayout, first: usize) {
+        unsafe {
+            FillRect(dc, &RECT { left: 0, top: 0, right: layout.width, bottom: layout.height() }, self.background);
+            let old_font = SelectObject(dc, self.font.into());
+            let old_mode = SetBkMode(dc, TRANSPARENT);
+            let old_color = SetTextColor(dc, COLORREF(0x00F0F0F0));
+            let text = |label: &str, top: i32, height: i32| {
+                let mut wide = label.chars().map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>().encode_utf16().collect::<Vec<u16>>();
+                let mut rect = RECT { left: 10, top, right: layout.width - 10, bottom: top + height };
+                DrawTextW(dc, &mut wide, &mut rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            };
+            text(&format!("Tracks ({})", view.titles.len()), 0, TRACKLIST_HEADER_H);
+            if view.titles.is_empty() {
+                text(if view.loading { "Loading playlist…" } else { "No tracks loaded" }, TRACKLIST_HEADER_H, TRACKLIST_ROW_H);
+            }
+            for row in 0..layout.rows {
+                let index = first + row;
+                let Some(title) = view.titles.get(index) else { break; };
+                let top = TRACKLIST_HEADER_H + row as i32 * TRACKLIST_ROW_H;
+                if view.current == Some(index) {
+                    FillRect(dc, &RECT { left: 0, top, right: layout.width, bottom: top + TRACKLIST_ROW_H }, self.selected);
+                }
+                text(&format!("{}. {title}", index + 1), top, TRACKLIST_ROW_H);
+            }
+            if view.titles.len() > layout.rows {
+                text("Scroll to view more", layout.height() - TRACKLIST_FOOTER_H, TRACKLIST_FOOTER_H);
+            }
+            SetTextColor(dc, old_color);
+            SetBkMode(dc, BACKGROUND_MODE(old_mode as u32));
+            SelectObject(dc, old_font);
+        }
+    }
+}
+
+impl Drop for TrackListRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.font.into());
+            let _ = DeleteObject(self.background.into());
+            let _ = DeleteObject(self.selected.into());
+        }
+    }
+}
 
 /// Which clickable status chunk sits under a point?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +476,14 @@ impl Renderer {
         status_toggle_at(x, y, self.eq_top, self.line_h, self.char_w)
     }
 
+    pub fn track_info_at(&self, x: i32, y: i32) -> bool {
+        track_info_at(x, y, self.line_h)
+    }
+
+    pub fn track_info_y(&self) -> i32 {
+        PAD + 2 * self.line_h
+    }
+
     /// Draw all four physical rows explicitly. Rasterize each glyph's exact
     /// Braille mask inside its cell so all six levels stay visibly distinct.
     fn draw_eq_strip(&self, eq: &[f32; EQ_BANDS]) {
@@ -500,6 +644,53 @@ impl Drop for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn track_info_hit_test_only_carves_out_the_third_text_row() {
+        assert!(track_info_at(0, PAD + 2 * 11, 11));
+        assert!(track_info_at(WINDOW_W - 1, PAD + 3 * 11 - 1, 11));
+        assert!(!track_info_at(20, PAD + 2 * 11 - 1, 11));
+        assert!(!track_info_at(20, PAD + 3 * 11, 11));
+        assert!(!track_info_at(-1, PAD + 2 * 11, 11));
+        assert!(!track_info_at(WINDOW_W, PAD + 2 * 11, 11));
+    }
+
+    #[test]
+    fn drawer_scroll_selection_and_outside_dismissal_share_geometry() {
+        let layout = TrackListLayout::new(3100, 1920, 1080);
+        assert_eq!(layout.rows, 12);
+        let first = layout.first(3100, Some(3099));
+        assert_eq!(first, 3088);
+        assert_eq!(layout.click(10, TRACKLIST_HEADER_H + 11 * TRACKLIST_ROW_H + 1, first, 3100), TrackListClick::Jump(3100));
+        assert_eq!(layout.scroll(0, -3, 3100), 0);
+        assert_eq!(layout.scroll(first, 3, 3100), first);
+        for (x, y) in [(-1, 10), (layout.width, 10), (10, -1), (10, layout.height())] {
+            assert_eq!(layout.click(x, y, first, 3100), TrackListClick::Dismiss);
+        }
+        assert_eq!(layout.click(10, 0, 0, 3100), TrackListClick::None);
+        let empty = TrackListLayout::new(0, 1920, 1080);
+        assert_eq!(empty.click(10, TRACKLIST_HEADER_H, 0, 0), TrackListClick::None);
+        let work = RECT { left: -1920, top: -300, right: 0, bottom: 780 };
+        let anchor = RECT { left: -84, top: 740, right: -4, bottom: 780 };
+        let (x, y) = tracklist_position(anchor, work, layout);
+        assert!(x >= work.left && x + layout.width <= work.right);
+        assert!(y >= work.top && y + layout.height() <= work.bottom);
+    }
+
+    #[test]
+    fn gdi_tracklist_highlights_only_the_selected_row() {
+        let canvas = Renderer::new("header\ntime\ntrack\nvolume\neq repeat").unwrap();
+        let renderer = TrackListRenderer::new().unwrap();
+        let layout = TrackListLayout { width: WINDOW_W, rows: 2 };
+        let view = TrackList { titles: vec!["音楽 A".into(), "Song B".into()], current: Some(1), loading: false };
+        renderer.draw(canvas.mem_dc, &view, layout, 0);
+        unsafe {
+            let _ = GdiFlush();
+            use windows::Win32::Graphics::Gdi::GetPixel;
+            assert_eq!(GetPixel(canvas.mem_dc, 2, TRACKLIST_HEADER_H + 2), TRACKLIST_BG);
+            assert_eq!(GetPixel(canvas.mem_dc, 2, TRACKLIST_HEADER_H + TRACKLIST_ROW_H + 2), TRACKLIST_SELECTED);
+        }
+    }
 
     #[test]
     fn braille_progression_matches_spec() {
