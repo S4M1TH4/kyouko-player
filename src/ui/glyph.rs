@@ -1,7 +1,6 @@
 //! The kyouko glyph: a mountain and its echo — computed, never shipped.
 //! Geometry is defined in a 16×16 logical space but can be rendered at any
-//! resolution; the tray icon supersamples at 4× (64×64) for smooth edges,
-//! and the terminal prints the 16×16 view (`icon` command).
+//! resolution; the tray icon supersamples at 4× (64×64) for smooth edges.
 //! Pure math, no platform types.
 
 const APEX_X: f32 = 5.0;
@@ -65,30 +64,4 @@ pub fn glyph_mask_at(size: usize) -> Vec<Vec<bool>> {
         }
     }
     m
-}
-
-/// The 16×16 logical view.
-pub fn glyph_mask() -> [[bool; 16]; 16] {
-    let m = glyph_mask_at(16);
-    let mut out = [[false; 16]; 16];
-    for (y, row) in m.iter().enumerate() {
-        for (x, lit) in row.iter().enumerate() {
-            out[y][x] = *lit;
-        }
-    }
-    out
-}
-
-/// ASCII view of the glyph, row 0 = top (debug: `icon` command).
-pub fn glyph_ascii() -> String {
-    let m = glyph_mask();
-    let mut out = String::with_capacity(16 * 17 + 4);
-    out.push_str("+  kyouko tray glyph  +\n");
-    for row in m {
-        for lit in row {
-            out.push(if lit { '#' } else { '.' });
-        }
-        out.push('\n');
-    }
-    out
 }

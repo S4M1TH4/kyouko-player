@@ -56,7 +56,7 @@ pub fn set_pump_hwnd(hwnd: isize) {
     PUMP_HWND.set(hwnd).ok();
 }
 
-/// stdin thread / tray / Ctrl+C → broker.
+/// window / tray / global hotkeys / debug Ctrl+C → broker.
 pub fn wake_broker() {
     post(WM_APP_BROKER);
 }
@@ -89,7 +89,7 @@ pub fn run(
     audio_out: AudioOut,
 ) {
     // Debug escape hatch: the step-1 headless pump, kept for CI-style runs.
-    if std::env::var_os("KYOUKO_HEADLESS").is_some() {
+    if cfg!(debug_assertions) && std::env::var_os("KYOUKO_HEADLESS").is_some() {
         headless::run(broker, cmd_rx, status_rx, audio_out);
         return;
     }

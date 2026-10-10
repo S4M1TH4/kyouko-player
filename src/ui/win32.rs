@@ -776,7 +776,7 @@ fn popup_menu(s: &UiState) {
     }
 }
 
-/// Window and tray interactions share the terminal's command channel. The
+/// Window, tray, and hotkey interactions share the broker command channel. The
 /// broker stays the single decision point, with one wake per interaction.
 fn post_command(cmd: Command) {
     if let Some(tx) = CMD_TX.get() {
@@ -790,8 +790,8 @@ fn post_command(cmd: Command) {
 // (`CF_UNICODETEXT`, `CF_TEXT`, the URL locator formats) — never as a file
 // list, which is why the old `WM_DROPFILES`/HDROP path never fired for them.
 // Files, folders and `.url` shortcuts still arrive as `CF_HDROP` and remain
-// the fallback. Every payload funnels through the same command channel as
-// the terminal, so the broker stays the single decision point.
+// the fallback. Every payload funnels through the broker command channel,
+// so the broker stays the single decision point.
 //
 // COM discipline: each `GetData` hit is followed by exactly one
 // `ReleaseStgMedium`; `GlobalLock`/`GlobalUnlock` bracket every raw read of
@@ -1206,7 +1206,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_CLOSE => {
                 // Closing the echo hides it; playback continues. Quit is
-                // available through the tray menu, terminal, and console Ctrl+C.
+                // available through the tray menu and debug-console Ctrl+C.
                 let _ = ShowWindow(s.hwnd, SW_HIDE);
                 s.hidden = true;
                 dismiss_tracklist(state);

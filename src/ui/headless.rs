@@ -1,14 +1,37 @@
-//! Cross-platform headless pump — the step-1 event loop, preserved verbatim.
-//! Reached on non-Windows targets and via `KYOUKO_HEADLESS=1` for CI-style
-//! debugging with no window, no tray, no audio device.
+//! Debug/non-Windows headless diagnostics. Windows release builds require
+//! a usable GUI; a failed window initialization shuts down gracefully.
 
+#[cfg(any(not(windows), debug_assertions))]
 use crossbeam_channel::{select, Receiver};
+#[cfg(all(windows, not(debug_assertions)))]
+use crossbeam_channel::Receiver;
 
 use crate::audio::AudioOut;
-use crate::broker::{Broker, Command, Flow, Phase, Status};
+use crate::broker::{Broker, Command, Status};
+#[cfg(any(not(windows), debug_assertions))]
+use crate::broker::{Flow, Phase};
+#[cfg(any(not(windows), debug_assertions))]
 use crate::{log_info, log_warn};
 
 pub fn run(
+    broker: Broker,
+    cmd_rx: Receiver<Command>,
+    status_rx: Receiver<Status>,
+    audio_out: AudioOut,
+) {
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        let mut broker = broker;
+        crate::log_error!("UI", "GUI unavailable — shutting down");
+        broker.handle_command(Command::Quit);
+        drop((cmd_rx, status_rx, audio_out));
+    }
+    #[cfg(any(not(windows), debug_assertions))]
+    run_debug(broker, cmd_rx, status_rx, audio_out);
+}
+
+#[cfg(any(not(windows), debug_assertions))]
+fn run_debug(
     mut broker: Broker,
     cmd_rx: Receiver<Command>,
     status_rx: Receiver<Status>,
@@ -28,8 +51,7 @@ pub fn run(
                     }
                 }
                 Err(_) => {
-                    // All Command senders gone: stdin died and the static
-                    // handle was never claimed. Treat as shutdown.
+                    // All command producers gone: treat as shutdown.
                     log_warn!("UI", "command channel closed — exiting");
                     break;
                 }

@@ -1,11 +1,13 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! kyouko-player — the mountain echo; only heard, never seen.
 //!
 //! # Thread map (the whole program is this picture)
 //!
 //! ```text
 //!                    Command (bounded 32)              DecoderCmd (bounded 8)
-//!   [stdin thread] ─────────────────────────▶ [MAIN / broker] ───────────────▶ [decoder thread]
-//!    blocked in ReadFile, parks on EOF        blocked in GetMessageW*          parked in recv()/select!
+//!   [window / tray / hotkeys] ──────────────▶ [MAIN / broker] ───────────────▶ [decoder thread]
+//!    native Win32 messages                   blocked in GetMessageW*          parked in recv()/select!
 //!                                             owns: window, tray, Stream
 //!                                                    ▲                              │ AudioChunk (bounded 16)
 //!                                                    │ Status (bounded 16)          ▼
@@ -18,11 +20,11 @@
 //!
 //! # Sleep semantics — there is no polling anywhere
 //!
-//! | state   | stdin thread | main/broker            | decoder thread                  | WASAPI callback      |
-//! |---------|--------------|------------------------|---------------------------------|----------------------|
-//! | stopped | parked       | parked in msg loop     | parked in `recv()`              | not running          |
-//! | playing | parked       | parked + 1 Hz WM_TIMER | awake: decode → EQ → push       | ~10 ms event-driven  |
-//! | paused  | parked       | parked, NO timer       | parked (chunk channel is full)  | stopped via pause()  |
+//! | state   | main/broker            | decoder thread                  | WASAPI callback      |
+//! |---------|------------------------|---------------------------------|----------------------|
+//! | stopped | parked in msg loop     | parked in `recv()`              | not running          |
+//! | playing | parked + 1 Hz WM_TIMER | awake: decode → EQ → push       | ~10 ms event-driven  |
+//! | paused  | parked, NO timer       | parked (chunk channel is full)  | stopped via pause()  |
 //!
 //! Every arrow above is a channel send or a Windows message. Zero spinning.
 //!
@@ -36,14 +38,15 @@
 //!
 //! `Quit` → broker sends `DecoderCmd::Shutdown` → decoder kills any yt-dlp
 //! child (never orphaned, network stops) → main joins the decoder → exit.
-//! Ctrl+C / terminal close are intercepted and routed through the same path.
+//! Debug-console Ctrl+C / console close use the same graceful shutdown path.
+//! Release builds are GUI/tray processes with no console or stdin reader.
 
 mod audio;
 mod broker;
 mod config;
 mod logging;
+mod process;
 mod stream_buffer;
-mod terminal;
 mod ui;
 
 use crossbeam_channel::bounded;
@@ -63,7 +66,7 @@ fn main() {
         env!("CARGO_PKG_VERSION")
     );
 
-    #[cfg(windows)]
+    #[cfg(all(windows, debug_assertions))]
     unsafe {
         // Non-ASCII titles must survive the debug log.
         use windows::Win32::System::Console::SetConsoleOutputCP;
@@ -108,12 +111,12 @@ fn main() {
 
     // The four message arteries. Bounded everywhere: a full queue is the
     // scheduler — senders block (park), nobody ever spins.
-    let (cmd_tx, cmd_rx) = bounded::<Command>(32); // terminal, window, and tray icon
+    let (cmd_tx, cmd_rx) = bounded::<Command>(32); // window, tray, hotkeys, and startup
     let (decoder_tx, decoder_rx) = bounded::<DecoderCmd>(8); // broker → decoder
     let (status_tx, status_rx) = bounded::<Status>(16); // decoder → broker
     CMD_TX.set(cmd_tx.clone()).ok();
 
-    // Explicit CLI input takes precedence. Otherwise the broker rebuilds
+    // An explicit startup file/URL takes precedence. Otherwise the broker rebuilds
     // the saved folder queue and stages its last track paused (0% CPU idle).
     if let Some(arg) = std::env::args().nth(1) {
         let source = Source::from_raw(&arg);
@@ -135,7 +138,6 @@ fn main() {
             AudioOut::new(None)
         }
     };
-    let _terminal = terminal::spawn(cmd_tx);
 
     // The kill switch rides along with every Stop/Load/Shutdown so a stalled
     // yt-dlp pipe read can never defer a command or hang shutdown.
@@ -161,13 +163,12 @@ fn main() {
     audio.controls.interrupt();
     let _ = audio.decoder.join();
     log_info!("MAIN", "shutdown complete — echo faded");
-    // Returning from main terminates the parked stdin thread; that is fine.
 }
 
 /// Console control handler: Ctrl+C, Ctrl+Break and terminal-close are turned
 /// into a graceful `Quit` so the decoder can kill its yt-dlp child instead of
 /// leaving a network-reading orphan behind.
-#[cfg(windows)]
+#[cfg(all(windows, debug_assertions))]
 unsafe extern "system" fn on_console_ctrl(ctrl: u32) -> windows::core::BOOL {
     use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT};
     if matches!(ctrl, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {

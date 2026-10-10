@@ -15,7 +15,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering,
 };
 use crossbeam_channel::Sender;
-use std::process::{Command as StdCommand, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::thread::self;
 use std::time::Duration;
@@ -52,7 +52,7 @@ const MEDIA_EXTENSIONS: [&str; 10] =
 /// Something to play. One enum so the decoder owns *all* source handling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
-    /// Path as typed on the terminal (wide-char conversion happens at open).
+    /// Local path (wide-char conversion happens at open).
     File(String),
     /// `format` is a yt-dlp format id; default "140" = m4a 128 kbps.
     /// `playlist_index: Some(n)` marks a playlist-shaped URL playing entry n
@@ -113,37 +113,6 @@ pub fn playlist_index_of(url: &str) -> Option<usize> {
     let has_list = url.contains("list=");
     let is_video = url.contains("watch?v=") || url.contains("youtu.be/");
     (has_list && !is_video).then_some(1)
-}
-
-/// The terminal queue listing: 1-based numbering with an arrow marker on
-/// the currently selected track. Pure so the format is unit-testable; the
-/// broker's ShowQueue arm prints what this returns.
-fn format_queue(queue: &[Source], current: Option<usize>) -> String {
-    if queue.is_empty() {
-        return "no local queue loaded (load a folder with `p <folder>`)".to_string();
-    }
-    let mut out = format!("local queue ({} tracks):
-", queue.len());
-    for (i, source) in queue.iter().enumerate() {
-        let marker = if current == Some(i) { "->" } else { "  " };
-        out.push_str(&format!("{} [{:>2}] {}
-", marker, i + 1, source.display_name()));
-    }
-    out
-}
-
-/// The terminal listing for a resolved YouTube playlist: 1-based numbering
-/// with an arrow marker on the playing entry (1-based playlist index).
-fn format_yt_queue(titles: &[String], current: Option<usize>) -> String {
-    let mut out = format!("youtube playlist ({} videos):
-", titles.len());
-    for (i, title) in titles.iter().enumerate() {
-        let n = i + 1;
-        let marker = if current == Some(n) { "->" } else { "  " };
-        out.push_str(&format!("{} [{:>2}] {}
-", marker, n, title));
-    }
-    out
 }
 
 /// Keep one title per actual playlist index, including multiline titles and
@@ -371,7 +340,7 @@ fn advance_playlist(source: &Source) -> Option<Source> {
     }
 }
 
-/// Input side: terminal, floating window, and tray icon. All of them
+/// Input side: floating window, global hotkeys, and tray icon. All of them
 /// converge here — the broker is the single decision point.
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -382,17 +351,14 @@ pub enum Command {
     /// saved track (or the first entry) paused. Fall back to last_track.
     RestoreState { last_folder: Option<String>, last_track: Option<String>, last_playlist_index: Option<usize> },
     /// Flip between Playing and Paused; restart the retained track when
-    /// Stopped (window/tray clicks + terminal `r`).
+    /// Stopped (window/tray clicks and the pause hotkey).
     TogglePause,
-    /// Jump the playhead by a signed offset in seconds (terminal `.` / `,`).
+    /// Jump the playhead by a signed offset in seconds (window and hotkeys).
     SeekRelative(f64),
     /// Next / previous track: playlist sources step their entry index
     /// (clamped at the start); everything else restarts from 00:00.
     NextTrack,
     PrevTrack,
-    /// Print the active queue (local folder or YouTube playlist) to the
-    /// terminal.
-    ShowQueue,
     /// Load a batch of dropped paths (files and/or folders). The broker
     /// expands folders, filters to supported media, merges and sorts
     /// newest-first into the local queue.
@@ -405,18 +371,16 @@ pub enum Command {
     JumpToTrack(usize),
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
-    /// Terminal `vol` and window wheel (+/-10% steps) all land here.
+    /// Window wheel (+/-10% steps) adjusts the volume through this command.
     SetVolume(f32),
     /// Band gain in dB, clamped to ±12. `None` = all bands.
     EqGain { band: Option<usize>, gain_db: f32 },
-    EqEnabled(bool),
     /// Flip EQ bypass (off = biquads skipped, saved band gains untouched).
     ToggleEq,
     /// Toggle track repeat (mpv `loop-file`): Finished replays the source.
     ToggleLoop,
     /// Show/hide the echo window (handled by the presentation layer).
     ToggleWindow,
-    DumpState,
     Quit,
 }
 
@@ -698,7 +662,7 @@ pub struct Broker {
     /// Paused instead of Playing. Consumed there, cleared on failure.
     stage_paused: bool,
     /// Most recently opened or explicitly jumped-to source — survives
-    /// Stop/Finished and immediately persists a GUI/terminal selection.
+    /// Stop/Finished and immediately persists a GUI selection.
     last_opened_source: Option<Source>,
     /// Active folder context survives queue navigation, Stop, and repeat.
     last_folder: Option<String>,
@@ -956,7 +920,7 @@ impl Broker {
         let spawned = thread::Builder::new()
             .name("kyouko-ytlist".into())
             .spawn(move || {
-                let output = StdCommand::new("yt-dlp")
+                let output = crate::process::command("yt-dlp")
                     .args(["--flat-playlist", "--encoding", "utf-8", "--print",
                         "%(playlist_index)s\t%(title|Unavailable track)j", &url])
                     .stdin(Stdio::null())
@@ -1259,22 +1223,6 @@ impl Broker {
                     self.yt_queue_loading = false;
                 }
             }
-            Command::ShowQueue => {
-                // The queue is broker-owned: the listing prints from this
-                // event loop (the spec's single-owner requirement). An active
-                // YouTube playlist takes precedence over the local queue.
-                if self.yt_queue_url.is_some() {
-                    if self.yt_queue.is_empty() {
-                        println!("YouTube playlist metadata is still loading...");
-                    } else {
-                        let current = self.current_yt_index();
-                        println!("{}", format_yt_queue(&self.yt_queue, current));
-                    }
-                } else {
-                    let current = self.queue_index;
-                    println!("{}", format_queue(&self.local_queue, current));
-                }
-            }
             Command::JumpToTrack(num) => {
                 // A playlist-shaped YouTube current/pending source routes to
                 // the YT listing; everything else uses the local folder queue.
@@ -1398,11 +1346,6 @@ impl Broker {
                 }
                 self.persist();
             }
-            Command::EqEnabled(on) => {
-                self.shared.set_eq_enabled(on);
-                log_info!("BROKER", "eq: {}", if on { "ON" } else { "OFF" });
-                self.refresh();
-            }
             // Bypass only: eq_enabled gates the biquad pass in the decoder;
             // the saved band gains are untouched, so nothing to persist.
             Command::ToggleEq => {
@@ -1422,26 +1365,9 @@ impl Broker {
             Command::ToggleWindow => {
                 log_debug!("BROKER", "window toggle is presentation-side");
             }
-            Command::DumpState => {
-                let s = &self.shared;
-                log_info!(
-                    "BROKER",
-                    "state dump: phase={} generation={} rate={} frames={} pos={} vol={:.2} eq_on={} loop={} gains_cdb={:?}",
-                    s.phase(),
-                    s.generation(),
-                    s.sample_rate.load(Ordering::Relaxed),
-                    s.frames_played.load(Ordering::Relaxed),
-                    fmt_mmss(s.position()),
-                    s.volume(),
-                    s.eq_enabled(),
-                    s.loop_enabled(),
-                    s.eq_gains_cdb.each_ref().map(|g| g.load(Ordering::Relaxed)),
-                );
-                self.refresh(); // re-print the panel with the dump
-            }
             Command::Quit => {
                 log_info!("BROKER", "quit — shutting decoder down (kills yt-dlp child)");
-                self.persist(); // final flush; Ctrl+C / tray / terminal all land here
+                self.persist(); // final flush; tray and debug Ctrl+C land here
                 self.send_decoder(DecoderCmd::Shutdown);
                 self.pending_source = None;
                 self.track = None;
@@ -2283,7 +2209,8 @@ mod tests {
             title: None, duration: None,
         });
         assert_eq!(restarted.shared.phase(), Phase::Paused);
-        assert!(format_queue(&restarted.local_queue, restarted.queue_index).contains("local queue (3 tracks)"));
+        assert_eq!(restarted.track_list().titles.len(), 3);
+        assert_eq!(restarted.track_list().current, restarted.queue_index);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -2492,25 +2419,25 @@ mod tests {
     }
 
     #[test]
-    fn queue_listing_marks_the_current_track() {
-        let queue = vec![
+    fn local_track_list_marks_the_current_track() {
+        let (mut broker, _, _) = broker_with_sink();
+        broker.local_queue = vec![
             Source::File("C:\\album\\01 First.wav".into()),
             Source::File("C:\\album\\02 Second.wav".into()),
             Source::File("C:\\album\\03 Third.wav".into()),
         ];
-        let listing = format_queue(&queue, Some(1));
-        assert!(listing.contains("local queue (3 tracks)"));
-        assert!(listing.contains("  [ 1] 01 First.wav"));
-        assert!(listing.contains("-> [ 2] 02 Second.wav"), "arrow marks current");
-        assert!(listing.contains("  [ 3] 03 Third.wav"));
-        // No selection: no arrows anywhere.
-        assert!(!format_queue(&queue, None).contains("->"));
+        broker.queue_index = Some(1);
+        let listing = broker.track_list();
+        assert_eq!(listing.titles, ["01 First.wav", "02 Second.wav", "03 Third.wav"]);
+        assert_eq!(listing.current, Some(1));
+        broker.queue_index = None;
+        assert_eq!(broker.track_list().current, None);
     }
 
     #[test]
-    fn queue_listing_empty_message() {
-        let listing = format_queue(&[], None);
-        assert!(listing.contains("no local queue loaded"));
+    fn local_track_list_is_empty_without_a_queue() {
+        let (broker, _, _) = broker_with_sink();
+        assert_eq!(broker.track_list(), TrackList::default());
     }
 
     #[test]
@@ -2622,19 +2549,22 @@ mod tests {
     }
 
     #[test]
-    fn yt_queue_listing_marks_the_playing_entry() {
+    fn streaming_track_list_marks_the_playing_entry() {
+        let (mut broker, _, _) = broker_with_sink();
         let titles = vec![
             "Entry One".to_string(),
             "Entry Two".to_string(),
             "Entry Three".to_string(),
         ];
-        // current is the 1-based playlist index of the playing entry.
-        let listing = format_yt_queue(&titles, Some(2));
-        assert!(listing.contains("youtube playlist (3 videos)"));
-        assert!(listing.contains("  [ 1] Entry One"));
-        assert!(listing.contains("-> [ 2] Entry Two"), "arrow marks the playing entry");
-        assert!(listing.contains("  [ 3] Entry Three"));
-        assert!(!format_yt_queue(&titles, None).contains("->"));
+        let url = "https://youtube.com/playlist?list=test".to_string();
+        broker.yt_queue = titles.clone();
+        broker.yt_queue_url = Some(url.clone());
+        broker.last_opened_source = Some(Source::Youtube { url, format: "140".into(), playlist_index: Some(2) });
+        let listing = broker.track_list();
+        assert_eq!(listing.titles, titles);
+        assert_eq!(listing.current, Some(1), "GUI selection is zero-based");
+        broker.last_opened_source = None;
+        assert_eq!(broker.track_list().current, None);
     }
 
     #[test]

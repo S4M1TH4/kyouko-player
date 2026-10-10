@@ -30,7 +30,9 @@
 
 use std::fs::File;
 use std::io::{ErrorKind, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
+#[cfg(test)]
+use std::process::Command;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -553,7 +555,7 @@ fn open_track_inner(
                 "spawning yt-dlp -f {format} (playlist entry {:?})",
                 playlist_index
             );
-            let mut child = Command::new("yt-dlp")
+            let mut child = crate::process::command("yt-dlp")
                 .args(yt_dlp_args(format, *playlist_index, url))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -707,7 +709,7 @@ fn send_chunk(
     }
 }
 
-/// One line, trimmed, control-char-free, capped — terminal titles must never
+/// One line, trimmed, control-char-free, capped — source titles must never
 /// smuggle newlines into the panel renderer.
 fn clean_title(raw: &str) -> String {
     let line = raw.lines().next().unwrap_or("").trim();
@@ -740,7 +742,7 @@ fn fetch_title_blocking(
         None => args.push("--no-playlist".into()),
     }
     args.push(url.into());
-    let mut child = Command::new("yt-dlp")
+    let mut child = crate::process::command("yt-dlp")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
