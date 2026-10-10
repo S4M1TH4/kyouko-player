@@ -369,6 +369,20 @@ struct ChildGuard {
     slot: Arc<Mutex<Option<Child>>>,
 }
 
+impl ChildGuard {
+    /// Pipe EOF can also mean yt-dlp exited with an HTTP/extraction error.
+    /// Inspect without waiting under the lock: Stop/Skip must remain able
+    /// to interrupt a child that is still finishing its output.
+    fn eof_failure(&self) -> Option<String> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_mut()?.try_wait() {
+            Ok(Some(status)) if !status.success() => Some(format!("yt-dlp exited with {status}")),
+            Err(error) => Some(format!("cannot inspect yt-dlp exit: {error}")),
+            _ => None,
+        }
+    }
+}
+
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Ok(mut slot) = self.slot.lock() {
@@ -494,7 +508,6 @@ fn open_track_inner(
         }
     };
 
-    *err_tail_out = None;
     let mut hint = Hint::new();
     if let Source::File(path) = source {
         if let Some(ext) = path.rsplit(['.', '/', '\\']).next() {
@@ -745,7 +758,7 @@ fn play_source(
         Ok(t) => t,
         Err(reason) => {
             log_error!("DECODER", "open failed: {reason}");
-            let _ = status_tx.send(Status::Failed { source, reason });
+            let _ = status_tx.send(Status::Failed { source, reason, generation });
             crate::ui::wake_status();
             return PlayExit::Failed;
         }
@@ -778,6 +791,7 @@ fn play_source(
     let mut bad_packets: u64 = 0;
     let mut opened = false;
     let mut exit = PlayExit::Eof;
+    let mut failure_reason = None;
 
     'play: loop {
         // Command check between packets: the loop only runs while doing real
@@ -823,7 +837,9 @@ fn play_source(
                 break 'play; // natural end — exit stays Eof
             }
             Err(SymphoniaError::ResetRequired) => {
-                log_warn!("DECODER", "stream reset — treating as end of track");
+                log_warn!("DECODER", "stream reset — restarting through failure recovery");
+                failure_reason = Some("stream reset requires a fresh decoder".to_string());
+                exit = PlayExit::Failed;
                 break 'play;
             }
             Err(e) => {
@@ -968,6 +984,16 @@ fn play_source(
         }
     }
 
+    if matches!(exit, PlayExit::Eof) {
+        failure_reason = track._child.as_ref().and_then(ChildGuard::eof_failure)
+            .or_else(|| (!opened).then(|| "source ended without decodable audio".to_string()));
+        if let Some(reason) = &failure_reason {
+            log_error!("DECODER", "playback failed: {reason}");
+            track.log_child_stderr();
+            exit = PlayExit::Failed;
+        }
+    }
+
     // EOF: flush the short tail chunk so nothing is lost, then wait for the
     // output callback to hand everything to the device before Finished.
     if matches!(exit, PlayExit::Eof) && !pending.is_empty() && pending.len() < chunk_samples {
@@ -987,8 +1013,6 @@ fn play_source(
             SendOutcome::SinkGone => exit = PlayExit::SinkGone,
         }
     }
-    drop(track); // kills + reaps any yt-dlp child on every path
-
     match exit {
         PlayExit::Eof => {
             // Clear signals emitted before EOF (the callback reports "drained"
@@ -998,6 +1022,17 @@ fn play_source(
                 select! {
                     recv(drained_rx) -> g => match g {
                         Ok(g) if g == generation => {
+                            // A child may close stdout just before its exit
+                            // code becomes available. Check again after the
+                            // buffered tail drains rather than reporting a
+                            // failed HTTP stream as successful completion.
+                            if let Some(reason) = track._child.as_ref().and_then(ChildGuard::eof_failure) {
+                                track.log_child_stderr();
+                                drop(track);
+                                let _ = status_tx.send(Status::Failed { source, reason, generation });
+                                crate::ui::wake_status();
+                                return PlayExit::Failed;
+                            }
                             let _ = status_tx.send(Status::Finished);
                             crate::ui::wake_status();
                             return PlayExit::Eof;
@@ -1015,7 +1050,9 @@ fn play_source(
             }
         }
         PlayExit::Failed => {
-            let _ = status_tx.send(Status::Failed { source, reason: "decode failed".into() });
+            let reason = failure_reason.unwrap_or_else(|| "decode failed".into());
+            drop(track); // reap the old child before the broker can retry
+            let _ = status_tx.send(Status::Failed { source, reason, generation });
             crate::ui::wake_status();
             PlayExit::Failed
         }
@@ -1245,6 +1282,88 @@ mod tests {
         let i = third.iter().position(|a| a == "--playlist-items").unwrap();
         assert_eq!(third[i + 1], "3");
         assert_eq!(third.last().unwrap(), "u");
+    }
+
+    #[test]
+    fn real_decoder_failures_retry_twice_per_track_then_exhaust_queue() {
+        use crate::broker::{Broker, Command as PlayerCommand, DecoderLink, Phase};
+        let dir = std::env::temp_dir().join(format!("kyouko-retry-{}-decoder", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("invalid.mp3"), b"not audio").unwrap();
+        // A valid PCM WAV header with no samples must report failure instead
+        // of waiting for an audio callback that never started.
+        let mut wav = b"RIFF".to_vec();
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&96_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(dir.join("empty.wav"), wav).unwrap();
+
+        let shared = SharedState::new();
+        let (cmd_tx, cmd_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let (chunk_tx, _chunk_rx) = bounded(16);
+        let (_drained_tx, drained_rx) = bounded(2);
+        let child_slot = Arc::new(Mutex::new(None));
+        let decoder_shared = shared.clone();
+        let decoder = thread::spawn(move || {
+            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, child_slot);
+        });
+        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
+            cmd_tx.clone(), Arc::new(|| {}),
+        ));
+        broker.handle_command(PlayerCommand::Load {
+            source: Source::File(dir.to_string_lossy().into_owned()), paused: false,
+        });
+        let mut attempts = std::collections::HashMap::new();
+        let mut reasons = Vec::new();
+        let result = (|| -> Result<(), String> {
+            for _ in 0..4 {
+                let status = status_rx.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
+                if let Status::Failed { source, reason, .. } = &status {
+                    *attempts.entry(source.raw().to_string()).or_insert(0usize) += 1;
+                    reasons.push(reason.clone());
+                } else {
+                    return Err(format!("expected failure, got {status:?}"));
+                }
+                broker.handle_status(status);
+            }
+            Ok(())
+        })();
+        cmd_tx.send(DecoderCmd::Shutdown).unwrap();
+        decoder.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        result.unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts.values().all(|&count| count == 2));
+        assert_eq!(shared.phase(), Phase::Stopped);
+        assert!(status_rx.try_recv().is_err(), "no additional failures after queue exhaustion");
+        assert!(reasons.iter().any(|r| r.contains("without decodable audio")));
+    }
+
+    #[test]
+    fn child_guard_detects_unsuccessful_stream_exit() {
+        for code in [0, 7] {
+            #[cfg(windows)]
+            let mut child = Command::new("cmd.exe").args(["/C", &format!("exit {code}")])
+                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            #[cfg(not(windows))]
+            let mut child = Command::new("sh").args(["-c", &format!("exit {code}")])
+                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            child.wait().unwrap();
+            let slot = Arc::new(Mutex::new(Some(child)));
+            let guard = ChildGuard { slot: slot.clone() };
+            assert_eq!(guard.eof_failure().is_some(), code != 0);
+            drop(guard);
+            assert!(slot.lock().unwrap().is_none());
+        }
     }
 
     #[test]

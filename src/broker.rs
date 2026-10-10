@@ -50,7 +50,7 @@ const MEDIA_EXTENSIONS: [&str; 10] =
 // ── Message vocabulary ───────────────────────────────────────────────────────
 
 /// Something to play. One enum so the decoder owns *all* source handling.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     /// Path as typed on the terminal (wide-char conversion happens at open).
     File(String),
@@ -437,7 +437,9 @@ pub enum Status {
     Seeked,
     /// Natural end of stream (not Stop).
     Finished,
-    Failed { source: Source, reason: String },
+    /// Generation identifies the failed attempt, so obsolete failures after
+    /// Stop/Skip/retry cannot restart playback or consume the retry budget.
+    Failed { source: Source, reason: String, generation: u64 },
 }
 
 /// Playback phase. Stored as `u8` in `SharedState`.
@@ -680,6 +682,12 @@ pub struct Broker {
     /// The source a LOADING load will open (no track exists yet) — lets
     /// navigation work while metadata/probe is still in flight.
     pending_source: Option<Source>,
+    /// One automatic retry for the current load, including failures after
+    /// Opened. Only a fresh track load resets this budget.
+    retry_used: bool,
+    /// When streaming playlist length is unavailable, allow one following
+    /// entry after double failure, then stop if that entry also fails twice.
+    failed_playlist_probe: bool,
     /// Local folder queue (shallow scan, newest first) + position. A single
     /// file load becomes a one-entry queue; a YouTube load clears it.
     local_queue: Vec<Source>,
@@ -707,6 +715,8 @@ impl Broker {
             last_opened_source: None,
             last_folder: None,
             pending_source: None,
+            retry_used: false,
+            failed_playlist_probe: false,
             local_queue: Vec::new(),
             queue_index: None,
             yt_queue: Vec::new(),
@@ -782,6 +792,13 @@ impl Broker {
     /// The common load tail - everything a Load does once queue management
     /// has settled which source to open.
     fn begin_load(&mut self, source: Source, paused: bool) {
+        self.retry_used = false;
+        self.start_attempt(source, paused);
+    }
+
+    /// Retry uses the same load tail without resetting its per-track budget
+    /// or re-running queue ingestion.
+    fn start_attempt(&mut self, source: Source, paused: bool) {
         log_info!(
             "BROKER",
             "load{}: {source}",
@@ -794,6 +811,54 @@ impl Broker {
         self.shared.bump_generation();
         self.set_phase(Phase::Loading, "load requested");
         self.send_decoder(DecoderCmd::Load(source));
+    }
+
+    fn playback_failed(&mut self, source: Source, reason: String, generation: u64) {
+        let current = self.pending_source.as_ref()
+            .or_else(|| self.track.as_ref().map(|track| &track.source));
+        if generation != self.shared.generation() || current != Some(&source)
+            || self.shared.phase() == Phase::Stopped
+        {
+            log_debug!("BROKER", "obsolete failure ignored: {source} (generation {generation})");
+            return;
+        }
+        let paused = self.stage_paused || self.shared.phase() == Phase::Paused;
+        if !self.retry_used {
+            log_warn!("BROKER", "playback failed: {source}: {reason}; retrying (attempt 2/2)");
+            self.retry_used = true;
+            self.start_attempt(source, paused);
+            return;
+        }
+        log_error!("BROKER", "playback failed after 2 attempts: {source}: {reason}; skipping track");
+        // Keep the failed source pending until NextTrack has selected its
+        // successor; clearing it first loses streaming playlist position.
+        self.track = None;
+        self.pending_source = Some(source.clone());
+        self.stage_paused = false;
+        self.shared.reset_playhead();
+        let has_next = if let Some(index) = self.queue_index {
+            index + 1 < self.local_queue.len()
+        } else if let Source::Youtube { playlist_index: Some(index), .. } = &source {
+            if !self.yt_queue.is_empty() {
+                *index < self.yt_queue.len()
+            } else if !self.failed_playlist_probe {
+                self.failed_playlist_probe = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if has_next {
+            self.handle_command(Command::NextTrack);
+            // A restored or manually paused track must not autoplay its
+            // successor when failure handling advances the queue.
+            self.stage_paused = paused;
+        } else {
+            log_info!("BROKER", "no next playable queue entry — stopping after failure");
+            self.handle_command(Command::Stop);
+        }
     }
 
     /// Load a track straight from the local folder queue WITHOUT re-running
@@ -907,6 +972,11 @@ impl Broker {
         };
         // YouTube playlist: step the entry index.
         if let Source::Youtube { url, format, playlist_index: Some(n) } = &current {
+            if dir > 0 && !self.yt_queue.is_empty() && *n >= self.yt_queue.len() {
+                log_info!("BROKER", "navigate: end of streaming playlist — stopping");
+                self.handle_command(Command::Stop);
+                return;
+            }
             let next = if dir > 0 { n + 1 } else { (*n).saturating_sub(1).max(1) };
             log_info!(
                 "BROKER",
@@ -920,29 +990,7 @@ impl Broker {
                 format: format.clone(),
                 playlist_index: Some(next),
             };
-            self.handle_command(Command::Load { source: target, paused: false });
-            return;
-        }
-        // Local folder queue: step the file index; Next past the end stops
-        // gracefully, Prev at the start restarts the first file.
-        if !self.local_queue.is_empty() {
-            let idx = self.queue_index.unwrap_or(0);
-            let last = self.local_queue.len() - 1;
-            let next_i = (idx as i32 + dir).clamp(0, last as i32) as usize;
-            if dir > 0 && next_i == idx && idx == last {
-                log_info!("BROKER", "navigate: end of folder queue — stopping");
-                self.handle_command(Command::Stop);
-                return;
-            }
-            log_info!(
-                "BROKER",
-                "navigate {}: folder track {} -> {} (of {})",
-                if dir > 0 { "next" } else { "prev" },
-                idx,
-                next_i,
-                last
-            );
-            self.load_queue_track(next_i);
+            self.begin_load(target, false);
             return;
         }
         // No playlist, no queue: restart the current track.
@@ -1003,6 +1051,7 @@ impl Broker {
                         });
                     }
                     DroppedBatch::Media(batch) if !batch.files.is_empty() => {
+                        self.failed_playlist_probe = false;
                         log_info!(
                             "BROKER",
                             "drop queue: {} media files (newest first)",
@@ -1121,6 +1170,7 @@ impl Broker {
                         }
                     }
                 }
+                self.failed_playlist_probe = false;
                 self.begin_load(source, paused);
             }
             Command::SeekRelative(delta) => {
@@ -1227,6 +1277,7 @@ impl Broker {
                 Phase::Playing => self.set_phase(Phase::Paused, "toggle"),
                 Phase::Paused => self.set_phase(Phase::Playing, "toggle"),
                 Phase::Stopped => {
+                    self.failed_playlist_probe = false;
                     if let Some(index) = self.queue_index.filter(|&i| i < self.local_queue.len()) {
                         log_info!("BROKER", "restart: selected local track {}", index + 1);
                         self.load_queue_track(index);
@@ -1242,7 +1293,9 @@ impl Broker {
             Command::Stop => {
                 log_info!("BROKER", "stop");
                 self.send_decoder(DecoderCmd::Stop);
+                self.shared.bump_generation();
                 self.pending_source = None;
+                self.stage_paused = false;
                 self.track = None;
                 self.shared.reset_playhead();
                 self.set_phase(Phase::Stopped, "stop");
@@ -1319,6 +1372,8 @@ impl Broker {
                 log_info!("BROKER", "quit — shutting decoder down (kills yt-dlp child)");
                 self.persist(); // final flush; Ctrl+C / tray / terminal all land here
                 self.send_decoder(DecoderCmd::Shutdown);
+                self.pending_source = None;
+                self.track = None;
                 self.set_phase(Phase::Stopped, "quit");
                 return Flow::Exit;
             }
@@ -1363,6 +1418,7 @@ impl Broker {
                 self.persist();
             }
             Status::Finished => {
+                self.failed_playlist_probe = false;
                 // 1. mpv loop-file: replay the exact source (preserving a
                 //    custom YouTube format id when the track carries one).
                 let replay = self.shared.loop_enabled().then(|| {
@@ -1385,7 +1441,7 @@ impl Broker {
                     self.track.as_ref().map(|t| t.source.clone()).and_then(|src| advance_playlist(&src))
                 {
                     log_info!("BROKER", "playlist: advancing to entry {:?}", source);
-                    self.handle_command(Command::Load { source, paused: false });
+                    self.handle_command(Command::NextTrack);
                     return;
                 }
                 // Local folder queue: play the next file, if any.
@@ -1411,13 +1467,8 @@ impl Broker {
                 // is not running).
                 self.refresh();
             }
-            Status::Failed { source, reason } => {
-                log_error!("BROKER", "failed to open {source}: {reason}");
-                self.stage_paused = false;
-                self.pending_source = None;
-                self.track = None;
-                self.shared.reset_playhead();
-                self.set_phase(Phase::Stopped, "load failed");
+            Status::Failed { source, reason, generation } => {
+                self.playback_failed(source, reason, generation);
             }
         }
         self.refresh();
@@ -1542,6 +1593,179 @@ mod tests {
         });
     }
 
+    fn fail(broker: &mut Broker, source: &Source) {
+        broker.handle_status(Status::Failed {
+            source: source.clone(), reason: "simulated playback failure".into(),
+            generation: broker.shared.generation(),
+        });
+    }
+
+    fn assert_load(rx: &crossbeam_channel::Receiver<DecoderCmd>, expected: &Source) {
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(source)) if source == *expected));
+    }
+
+    #[test]
+    fn failure_retry_success_keeps_budget_until_next_track() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let first = Source::File("first.mp3".into());
+        let next = Source::File("next.mp3".into());
+        broker.local_queue = vec![first.clone(), next.clone()];
+        broker.last_folder = Some("folder context".into());
+        broker.load_queue_track(0);
+        assert_load(&rx, &first);
+        fail(&mut broker, &first);
+        assert_load(&rx, &first);
+        assert!(broker.retry_used);
+        assert_eq!(broker.queue_index, Some(0));
+        broker.handle_status(Status::Opened {
+            source: first.clone(), sample_rate: 48_000, channels: 2,
+            title: None, duration: None,
+        });
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        assert!(broker.retry_used, "Opened must not allow unlimited stream-drop retries");
+        fail(&mut broker, &first);
+        assert_load(&rx, &next);
+        assert_eq!(broker.local_queue.len(), 2);
+        assert_eq!(broker.queue_index, Some(1));
+        assert_eq!(broker.last_folder.as_deref(), Some("folder context"));
+        assert!(!broker.retry_used, "a different queue track receives a fresh budget");
+        fail(&mut broker, &next);
+        assert_load(&rx, &next);
+        fail(&mut broker, &next);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn streaming_double_failure_advances_with_exact_format_and_index() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let first = Source::Youtube {
+            url: "https://youtube.com/playlist?list=test".into(),
+            format: "custom-format".into(), playlist_index: Some(2),
+        };
+        broker.yt_queue_url = Some(first.raw().into());
+        broker.yt_queue = vec!["one".into(), "two".into(), "three".into()];
+        broker.begin_load(first.clone(), false);
+        assert_load(&rx, &first);
+        fail(&mut broker, &first);
+        assert_load(&rx, &first);
+        fail(&mut broker, &first);
+        let next = advance_playlist(&first).unwrap();
+        assert_load(&rx, &next);
+        assert_eq!(broker.current_yt_index(), Some(3));
+        assert!(!broker.retry_used);
+        assert_eq!(broker.yt_queue.len(), 3);
+        fail(&mut broker, &next);
+        assert_load(&rx, &next);
+        fail(&mut broker, &next);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        assert!(rx.try_recv().is_err(), "end of playlist must not request a nonexistent entry");
+    }
+
+    #[test]
+    fn standalone_double_failure_stops_even_with_repeat_enabled() {
+        for source in [Source::File("missing.mp3".into()), Source::from_raw("https://youtu.be/unavailable")] {
+            let (mut broker, _, rx) = broker_with_sink();
+            broker.shared.set_loop_enabled(true);
+            broker.handle_command(Command::Load { source: source.clone(), paused: false });
+            assert_load(&rx, &source);
+            fail(&mut broker, &source);
+            assert_load(&rx, &source);
+            fail(&mut broker, &source);
+            assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+            assert_eq!(broker.shared.phase(), Phase::Stopped);
+            // Repeated/delayed notifications cannot restart an exhausted load.
+            fail(&mut broker, &source);
+            assert!(rx.try_recv().is_err());
+            broker.handle_command(Command::Load { source: source.clone(), paused: false });
+            assert_load(&rx, &source);
+            fail(&mut broker, &source);
+            assert_load(&rx, &source);
+        }
+    }
+
+    #[test]
+    fn failure_advancement_preserves_paused_playback_intent() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let first = Source::File("first.mp3".into());
+        let next = Source::File("next.mp3".into());
+        broker.local_queue = vec![first.clone(), next.clone()];
+        broker.queue_index = Some(0);
+        broker.begin_load(first.clone(), true);
+        assert_load(&rx, &first);
+        fail(&mut broker, &first);
+        assert_load(&rx, &first);
+        assert!(broker.stage_paused);
+        broker.handle_status(Status::Opened {
+            source: first.clone(), sample_rate: 48_000, channels: 2,
+            title: None, duration: None,
+        });
+        assert_eq!(broker.shared.phase(), Phase::Paused);
+        fail(&mut broker, &first);
+        assert_load(&rx, &next);
+        assert!(broker.stage_paused);
+        broker.handle_status(Status::Opened {
+            source: next, sample_rate: 48_000, channels: 2,
+            title: None, duration: None,
+        });
+        assert_eq!(broker.shared.phase(), Phase::Paused);
+    }
+
+    #[test]
+    fn obsolete_failures_after_retry_stop_or_new_load_are_ignored() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let source = Source::File("same.mp3".into());
+        broker.handle_command(Command::Load { source: source.clone(), paused: false });
+        assert_load(&rx, &source);
+        let obsolete_generation = broker.shared.generation();
+        fail(&mut broker, &source);
+        assert_load(&rx, &source);
+        broker.handle_status(Status::Failed {
+            source: source.clone(), reason: "late first-attempt error".into(), generation: obsolete_generation,
+        });
+        assert!(rx.try_recv().is_err());
+        assert!(broker.retry_used);
+        broker.handle_command(Command::Stop);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        fail(&mut broker, &source);
+        assert!(rx.try_recv().is_err());
+        broker.handle_command(Command::Load { source: source.clone(), paused: false });
+        assert_load(&rx, &source);
+        broker.handle_status(Status::Failed {
+            source: source.clone(), reason: "late older load".into(), generation: obsolete_generation,
+        });
+        assert!(rx.try_recv().is_err());
+        assert!(!broker.retry_used);
+        // Even a current-generation error for another source is obsolete.
+        fail(&mut broker, &Source::File("other.mp3".into()));
+        assert!(!broker.retry_used);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unknown_streaming_playlist_bounds_failure_advancement() {
+        let (mut broker, _, rx) = broker_with_sink();
+        let source = Source::Youtube {
+            url: "https://youtube.com/playlist?list=unresolved".into(),
+            format: "140".into(), playlist_index: Some(1),
+        };
+        broker.begin_load(source.clone(), false);
+        assert_load(&rx, &source);
+        fail(&mut broker, &source);
+        assert_load(&rx, &source);
+        fail(&mut broker, &source);
+        let next = advance_playlist(&source).unwrap();
+        assert_load(&rx, &next);
+        fail(&mut broker, &next);
+        assert_load(&rx, &next);
+        fail(&mut broker, &next);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        assert!(rx.try_recv().is_err(), "unavailable metadata must not enumerate forever");
+    }
+
     #[test]
     fn staged_load_opens_paused_and_clears_on_failure() {
         let (mut broker, _, _rx) = broker_with_sink();
@@ -1555,7 +1779,10 @@ mod tests {
         broker.handle_status(Status::Failed {
             source: Source::File("nowhere.mp3".into()),
             reason: "test".into(),
+            generation: broker.shared.generation(),
         });
+        assert!(broker.stage_paused, "retry retains startup's paused intent");
+        fail(&mut broker, &Source::File("nowhere.mp3".into()));
         assert!(!broker.stage_paused);
         assert_eq!(broker.shared.phase(), Phase::Stopped);
     }
@@ -1796,13 +2023,12 @@ mod tests {
                 source: source.clone(), sample_rate: 48_000, channels: 2,
                 title: None, duration: None,
             });
+            if playlist_index.is_some() {
+                broker.yt_queue = vec!["one".into(), "two".into(), "three".into()];
+            }
             broker.handle_status(Status::Finished);
             if playlist_index.is_some() {
-                // The end-of-playlist probe can fail when no next entry exists.
-                let Ok(DecoderCmd::Load(next)) = rx.try_recv() else {
-                    panic!("expected playlist advance");
-                };
-                broker.handle_status(Status::Failed { source: next, reason: "playlist ended".into() });
+                assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
             }
             assert_eq!(broker.shared.phase(), Phase::Stopped);
             broker.handle_command(Command::TogglePause);
