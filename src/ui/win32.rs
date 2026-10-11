@@ -6,6 +6,7 @@
 //! Wake-up routing (`WM_APP`):
 //! * `WM_APP_BROKER` (0x8001) — a Command is waiting in `cmd_rx`
 //! * `WM_APP_STATUS` (0x8002) — a Status is waiting in `status_rx`
+//! * `WM_APP_OUTPUT` (0x8003) — CPAL error or endpoint notification
 //!
 //! Timer discipline: the 1 Hz panel timer exists **only** while `Playing`.
 //! Pause/Stop kill it, so a paused player has zero scheduled wake-ups — the
@@ -61,7 +62,7 @@ use crate::audio::AudioOut;
 
 use super::render::{Renderer,
     TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position};
-use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS};
+use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_OUTPUT};
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status, TrackList};
 use crate::{log_debug, log_error, log_info, log_warn};
 
@@ -254,7 +255,7 @@ pub fn run(
     broker: Broker,
     cmd_rx: Receiver<Command>,
     status_rx: Receiver<Status>,
-    audio_out: AudioOut,
+    mut audio_out: AudioOut,
 ) {
     let shared = broker.shared();
 
@@ -310,6 +311,7 @@ pub fn run(
     if let Err(e) = &ole {
         log_warn!("UI", "OleInitialize failed: {e} — drag-and-drop unavailable");
     }
+    audio_out.start_notifications();
     // Kept alive past the pump: the window's registration holds a reference
     // that WM_DESTROY revokes; this local releases the last one afterwards.
     let drop_target: IDropTarget = DropTarget::new().into();
@@ -653,6 +655,7 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
 /// Everything the pure core can't know about: timer lifecycle + repaint.
 /// Called after every burst of broker activity.
 fn sync(s: &mut UiState) {
+    s.audio_out.handle_device_events(&mut s.broker);
     let phase = s.shared.phase();
     if phase != s.last_phase {
         // WASAPI follows the phase: running while Playing, stopped otherwise.
@@ -1038,6 +1041,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_APP_STATUS => {
                 drain_statuses(s);
+                sync(s);
+                LRESULT(0)
+            }
+            WM_APP_OUTPUT => {
                 sync(s);
                 LRESULT(0)
             }

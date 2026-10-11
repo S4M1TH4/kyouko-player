@@ -35,13 +35,13 @@ use std::process::{Child, Stdio};
 #[cfg(test)]
 use std::process::Command;
 use std::sync::{Arc, Mutex, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, select, Receiver, Sender, TryRecvError, TrySendError};
 
-use symphonia::core::audio::SampleBuffer;
+use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatReader, Packet, SeekMode, SeekTo, Track};
@@ -52,7 +52,7 @@ use symphonia::core::units::{Time, TimeBase};
 use symphonia::default::get_probe;
 
 use crate::broker::{
-    DecoderCmd, SharedState, Source, Status, CHUNK_FRAMES, EQ_BANDS,
+    Broker, DecoderCmd, SharedState, Source, Status, CHUNK_FRAMES, EQ_BANDS,
     EQ_BAND_HZ,
 };
 use crate::log_error;
@@ -85,6 +85,7 @@ struct BufferState {
     ready_generation: AtomicU64,
     eof_generation: AtomicU64,
     underrun_frames: AtomicU64,
+    rendered_frames: AtomicU64,
 }
 
 /// A fixed pool travels through two bounded rings. Only the decoder fills
@@ -100,6 +101,7 @@ struct ChunkSender {
     priming: Cell<(u64, usize)>,
 }
 
+#[derive(Clone)]
 pub struct ChunkReceiver {
     queue: Receiver<AudioChunk>,
     recycle: Sender<AudioChunk>,
@@ -124,6 +126,7 @@ fn chunk_channel(rate: u32, channels: usize, depth: usize) -> (ChunkSender, Chun
         ready_generation: AtomicU64::new(u64::MAX),
         eof_generation: AtomicU64::new(u64::MAX),
         underrun_frames: AtomicU64::new(0),
+        rendered_frames: AtomicU64::new(0),
     });
     (ChunkSender {
         ready, discard: queue.clone(), free: free.clone(), recycle: recycle.clone(), sink_gone,
@@ -174,11 +177,30 @@ fn recycle(sender: &Sender<AudioChunk>, chunk: AudioChunk) {
 pub struct AudioControls {
     child_slot: Arc<Mutex<Option<Child>>>,
     buffer_slot: BufferSlot,
+    output_slot: OutputSlot,
 }
 
 type BufferSlot = Arc<Mutex<Option<Weak<StreamBuffer>>>>;
+type OutputSlot = Arc<Mutex<Option<OutputReplacement>>>;
+
+struct OutputReplacement {
+    sender: ChunkSender,
+    // Keep the retired consumer alive until the decoder acknowledges the swap.
+    // Otherwise sink disconnection can terminate the decoder during recovery.
+    retired: ChunkReceiver,
+    epoch: u64,
+}
 
 impl AudioControls {
+    fn replace_output(&self, mut replacement: OutputReplacement) {
+        let mut slot = self.output_slot.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(previous) = slot.take() {
+            // Rapid notifications coalesce to the latest pool, while retaining
+            // the original consumer of the still-running producer.
+            replacement.retired = previous.retired;
+        }
+        *slot = Some(replacement);
+    }
     /// Kill the active yt-dlp child, if any. Safe to call any time; it is a
     /// no-op while playing local files. Idempotent.
     pub fn interrupt(&self) {
@@ -220,15 +242,17 @@ pub fn spawn(
     let (drained_tx, drained_rx) = bounded::<u64>(4);
     let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let buffer_slot: BufferSlot = Arc::new(Mutex::new(None));
+    let output_slot: OutputSlot = Arc::new(Mutex::new(None));
     let decoder = thread::Builder::new()
         .name("kyouko-decoder".into())
         .spawn({
             let child_slot = Arc::clone(&child_slot);
             let buffer_slot = buffer_slot.clone();
-            move || run_decoder(shared, cmds, status_tx, chunk_tx, drained_rx, child_slot, buffer_slot)
+            let output_slot = output_slot.clone();
+            move || run_decoder(shared, cmds, status_tx, chunk_tx, drained_rx, child_slot, buffer_slot, output_slot)
         })
         .expect("spawn decoder thread");
-    AudioHandles { chunk_rx, drained_tx, decoder, controls: AudioControls { child_slot, buffer_slot } }
+    AudioHandles { chunk_rx, drained_tx, decoder, controls: AudioControls { child_slot, buffer_slot, output_slot } }
 }
 
 // ── Output stream (owned by the main thread; WASAPI event-driven) ───────────
@@ -239,15 +263,207 @@ pub fn spawn(
 pub struct AudioOut {
     stream: Option<cpal::Stream>,
     playing: bool,
+    signals: Arc<OutputSignals>,
+    receiver: Option<ChunkReceiver>,
+    drained: Option<Sender<u64>>,
+    shared: Option<Arc<SharedState>>,
+    controls: Option<AudioControls>,
+    key: Option<OutputKey>,
+    error_recovery_used: bool,
+    #[cfg(windows)]
+    notifications: Option<crate::audio_device::DeviceNotifications>,
+}
+
+/// Error/COM callbacks only latch events and wake the owner. Epoch-qualified
+/// CAS rejects callbacks from retired streams; the mailbox is bounded to one.
+pub(crate) struct OutputSignals {
+    stream_state: AtomicU64, // even stream epoch, low bit = failed
+    consumed_failure: AtomicU64,
+    changed: AtomicBool,
+    endpoint_changed: AtomicBool,
+    endpoint_hash: AtomicU64,
+    wake: Sender<()>,
+    events: Receiver<()>,
+}
+
+impl OutputSignals {
+    pub(crate) fn new() -> Arc<Self> {
+        let (wake, events) = bounded(1);
+        Arc::new(Self { stream_state: AtomicU64::new(2), consumed_failure: AtomicU64::new(0),
+            changed: AtomicBool::new(false), endpoint_changed: AtomicBool::new(false),
+            endpoint_hash: AtomicU64::new(0), wake, events })
+    }
+
+    fn notify(&self) {
+        let _ = self.wake.try_send(());
+        crate::ui::wake_output();
+    }
+
+    pub(crate) fn device_changed(&self) {
+        if !self.changed.swap(true, Ordering::AcqRel) { self.notify(); }
+    }
+
+    pub(crate) fn endpoint_changed(&self) {
+        self.endpoint_changed.store(true, Ordering::Release);
+        self.device_changed();
+    }
+
+    pub(crate) fn set_endpoint(&self, endpoint: &str) {
+        self.endpoint_hash.store(endpoint_hash(endpoint.encode_utf16()), Ordering::Release);
+    }
+
+    pub(crate) fn is_current_endpoint(&self, hash: u64) -> bool {
+        hash != 0 && hash == self.endpoint_hash.load(Ordering::Acquire)
+    }
+
+    fn stream_error(&self, epoch: u64, error: &cpal::Error) {
+        if self.stream_state.load(Ordering::Acquire) & !1 != epoch { return; }
+        match error.kind() {
+            cpal::ErrorKind::DeviceChanged => { self.device_changed(); return; }
+            cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied => return,
+            _ => {}
+        }
+        if self.stream_state.compare_exchange(epoch, epoch | 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            log_warn!("AUDIO", "output stream invalidated: {error}");
+            self.notify();
+        }
+    }
+
+    fn next_epoch(&self) -> u64 {
+        let previous = self.stream_state.try_update(Ordering::AcqRel, Ordering::Relaxed,
+            |state| Some((state & !1).wrapping_add(2))).unwrap();
+        (previous & !1).wrapping_add(2)
+    }
+
+    pub(crate) fn take(&self) -> (bool, bool, bool) {
+        while self.events.try_recv().is_ok() {}
+        let changed = self.changed.swap(false, Ordering::AcqRel);
+        let state = self.stream_state.load(Ordering::Acquire);
+        let failed = state & 1 != 0 && self.consumed_failure.swap(state & !1, Ordering::AcqRel) != state & !1;
+        (changed, failed, self.endpoint_changed.swap(false, Ordering::AcqRel))
+    }
+}
+
+pub(crate) fn endpoint_hash(id: impl Iterator<Item = u16>) -> u64 {
+    id.fold(0xcbf29ce484222325, |hash, code| (hash ^ code as u64).wrapping_mul(0x100000001b3))
+}
+
+#[derive(PartialEq)]
+struct OutputKey {
+    endpoint: String,
+    rate: u32,
+    channels: u16,
+    format: cpal::SampleFormat,
+}
+
+impl OutputKey {
+    fn new(device: &cpal::Device, config: &cpal::SupportedStreamConfig) -> Self {
+        use cpal::traits::DeviceTrait;
+        #[cfg(windows)]
+        let endpoint = crate::audio_device::default_device_id().ok();
+        #[cfg(not(windows))]
+        let endpoint: Option<String> = None;
+        Self { endpoint: endpoint.unwrap_or_else(|| device.description().map(|description| description.name().to_owned()).unwrap_or_default()),
+            rate: config.sample_rate(), channels: config.channels(), format: config.sample_format() }
+    }
 }
 
 impl AudioOut {
     pub fn new(stream: Option<cpal::Stream>) -> Self {
-        Self { stream, playing: false }
+        Self { stream, playing: false, signals: OutputSignals::new(), receiver: None, drained: None,
+            shared: None, controls: None, key: None, error_recovery_used: false,
+            #[cfg(windows)] notifications: None }
+    }
+
+    pub fn managed(device: Result<(cpal::Device, cpal::SupportedStreamConfig), String>,
+        receiver: ChunkReceiver, drained: Sender<u64>, shared: Arc<SharedState>, controls: AudioControls) -> Self {
+        let mut output = Self::new(None);
+        let epoch = output.signals.stream_state.load(Ordering::Relaxed);
+        let stream = device.and_then(|(device, config)| {
+            output.key = Some(OutputKey::new(&device, &config));
+            output.signals.set_endpoint(&output.key.as_ref().unwrap().endpoint);
+            build_output_stream(device, config, receiver.clone(), drained.clone(), shared.clone(), output.signals.clone(), epoch)
+        });
+        match stream {
+            Ok(stream) => output.stream = Some(stream),
+            Err(error) => {
+                log_warn!("AUDIO", "output unavailable: {error}; awaiting device recovery");
+                output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+            }
+        }
+        output.receiver = Some(receiver);
+        output.drained = Some(drained);
+        output.shared = Some(shared);
+        output.controls = Some(controls);
+        output
+    }
+
+    #[cfg(any(not(windows), debug_assertions))]
+    pub fn event_receiver(&self) -> Receiver<()> { self.signals.events.clone() }
+
+    pub fn start_notifications(&mut self) {
+        if self.controls.is_none() { return; }
+        #[cfg(windows)]
+        match crate::audio_device::DeviceNotifications::new(self.signals.clone()) {
+            Ok(notifications) => self.notifications = Some(notifications),
+            Err(error) => log_warn!("AUDIO", "endpoint notifications unavailable: {error}"),
+        }
+        // Covers changes between initial device selection and registration.
+        self.signals.device_changed();
+    }
+
+    /// Always invoked on the output's owning/UI thread, never from a callback.
+    pub fn handle_device_events(&mut self, broker: &mut Broker) {
+        let (changed, failed, endpoint_changed) = self.signals.take();
+        if (!changed && !failed) || self.controls.is_none() { return; }
+        if changed { self.error_recovery_used = false; }
+        // A replacement that has rendered at least half a second is healthy.
+        // Another later disconnect gets a fresh retry; an immediately failing
+        // replacement waits for notifications instead of rebuilding in a loop.
+        if failed && self.receiver.as_ref().is_some_and(|receiver|
+            receiver.state.rendered_frames.load(Ordering::Relaxed) >= self.key.as_ref().map_or(24_000, |key| key.rate as u64 / 2)) {
+            self.error_recovery_used = false;
+        }
+        let candidate = query_output_device();
+        if !failed && !endpoint_changed && self.stream.is_some() && candidate.as_ref().is_ok_and(|(device, config)|
+            self.key.as_ref() == Some(&OutputKey::new(device, config))) { return; }
+        broker.audio_output_lost();
+        self.playing = false;
+        let epoch = self.signals.next_epoch(); // reject errors from the stream being dropped
+        self.stream = None; // CPAL joins the retired worker before reopening
+        if failed && self.error_recovery_used && !changed {
+            log_warn!("AUDIO", "recovery stream failed; waiting for the next endpoint notification");
+            return;
+        }
+        if failed { self.error_recovery_used = true; }
+        let (device, config) = match candidate {
+            Ok(candidate) => candidate,
+            Err(error) => { log_warn!("AUDIO", "{error}; playback suspended until a device returns"); return; }
+        };
+        let key = OutputKey::new(&device, &config);
+        let rate = config.sample_rate();
+        let channels = config.channels().max(1) as usize;
+        let (sender, receiver) = chunk_channel(rate, channels, buffer_depth(rate));
+        let shared = self.shared.as_ref().unwrap();
+        let stream = match build_output_stream(device, config, receiver.clone(), self.drained.as_ref().unwrap().clone(),
+            shared.clone(), self.signals.clone(), epoch) {
+            Ok(stream) => stream,
+            Err(error) => { log_warn!("AUDIO", "device rebuild failed: {error}; awaiting another device event"); return; }
+        };
+        // The old stream has stopped, so only now may the device clock/layout change.
+        shared.set_sample_rate(rate);
+        shared.set_device_channels(channels as u32);
+        let retired = self.receiver.replace(receiver).unwrap();
+        self.controls.as_ref().unwrap().replace_output(OutputReplacement { sender, retired, epoch });
+        self.key = Some(key);
+        self.signals.set_endpoint(&self.key.as_ref().unwrap().endpoint);
+        self.stream = Some(stream);
+        broker.audio_output_prepared(epoch); // Stop wakes the one decoder to install the pool
+        log_info!("AUDIO", "replacement output ready: {rate} Hz, {channels} ch; awaiting decoder acknowledgement");
     }
 
     pub fn set_playing(&mut self, on: bool) {
-        if on == self.playing {
+        if on == self.playing || (on && self.stream.is_none()) {
             return;
         }
         use cpal::traits::StreamTrait;
@@ -255,11 +471,16 @@ impl AudioOut {
             (Some(s), true) => {
                 if let Err(e) = s.play() {
                     log_error!("AUDIO", "stream.play failed: {e}");
+                    let epoch = self.signals.stream_state.load(Ordering::Acquire) & !1;
+                    self.signals.stream_error(epoch, &e);
+                    return;
                 }
             }
             (Some(s), false) => {
                 if let Err(e) = s.pause() {
                     log_error!("AUDIO", "stream.pause failed: {e}");
+                    let epoch = self.signals.stream_state.load(Ordering::Acquire) & !1;
+                    self.signals.stream_error(epoch, &e);
                 }
             }
             (None, _) => {}
@@ -273,23 +494,25 @@ impl AudioOut {
     }
 }
 
+impl Drop for AudioOut {
+    fn drop(&mut self) {
+        self.signals.next_epoch();
+        #[cfg(windows)]
+        { self.notifications = None; } // unregister before OLE/COM apartment teardown
+        self.stream = None;
+    }
+}
+
 /// Select the native device layout before the decoder/pool starts. The UI
 /// later plays/pauses its stream with AudioOut on phase transitions.
 pub fn output_device(shared: &SharedState) -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-
-    let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| "no default output device".to_string())?;
-    let supported = device
-        .default_output_config()
-        .map_err(|e| format!("default output config: {e}"))?;
-    let device_rate = supported.sample_rate().0;
+    let (device, supported) = query_output_device()?;
+    use cpal::traits::DeviceTrait;
+    let device_rate = supported.sample_rate();
     let device_channels = supported.channels().max(1);
     shared.set_sample_rate(device_rate);
     shared.set_device_channels(device_channels as u32);
-    let name = device.name().unwrap_or_else(|_| "<unnamed>".into());
+    let name = device.description().map(|description| description.name().to_owned()).unwrap_or_else(|_| "<unnamed>".into());
     log_info!(
         "AUDIO",
         "output: {name} — {device_rate} Hz, {device_channels} ch, {:?}",
@@ -298,6 +521,20 @@ pub fn output_device(shared: &SharedState) -> Result<(cpal::Device, cpal::Suppor
     Ok((device, supported))
 }
 
+fn query_output_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let default = host.default_output_device().ok_or("no default output device")?;
+    // Resolve a concrete endpoint before activation. The app owns default-device
+    // changes via IMMNotificationClient; CPAL's auto-follow activation can move
+    // a UI STA into a neutral apartment and break subsequent OLE/COM calls.
+    let id = default.id().map_err(|error| format!("default endpoint ID: {error}"))?;
+    let device = host.device_by_id(&id).ok_or("default endpoint disappeared during enumeration")?;
+    let supported = device.default_output_config().map_err(|error| format!("default output config: {error}"))?;
+    Ok((device, supported))
+}
+
+#[cfg(test)]
 pub fn open_output_stream(
     device: cpal::Device,
     supported: cpal::SupportedStreamConfig,
@@ -305,6 +542,13 @@ pub fn open_output_stream(
     drained_tx: Sender<u64>,
     shared: Arc<SharedState>,
 ) -> Result<cpal::Stream, String> {
+    let signals = OutputSignals::new();
+    build_output_stream(device, supported, chunk_rx, drained_tx, shared, signals, 2)
+}
+
+fn build_output_stream(device: cpal::Device, supported: cpal::SupportedStreamConfig,
+    chunk_rx: ChunkReceiver, drained_tx: Sender<u64>, shared: Arc<SharedState>,
+    signals: Arc<OutputSignals>, epoch: u64) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
     let device_channels = supported.channels().max(1);
 
@@ -313,23 +557,25 @@ pub fn open_output_stream(
         sample_rate: supported.sample_rate(),
         buffer_size: cpal::BufferSize::Default,
     };
-    let err_cb = move |err| log_warn!("AUDIO", "output stream error: {err}");
+    // DeviceNotAvailable and backend-specific WASAPI aborts follow the same
+    // bounded, epoch-qualified recovery path. No teardown inside this callback.
+    let err_cb = move |err| signals.stream_error(epoch, &err);
 
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream(
-            &config,
+            config,
             popper::<f32>(chunk_rx, drained_tx, Arc::clone(&shared), device_channels),
             err_cb,
             None,
         ),
         cpal::SampleFormat::I16 => device.build_output_stream(
-            &config,
+            config,
             popper::<i16>(chunk_rx, drained_tx, Arc::clone(&shared), device_channels),
             err_cb,
             None,
         ),
         cpal::SampleFormat::U16 => device.build_output_stream(
-            &config,
+            config,
             popper::<u16>(chunk_rx, drained_tx, Arc::clone(&shared), device_channels),
             err_cb,
             None,
@@ -405,6 +651,7 @@ impl PcmOutput {
         if shared.generation() != generation { return; }
         // Silence while priming or starved must not move the track playhead.
         shared.add_frames_played((written / channels) as u64);
+        self.chunks.state.rendered_frames.fetch_add((written / channels) as u64, Ordering::Relaxed);
         let eof = self.chunks.state.eof_generation.load(Ordering::Acquire) == generation;
         if written < data.len() && self.started == generation && !eof {
             self.chunks.state.underrun_frames.fetch_add(((data.len() - written) / channels) as u64, Ordering::Relaxed);
@@ -421,6 +668,12 @@ impl PcmOutput {
 /// No I/O, heap allocation/free, logging or state locks. All sample storage
 /// was allocated before playback; only bounded nonblocking ring operations,
 /// conversion and atomic playhead/diagnostic updates occur here.
+impl Drop for PcmOutput {
+    fn drop(&mut self) {
+        if let Some(chunk) = self.current.take() { recycle(&self.chunks.recycle, chunk); }
+    }
+}
+
 fn popper<T: OutputSample>(
     chunk_rx: ChunkReceiver,
     drained_tx: Sender<u64>,
@@ -454,16 +707,24 @@ fn run_decoder(
     shared: Arc<SharedState>,
     cmds: Receiver<DecoderCmd>,
     status_tx: Sender<Status>,
-    chunk_tx: ChunkSender,
+    mut chunk_tx: ChunkSender,
     drained_rx: Receiver<u64>,
     child_slot: Arc<Mutex<Option<Child>>>,
     buffer_slot: BufferSlot,
+    output_slot: OutputSlot,
 ) {
     log_info!("DECODER", "online — parked on command channel (zero CPU)");
     let mut cache: Option<StreamCache> = None;
     loop {
         let first = match cmds.recv() {
             Ok(cmd) => {
+                let replacement = output_slot.lock().unwrap_or_else(|error| error.into_inner()).take();
+                if let Some(replacement) = replacement {
+                    chunk_tx = replacement.sender;
+                    drop(replacement.retired);
+                    let _ = status_tx.send(Status::OutputReady { epoch: replacement.epoch });
+                    crate::ui::wake_status();
+                }
                 log_debug!("DECODER", "recv {cmd:?}");
                 match cmd {
                     DecoderCmd::Load(s) => s,
@@ -555,6 +816,7 @@ struct ActiveTrack {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     track_id: u32,
+    /// Provisional container rate until the first decoded packet, then PCM rate.
     sample_rate: u32,
     time_base: Option<TimeBase>,
     channels: usize,
@@ -570,9 +832,17 @@ struct ActiveTrack {
     stream_buffer: Option<Arc<StreamBuffer>>,
     seek_packet: Option<Packet>,
     next_ts: u64,
+    seek_status: Option<Sender<Status>>,
 }
 
 impl ActiveTrack {
+    fn seek_failed(&self) -> bool {
+        if let Some(status) = &self.seek_status {
+            let _ = status.send(Status::SeekFailed);
+            crate::ui::wake_status();
+        }
+        false
+    }
     /// Log the last lines of yt-dlp's stderr — the reason it died, if it died.
     fn log_child_stderr(&mut self) {
         if let Some(tail) = self.err_tail.take() {
@@ -757,12 +1027,9 @@ fn open_track_inner(
     let sample_rate = track.codec_params.sample_rate.unwrap_or(0);
     let time_base = track.codec_params.time_base;
     let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(0);
-    if sample_rate == 0 {
-        return Err(format!("track has no usable sample rate ({sample_rate} Hz)"));
-    }
-    // `channels == 0` is allowed: AAC in fragmented MP4 (yt-dlp stdout) only
-    // exposes the layout once the first packet is decoded. play_source sends
-    // Status::Opened with the decoder's authoritative spec at that point.
+    // Container rate/layout are hints, not the format of decoded samples.
+    // AAC's core rate can differ from the MP4 sample entry (HE-AAC), and
+    // fragmented MP4 may omit the layout. Validate the decoded spec instead.
     let duration = track
         .codec_params
         .n_frames
@@ -803,6 +1070,7 @@ fn open_track_inner(
         stream_buffer,
         seek_packet: None,
         next_ts: 0,
+        seek_status: None,
     })
 }
 
@@ -957,9 +1225,9 @@ fn seek_relative(
 ) -> bool {
     if !track.seekable {
         log_info!("DECODER", "container does not support seeking");
-        return false;
+        return track.seek_failed();
     }
-    if !delta.is_finite() { return false; }
+    if !delta.is_finite() { return track.seek_failed(); }
     let previous = shared.position().as_secs_f64();
     let mut target = (previous + delta).max(0.0);
     if let Some(duration) = track.duration { target = target.min(duration.as_secs_f64()); }
@@ -1002,11 +1270,11 @@ fn seek_relative(
         }
         Err(SymphoniaError::Unsupported(_)) => {
             log_info!("DECODER", "container does not support this seek");
-            false
+            track.seek_failed()
         }
         Err(e) => {
             log_warn!("DECODER", "seek failed: {e}");
-            false
+            track.seek_failed()
         }
     }
 }
@@ -1068,9 +1336,10 @@ fn play_source(
         }
     };
     let replay_title = track.title.clone().or_else(|| resolved_title.clone());
+    track.seek_status = Some(status_tx.clone());
     log_info!(
         "DECODER",
-        "opened: {} Hz, {} ch{}, title {:?}",
+        "probed container: {} Hz, {} ch{}, title {:?}",
         track.sample_rate,
         track.channels,
         track
@@ -1190,19 +1459,28 @@ fn play_source(
             };
 
             let spec = *decoded.spec();
+            let (pcm_rate, pcm_channels) = match decoded_pcm_format(spec) {
+                Ok(format) => format,
+                Err(reason) => {
+                    log_error!("DECODER", "{reason}");
+                    exit = PlayExit::Failed;
+                    break 'play;
+                }
+            };
+            if track.sample_rate != pcm_rate || track.channels != pcm_channels {
+                if track.sample_rate != pcm_rate {
+                    log_info!("DECODER", "using decoded PCM rate {pcm_rate} Hz (container/previous {} Hz); device {dst_rate} Hz", track.sample_rate);
+                }
+                track.sample_rate = pcm_rate;
+                track.channels = pcm_channels;
+                eq.built = false;
+                resampler = None;
+                sample_buf = None;
+            }
             // First good packet: the decoder's spec is authoritative. Streams that
             // withheld their layout at open (AAC-in-fMP4) resolve here, and only
             // now does the broker hear about the track — before any chunk flows.
             if !opened {
-                track.channels = spec.channels.count();
-                if track.sample_rate == 0 {
-                    track.sample_rate = spec.rate;
-                }
-                if track.channels == 0 {
-                    log_error!("DECODER", "decoded audio has no channels");
-                    exit = PlayExit::Failed;
-                    break 'play;
-                }
                 dst_channels = match shared.device_channels() {
                     0 => track.channels,
                     n => n as usize,
@@ -1221,8 +1499,10 @@ fn play_source(
                 crate::ui::wake_status();
                 opened = true;
             }
-            let sb = sample_buf
-                .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
+            if sample_buf.as_ref().is_none_or(|buffer| buffer.capacity() < decoded.capacity() * pcm_channels) {
+                sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
+            }
+            let sb = sample_buf.as_mut().unwrap();
             sb.copy_interleaved_ref(decoded);
             let frames = sb.len() / track.channels;
             if frames == 0 {
@@ -1436,6 +1716,16 @@ fn play_source(
 
 // ── DSP: 10-band peaking biquads, linear resampler, channel mix ─────────────
 
+/// The decoded buffer describes PCM timing/interleaving. Container timestamps
+/// retain their own timebase for duration and seeking, even if its rate differs.
+fn decoded_pcm_format(spec: SignalSpec) -> Result<(u32, usize), &'static str> {
+    let channels = spec.channels.count();
+    if spec.rate == 0 || channels == 0 {
+        return Err("decoded audio has no usable sample rate or channels");
+    }
+    Ok((spec.rate, channels))
+}
+
 fn convert_channels(input: &[f32], src_ch: usize, dst_ch: usize, out: &mut Vec<f32>) {
     if src_ch == dst_ch {
         out.extend_from_slice(input);
@@ -1483,7 +1773,9 @@ struct Biquad {
 
 impl Biquad {
     fn set(&mut self, freq_hz: u32, gain_db: f32, sample_rate: u32, channels: usize) {
-        self.active = gain_db.abs() >= 0.05;
+        // Bands at/above Nyquist cannot exist at this PCM rate; attempting
+        // them produces unstable coefficients for low-rate AAC cores.
+        self.active = gain_db.abs() >= 0.05 && (freq_hz as u64) * 2 < sample_rate as u64;
         let a = 10f64.powf(gain_db as f64 / 40.0);
         let w0 = 2.0 * std::f64::consts::PI * freq_hz as f64 / sample_rate as f64;
         let (sw, cw) = w0.sin_cos();
@@ -1595,6 +1887,220 @@ impl LinearResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_errors_are_coalesced_and_retired_stream_callbacks_are_ignored() {
+        let signals = OutputSignals::new();
+        assert_eq!(signals.take(), (false, false, false));
+        for _ in 0..100 {
+            signals.stream_error(2, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+            signals.device_changed();
+        }
+        assert_eq!(signals.events.len(), 1);
+        assert_eq!(signals.take(), (true, true, false));
+        assert_eq!(signals.take(), (false, false, false));
+        let epoch = signals.next_epoch();
+        assert_eq!(epoch, 4);
+        signals.stream_error(2, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+        assert_eq!(signals.take(), (false, false, false));
+        signals.stream_error(epoch, &cpal::Error::with_message(cpal::ErrorKind::BackendError, "WASAPI stream aborted"));
+        assert_eq!(signals.take(), (false, true, false));
+        signals.endpoint_changed();
+        assert_eq!(signals.take(), (true, false, true));
+        let epoch = signals.next_epoch();
+        signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::Xrun));
+        signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::RealtimeDenied));
+        assert_eq!(signals.take(), (false, false, false), "nonfatal advisories cannot rebuild the stream");
+        signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceChanged));
+        assert_eq!(signals.take(), (true, false, false));
+    }
+
+    #[test]
+    fn pcm_output_drop_recycles_its_partial_block_for_device_rebuild() {
+        let shared = SharedState::new();
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (_command_tx, commands) = bounded(1);
+        sender.begin(shared.generation());
+        push_pcm(&sender, &commands, &[0.5; 64], shared.generation());
+        sender.finish(shared.generation());
+        let mut output = PcmOutput::new(receiver);
+        output.render(&mut [0.0f32; 1], &shared, 1);
+        assert!(output.current.is_some());
+        assert_eq!(sender.free.len(), 2);
+        drop(output);
+        assert_eq!(sender.free.len(), 3, "retirement must not gradually exhaust the fixed pool");
+    }
+
+    #[test]
+    fn pending_device_pools_coalesce_without_disconnecting_the_live_decoder() {
+        let (original, receiver) = chunk_channel(48_000, 2, 2);
+        let oldest = Arc::downgrade(&receiver.state);
+        let controls = AudioControls { child_slot: Arc::new(Mutex::new(None)),
+            buffer_slot: Arc::new(Mutex::new(None)), output_slot: Arc::new(Mutex::new(None)) };
+        let (first, first_receiver) = chunk_channel(44_100, 1, 2);
+        let intermediate = Arc::downgrade(&first_receiver.state);
+        controls.replace_output(OutputReplacement { sender: first, retired: receiver, epoch: 4 });
+        let (latest, latest_receiver) = chunk_channel(48_000, 6, 2);
+        controls.replace_output(OutputReplacement { sender: latest, retired: first_receiver, epoch: 6 });
+        assert!(intermediate.upgrade().is_none(), "superseded pending pool must be freed");
+        assert!(oldest.upgrade().is_some());
+        assert!(!matches!(original.sink_gone.try_recv(), Err(TryRecvError::Disconnected)));
+        let replacement = controls.output_slot.lock().unwrap().take().unwrap();
+        assert_eq!(replacement.epoch, 6);
+        assert!(Arc::ptr_eq(&replacement.retired.state, &original.state));
+        drop(original);
+        drop(replacement.retired);
+        assert!(oldest.upgrade().is_none());
+        drop((replacement.sender, latest_receiver));
+    }
+
+    #[test]
+    fn decoder_installs_changed_device_pools_and_releases_retired_allocations() {
+        let path = std::env::temp_dir().join(format!("kyouko-device-pools-{}.wav", std::process::id()));
+        std::fs::write(&path, pcm_wav(&vec![8192; 48_000], 48_000)).unwrap();
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        shared.set_device_channels(2);
+        let (command_tx, command_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let audio = spawn(shared.clone(), command_rx, status_tx);
+        let mut receiver = audio.chunk_rx;
+        let thread_id = audio.decoder.thread().id();
+        let source = Source::File(path.to_string_lossy().into_owned());
+        for (cycle, (rate, channels)) in [(48_000, 2), (44_100, 1), (96_000, 2), (48_000, 6)].into_iter().enumerate() {
+            let old_state = Arc::downgrade(&receiver.state);
+            let (sender, fresh_receiver) = chunk_channel(rate, channels, buffer_depth(rate));
+            let epoch = 2 + cycle as u64 * 2;
+            shared.set_sample_rate(rate);
+            shared.set_device_channels(channels as u32);
+            audio.controls.replace_output(OutputReplacement { sender, retired: receiver, epoch });
+            receiver = fresh_receiver;
+            command_tx.send(DecoderCmd::Stop).unwrap();
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::OutputReady { epoch: ready } if ready == epoch));
+            assert!(old_state.upgrade().is_none(), "acknowledgement releases the old pool");
+            shared.bump_generation();
+            command_tx.send(DecoderCmd::Load(source.clone())).unwrap();
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { sample_rate: 48_000, channels: 1, .. }));
+            let mut frames = 0;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(std::time::Instant::now() < deadline);
+                match receiver.queue.recv_timeout(Duration::from_millis(5)) {
+                    Ok(chunk) => {
+                        assert_eq!(chunk.data.len(), CHUNK_FRAMES * channels);
+                        assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
+                        frames += chunk.len / channels;
+                        recycle(&receiver.recycle, chunk);
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if receiver.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
+                            audio.drained_tx.send(shared.generation()).unwrap();
+                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+                            break;
+                        }
+                    }
+                    Err(error) => panic!("pool disconnected: {error}"),
+                }
+            }
+            assert!((frames as i64 - rate as i64).abs() <= 2, "device format cannot change playback duration");
+            assert_eq!(audio.decoder.thread().id(), thread_id);
+        }
+        command_tx.send(DecoderCmd::Shutdown).unwrap();
+        audio.decoder.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires the saved local track/folder and an actual output device"]
+    fn saved_track_device_hotswap_cycles_recover_on_wasapi() {
+        use crate::broker::{Command as PlayerCommand, DecoderLink, Flow, Phase};
+        let saved = crate::config::load();
+        let shared = SharedState::new();
+        restore_test_controls(&shared, &saved);
+        shared.set_loop_enabled(saved.loop_enabled);
+        let device = output_device(&shared).unwrap();
+        let (command_tx, command_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let audio = spawn(shared.clone(), command_rx, status_tx);
+        let thread_id = audio.decoder.thread().id();
+        let mut output = AudioOut::managed(Ok(device), audio.chunk_rx, audio.drained_tx, shared.clone(), audio.controls.clone());
+        output.start_notifications();
+        // No saver is installed: use the real saved selection/controls without
+        // writing state.cfg or injecting any window/keyboard/mouse input.
+        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(command_tx, audio.controls.clone().hook()));
+        broker.handle_command(PlayerCommand::RestoreState { last_folder: saved.last_folder,
+            last_track: saved.last_track, last_playlist_index: saved.last_playlist_index });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while shared.phase() != Phase::Paused {
+            broker.handle_status(status_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap());
+            output.handle_device_events(&mut broker);
+        }
+        broker.handle_command(PlayerCommand::TogglePause);
+        output.set_playing(true);
+        let output_events = output.signals.events.clone();
+        for cycle in 0..4 {
+            let start_position = shared.position().as_secs_f64();
+            let observe_until = std::time::Instant::now() + Duration::from_secs(2);
+            // Service real output notifications during the fault interval, just
+            // like the UI pump. No polling or simulated input is involved.
+            loop {
+                let remaining = observe_until.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() { break; }
+                select! {
+                    recv(status_rx) -> status => broker.handle_status(status.unwrap()),
+                    recv(output_events) -> _ => output.handle_device_events(&mut broker),
+                    default(remaining) => break,
+                }
+                output.handle_device_events(&mut broker);
+                output.set_playing(shared.phase() == Phase::Playing);
+            }
+            let position = shared.position().as_secs_f64();
+            assert!(position - start_position > 1.7, "healthy playback must continue between device cycles: {}s advanced", position - start_position);
+            assert_eq!(shared.phase(), Phase::Playing);
+            let old_pool = Arc::downgrade(&output.receiver.as_ref().unwrap().state);
+            let epoch = output.signals.stream_state.load(Ordering::Acquire) & !1;
+            // Invoke the same callback sink used by CPAL's device-error callback.
+            // The hardware stream really closes/reopens; no OS endpoint is disabled.
+            match cycle {
+                1 => output.signals.endpoint_changed(), // same-ID endpoint event / silent stall
+                2 => output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::StreamInvalidated)),
+                _ => output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable)),
+            }
+            output.handle_device_events(&mut broker);
+            assert_eq!(shared.phase(), Phase::Paused);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while shared.phase() != Phase::Playing {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "device recovery stalled");
+                select! {
+                    recv(status_rx) -> status => broker.handle_status(status.unwrap()),
+                    recv(output_events) -> _ => output.handle_device_events(&mut broker),
+                    default(remaining) => panic!("device recovery timed out"),
+                }
+                output.handle_device_events(&mut broker);
+                output.set_playing(shared.phase() == Phase::Playing);
+            }
+            assert!((shared.position().as_secs_f64() - position).abs() < 0.15, "recovery retains playhead");
+            assert!(old_pool.upgrade().is_none(), "retired PCM allocation must be freed");
+            assert_eq!(audio.decoder.thread().id(), thread_id, "device swaps reuse the one decoder");
+            assert!(audio.controls.output_slot.lock().unwrap().is_none());
+            let new_epoch = output.signals.stream_state.load(Ordering::Acquire) & !1;
+            output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+            output.handle_device_events(&mut broker);
+            assert_eq!(output.signals.stream_state.load(Ordering::Acquire) & !1, new_epoch);
+            println!("device cycle {}: recovered at {:.3}s, retired pool freed, decoder thread unchanged", cycle + 1, shared.position().as_secs_f64());
+        }
+        #[cfg(windows)]
+        unsafe {
+            // Recovery must leave the UI's STA usable for drag-and-drop.
+            windows::Win32::System::Ole::OleInitialize(None).unwrap();
+            windows::Win32::System::Ole::OleUninitialize();
+        }
+        assert!(matches!(broker.handle_command(PlayerCommand::Quit), Flow::Exit));
+        output.set_playing(false);
+        drop(output);
+        audio.decoder.join().unwrap();
+    }
 
     fn push_pcm(sender: &ChunkSender, cmds: &Receiver<DecoderCmd>, samples: &[f32], generation: u64) {
         assert!(matches!(send_chunk(sender, cmds, samples, generation), SendOutcome::Sent));
@@ -1797,12 +2303,17 @@ mod tests {
 
     fn saved_local_tracks() -> (crate::config::PersistedState, Vec<std::path::PathBuf>) {
         let saved = crate::config::load();
-        let folder = saved.last_folder.as_ref().expect("state.cfg needs a local folder for this diagnostic");
-        let mut files: Vec<_> = std::fs::read_dir(folder).unwrap().flatten().map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| matches!(ext.to_str(), Some("ogg" | "mp3" | "flac" | "wav" | "m4a" | "mp4"))))
-            .collect();
+        let mut files: Vec<_> = if let Some(folder) = &saved.last_folder {
+            std::fs::read_dir(folder).unwrap().flatten().map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| matches!(ext.to_str(), Some("ogg" | "mp3" | "flac" | "wav" | "m4a" | "mp4"))))
+                .collect()
+        } else {
+            let file = std::path::PathBuf::from(saved.last_track.as_ref().expect("state.cfg needs a local track or folder"));
+            assert!(file.is_file(), "saved last_track must be a local media file");
+            vec![file]
+        };
         files.sort();
-        assert!(!files.is_empty(), "the saved folder must contain media");
+        assert!(!files.is_empty(), "the saved source must contain media");
         (saved, files)
     }
 
@@ -1813,7 +2324,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires local media in the folder saved in state.cfg"]
+    #[ignore = "requires the local track or folder saved in state.cfg"]
     fn saved_folder_full_tracks_decode_through_the_pcm_pool() {
         let (saved, files) = saved_local_tracks();
         let shared = SharedState::new();
@@ -1824,11 +2335,43 @@ mod tests {
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), cmd_rx, status_tx);
         for file in files {
+            let source = Source::File(file.to_string_lossy().into_owned());
+            let mut probe = open_track(&source, &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), None).unwrap();
+            let mut expected_seconds = 0.0;
+            let mut first_spec = None;
+            let mut padding_tolerance: f64 = 0.1;
+            loop {
+                let packet = match probe.format.next_packet() {
+                    Ok(packet) => packet,
+                    Err(SymphoniaError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(error) => panic!("probe packet failed: {error}"),
+                };
+                if packet.track_id() != probe.track_id { continue; }
+                let decoded = match probe.decoder.decode(&packet) {
+                    Ok(decoded) => decoded,
+                    Err(SymphoniaError::DecodeError(_)) => continue,
+                    Err(error) => panic!("probe decode failed: {error}"),
+                };
+                let spec = *decoded.spec();
+                let packet_seconds = decoded.frames() as f64 / spec.rate as f64;
+                expected_seconds += packet_seconds;
+                if first_spec.is_none() {
+                    println!("{}: container {} Hz/{} ch, decoded {} Hz/{} ch, timebase {:?}",
+                        file.display(), probe.sample_rate, probe.channels, spec.rate, spec.channels.count(), probe.time_base);
+                    first_spec = Some((spec.rate, spec.channels.count()));
+                    // Compressed packets include codec priming/tail padding.
+                    padding_tolerance = padding_tolerance.max(packet_seconds * 4.0);
+                }
+            }
+            drop(probe);
             let started = std::time::Instant::now();
             shared.bump_generation();
             cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()))).unwrap();
             let duration = match status_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                Status::Opened { duration, .. } => duration.unwrap(),
+                Status::Opened { duration, sample_rate, channels, .. } => {
+                    assert_eq!((sample_rate, channels as usize), first_spec.unwrap());
+                    duration.unwrap()
+                }
                 other => panic!("local source failed: {other:?}"),
             };
             let mut frames = 0;
@@ -1855,7 +2398,9 @@ mod tests {
                 }
             }
             let seconds = frames as f64 / 48_000.0;
-            assert!((seconds - duration.as_secs_f64()).abs() < 0.1, "no decoded audio is lost");
+            println!("{}: container {:.6}s, output {seconds:.6}s ({frames} device frames)", file.display(), duration.as_secs_f64());
+            assert!((seconds - expected_seconds).abs() < 2.0 / 48_000.0, "output must preserve decoded PCM duration");
+            assert!((seconds - duration.as_secs_f64()).abs() < padding_tolerance, "output must match container timing apart from codec padding");
             assert!(started.elapsed() < duration / 10, "decoder must comfortably outpace playback");
             println!("{}: {seconds:.3}s decoded in {:.3}s ({:.1}x realtime), peak chunk wait {:.3}ms",
                 file.display(), started.elapsed().as_secs_f64(), seconds / started.elapsed().as_secs_f64(), peak_wait.as_secs_f64() * 1000.0);
@@ -1865,7 +2410,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the saved local folder and an actual output device"]
+    #[ignore = "requires the saved local track or folder and an actual output device"]
     fn saved_folder_wasapi_output_has_no_underruns() {
         use cpal::traits::StreamTrait;
         let (saved, files) = saved_local_tracks();
@@ -1881,17 +2426,32 @@ mod tests {
             shared.bump_generation();
             shared.reset_playhead();
             cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()))).unwrap();
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(10)).unwrap(), Status::Opened { .. }));
+            let duration = match status_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Status::Opened { duration, .. } => duration,
+                other => panic!("local source failed: {other:?}"),
+            };
             let before = counters.underrun_frames.load(Ordering::Relaxed);
+            let started = std::time::Instant::now();
             stream.play().unwrap();
-            // Real WASAPI callbacks, real file reads and saved active EQ.
-            // Sleep is solely the automated observation interval, never a
-            // production scheduling mechanism; config/UI stay untouched.
-            thread::sleep(Duration::from_secs(10));
+            // Short repro files play to EOF; longer songs retain a ten-second
+            // hardware observation. Neither path injects UI input or saves config.
+            let full_track = duration.filter(|duration| *duration <= Duration::from_secs(30));
+            if let Some(duration) = full_track {
+                assert!(matches!(status_rx.recv_timeout(duration + Duration::from_secs(5)).unwrap(), Status::Finished));
+            } else {
+                thread::sleep(Duration::from_secs(10));
+            }
             stream.pause().unwrap();
+            let elapsed = started.elapsed().as_secs_f64();
+            let rendered = shared.position().as_secs_f64();
             let underruns = counters.underrun_frames.load(Ordering::Relaxed) - before;
-            println!("{}: {:.3}s rendered, {underruns} underrun frames", file.display(), shared.position().as_secs_f64());
-            assert!(shared.position() > Duration::from_secs(9));
+            println!("{}: {rendered:.3}s rendered in {elapsed:.3}s wall time, {underruns} underrun frames", file.display());
+            if let Some(duration) = full_track {
+                assert!((rendered - duration.as_secs_f64()).abs() < 0.25, "track must render at 1x, allowing AAC padding");
+                assert!((rendered - elapsed).abs() < 0.5, "device clock must agree with PCM timing");
+            } else {
+                assert!(rendered > 9.0);
+            }
             assert_eq!(underruns, 0);
         }
         cmd_tx.send(DecoderCmd::Shutdown).unwrap();
@@ -2111,6 +2671,115 @@ mod tests {
     }
 
     #[test]
+    fn decoded_pcm_format_validates_rate_and_channel_stride() {
+        use symphonia::core::audio::Channels;
+        for rate in [22_050, 24_000, 44_100, 48_000] {
+            assert_eq!(decoded_pcm_format(SignalSpec::new(rate, Channels::FRONT_LEFT)), Ok((rate, 1)));
+            assert_eq!(decoded_pcm_format(SignalSpec::new(rate, Channels::FRONT_LEFT | Channels::FRONT_RIGHT)), Ok((rate, 2)));
+        }
+        assert!(decoded_pcm_format(SignalSpec::new(0, Channels::FRONT_LEFT)).is_err());
+        assert!(decoded_pcm_format(SignalSpec::new(48_000, Channels::empty())).is_err());
+    }
+
+    #[test]
+    fn mp4_sample_entry_rate_cannot_change_decoded_pcm_timing() {
+        let fixture = include_bytes!("../tests/fixtures/silence.m4a");
+        let entry = fixture.windows(4).position(|bytes| bytes == b"mp4a").unwrap();
+        // AudioSampleEntry stores a 16.16 rate 28 bytes after its type.
+        let rate_offset = entry + 28;
+        assert_eq!(&fixture[rate_offset..rate_offset + 4], &(48_000u32 << 16).to_be_bytes());
+        let mut rounds = Vec::new();
+        for container_rate in [48_000u32, 24_000] {
+            let mut bytes = fixture.to_vec();
+            bytes[rate_offset..rate_offset + 4].copy_from_slice(&(container_rate << 16).to_be_bytes());
+            let shared = SharedState::new();
+            shared.set_sample_rate(48_000);
+            shared.set_device_channels(1);
+            shared.set_volume(1.0);
+            shared.set_eq_enabled(false);
+            let source = Source::Youtube { url: "ram-test://aac-rate".into(), format: "140".into(), playlist_index: None };
+            let buffer = StreamBuffer::new();
+            buffer.append(&bytes).unwrap();
+            buffer.finish(Ok(()));
+            let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
+            let mut probe = open_track(&source, &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), cache.as_ref().map(|cache| cache.buffer.clone())).unwrap();
+            assert_eq!(probe.sample_rate, container_rate, "regression fixture must change demuxer metadata");
+            let time_base = probe.time_base.unwrap();
+            assert_eq!((time_base.numer, time_base.denom), (1, 48_000));
+            let packet = probe.format.next_packet().unwrap();
+            assert_eq!(probe.decoder.decode(&packet).unwrap().spec().rate, 48_000);
+            drop(probe);
+            let (_cmd_tx, cmd_rx) = bounded(8);
+            let (status_tx, status_rx) = bounded(16);
+            let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
+            let (drained_tx, drained_rx) = bounded(4);
+            let decoder_shared = shared.clone();
+            let decoder = thread::spawn(move || play_source(&decoder_shared, &cmd_rx, &status_tx, &chunk_tx, &drained_rx,
+                &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), &mut cache, source));
+            let duration = match status_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Status::Opened { sample_rate: 48_000, channels: 1, duration, .. } => duration,
+                other => panic!("source must report its actual PCM format: {other:?}"),
+            };
+            let mut pcm = Vec::new();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(std::time::Instant::now() < deadline, "AAC regression decoder stalled");
+                match chunk_rx.queue.recv_timeout(Duration::from_millis(5)) {
+                    Ok(chunk) => { pcm.extend_from_slice(chunk.samples()); recycle(&chunk_rx.recycle, chunk); }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
+                            drained_tx.send(shared.generation()).unwrap();
+                            break;
+                        }
+                    }
+                    Err(error) => panic!("decoder disconnected: {error}"),
+                }
+            }
+            assert!(matches!(decoder.join().unwrap(), PlayExit::Eof));
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+            rounds.push((duration, pcm));
+        }
+        assert_eq!(rounds[0], rounds[1], "sample-entry hints must not change frame count, samples or duration");
+    }
+
+    #[test]
+    fn low_rate_pcm_resampling_preserves_one_second_and_one_khz_pitch() {
+        use symphonia::core::audio::Channels;
+        for src_rate in [22_050, 24_000] {
+            let (rate, channels) = decoded_pcm_format(SignalSpec::new(src_rate, Channels::FRONT_LEFT)).unwrap();
+            let input: Vec<f32> = (0..src_rate).map(|frame| {
+                (std::f32::consts::TAU * 1000.0 * frame as f32 / src_rate as f32).sin()
+            }).collect();
+            for dst_rate in [44_100, 48_000] {
+                let mut rs = LinearResampler::new(rate, dst_rate, channels);
+                let mut output = Vec::new();
+                // Exercise fractional carry across AAC-sized packets.
+                for packet in input.chunks(1024) { rs.process(packet, packet.len(), &mut output); }
+                assert!((output.len() as i64 - dst_rate as i64).abs() <= 1);
+                let cycles = output.windows(2).filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0).count();
+                let pitch = cycles as f64 * dst_rate as f64 / output.len() as f64;
+                assert!((pitch - 1000.0).abs() < 2.0, "{src_rate} -> {dst_rate}: {pitch} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn low_rate_eq_bypasses_unrepresentable_bands_without_unstable_audio() {
+        let mut eq = EqChain::new();
+        for rate in [22_050, 24_000] {
+            eq.rebuild(&[-5.0; EQ_BANDS], rate, 1);
+            let mut tone: Vec<f32> = (0..rate).map(|frame| {
+                0.05 * (std::f32::consts::TAU * 1000.0 * frame as f32 / rate as f32).sin()
+            }).collect();
+            eq.apply(&mut tone, 1);
+            assert!(tone.iter().all(|sample| sample.is_finite() && sample.abs() < 1.0));
+            assert!(!eq.bands[EQ_BANDS - 1].active, "16 kHz is above Nyquist");
+        }
+        eq.rebuild(&[-5.0; EQ_BANDS], 48_000, 2);
+        assert!(eq.bands[EQ_BANDS - 1].active, "16 kHz remains available at device-capable source rates");
+    }
+
+    #[test]
     fn resampler_length_and_constancy() {
         // 44.1k → 48k: 4410 frames in, ~4800 out, constant stays constant.
         let mut rs = LinearResampler::new(44_100, 48_000, 1);
@@ -2242,7 +2911,7 @@ mod tests {
         let child_slot = Arc::new(Mutex::new(None));
         let decoder_shared = shared.clone();
         let decoder = thread::spawn(move || {
-            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, child_slot, Arc::new(Mutex::new(None)));
+            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, child_slot, Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
         });
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
             cmd_tx.clone(), Arc::new(|| {}),

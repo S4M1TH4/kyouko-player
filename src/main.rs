@@ -42,6 +42,8 @@
 //! Release builds are GUI overlay processes with no console or stdin reader.
 
 mod audio;
+#[cfg(windows)]
+mod audio_device;
 mod broker;
 mod config;
 mod logging;
@@ -115,7 +117,7 @@ fn main() {
         restored.last_folder.as_deref().unwrap_or("<none>")
     );
 
-    // The four message arteries. Bounded everywhere: a full queue is the
+    // Core message arteries. Bounded everywhere: a full queue is the
     // scheduler — senders block (park), nobody ever spins.
     let (cmd_tx, cmd_rx) = bounded::<Command>(32); // window, hotkeys, and startup
     let (decoder_tx, decoder_rx) = bounded::<DecoderCmd>(8); // broker → decoder
@@ -138,16 +140,13 @@ fn main() {
 
     // Fix the device layout before allocating the PCM pool or starting decode.
     let device = audio::output_device(&shared);
+    if device.is_err() {
+        // A disconnected startup still needs a valid provisional PCM clock.
+        shared.set_sample_rate(48_000);
+        shared.set_device_channels(2);
+    }
     let audio = audio::spawn(shared.clone(), decoder_rx, status_tx);
-    let audio_out = match device.and_then(|(device, config)| {
-        audio::open_output_stream(device, config, audio.chunk_rx, audio.drained_tx, shared.clone())
-    }) {
-        Ok(stream) => AudioOut::new(Some(stream)),
-        Err(e) => {
-            log_error!("MAIN", "audio output unavailable: {e} — running silent");
-            AudioOut::new(None)
-        }
-    };
+    let audio_out = AudioOut::managed(device, audio.chunk_rx, audio.drained_tx, shared.clone(), audio.controls.clone());
 
     // The kill switch rides along with every Stop/Load/Shutdown so a stalled
     // yt-dlp pipe read can never defer a command or hang shutdown.

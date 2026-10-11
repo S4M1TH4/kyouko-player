@@ -22,6 +22,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Ole",
     "Win32_System_SystemServices",
+    "Win32_Media_Audio", # default endpoint notifications for event-driven hot-swap
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell", # DragQueryFileW/HDROP for OLE file and folder drops
     "Win32_UI_HiDpi",
@@ -34,7 +35,7 @@ windows = { version = "0.62", features = [
 # wakes the callback only when it needs samples, and `Stream::pause()` stops
 # the callback entirely (true zero-CPU pause). Cross-platform by construction,
 # so the future Linux port keeps this module untouched.
-cpal = "0.15"
+cpal = "0.18.2" # WASAPI failed-worker cleanup and default-device recovery fixes
 
 # Decoding. Defaults off — we ship exactly the codecs we play, nothing else.
 # `isomp4`+`aac` covers yt-dlp's format 140 (m4a); `mkv` covers webm/matroska

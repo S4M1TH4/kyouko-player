@@ -401,8 +401,11 @@ pub enum DecoderCmd {
 #[allow(dead_code)] // Opened/Finished are constructed by the audio module in step 3
 #[derive(Debug)]
 pub enum Status {
+    /// The one decoder has installed the replacement device's PCM pool.
+    OutputReady { epoch: u64 },
     Opened {
         source: Source,
+        /// Actual decoded PCM rate; SharedState keeps the separate device rate.
         sample_rate: u32,
         channels: u16,
         /// Streams may not know their name; files usually do.
@@ -412,6 +415,8 @@ pub enum Status {
     /// The playhead moved (seek); the presentation layer refreshes its view.
     /// The new position is already in SharedState.
     Seeked,
+    /// A recovery seek could not be honored; replay may resume at the start.
+    SeekFailed,
     /// Natural end of stream (not Stop).
     Finished,
     /// Generation identifies the failed attempt, so obsolete failures after
@@ -658,6 +663,13 @@ pub struct Broker {
     /// Load asked for a staged (paused) start: the next Opened flips to
     /// Paused instead of Playing. Consumed there, cleared on failure.
     stage_paused: bool,
+    output_unavailable: bool,
+    output_epoch: Option<u64>,
+    output_reload: bool,
+    output_resume: bool,
+    output_position: f64,
+    seek_after_open: Option<f64>,
+    resume_after_seek: Option<bool>,
     /// Most recently opened or explicitly jumped-to source — survives
     /// Stop/Finished and immediately persists a GUI selection.
     last_opened_source: Option<Source>,
@@ -698,6 +710,13 @@ impl Broker {
             view: String::new(),
             view_dirty: false,
             stage_paused: false,
+            output_unavailable: false,
+            output_epoch: None,
+            output_reload: false,
+            output_resume: false,
+            output_position: 0.0,
+            seek_after_open: None,
+            resume_after_seek: None,
             last_opened_source: None,
             last_folder: None,
             pending_source: None,
@@ -790,6 +809,8 @@ impl Broker {
     /// The common load tail - everything a Load does once queue management
     /// has settled which source to open.
     fn begin_load(&mut self, source: Source, paused: bool) {
+        self.seek_after_open = None;
+        self.resume_after_seek = None;
         if let Source::Youtube { playlist_index: Some(index), .. } = &source {
             self.queue_index = index.checked_sub(1);
         }
@@ -810,6 +831,14 @@ impl Broker {
         self.pending_source = Some(source.clone());
         self.shared.reset_playhead();
         self.shared.bump_generation();
+        if self.output_unavailable {
+            self.output_reload = true;
+            self.output_resume = !paused;
+            self.output_position = 0.0;
+            self.set_phase(Phase::Paused, "load deferred until audio output returns");
+            self.persist();
+            return;
+        }
         self.set_phase(Phase::Loading, "load requested");
         self.send_decoder(DecoderCmd::Load(source));
     }
@@ -1044,6 +1073,37 @@ impl Broker {
         Arc::clone(&self.shared)
     }
 
+    /// Suspend the decoder before the UI destroys its failed stream. Repeated
+    /// events retain the original playback intent/position and do not retry media.
+    pub fn audio_output_lost(&mut self) {
+        self.output_epoch = None;
+        if self.output_unavailable { return; }
+        let phase = self.shared.phase();
+        self.output_resume = phase == Phase::Playing || (phase == Phase::Loading && !self.stage_paused);
+        self.output_reload = phase != Phase::Stopped;
+        if let Some(resume) = self.resume_after_seek.take() {
+            self.output_resume = resume;
+            // A second invalidation before the recovery seek finished must
+            // retain the original position, not the temporary zero playhead.
+        } else {
+            self.output_position = self.shared.position().as_secs_f64();
+        }
+        self.output_unavailable = true;
+        self.seek_after_open = None;
+        self.shared.bump_generation();
+        self.send_decoder(DecoderCmd::Stop);
+        if phase != Phase::Stopped { self.set_phase(Phase::Paused, "audio device unavailable"); }
+        self.persist();
+    }
+
+    pub fn audio_output_prepared(&mut self, epoch: u64) {
+        self.output_epoch = Some(epoch);
+        self.shared.set_playhead_frames((self.output_position * self.shared.sample_rate() as f64).round() as u64);
+        // Wakes the parked decoder to consume the latest pool. An acknowledgement
+        // orders old Opened/Finished events before any restored source is loaded.
+        self.send_decoder(DecoderCmd::Stop);
+    }
+
     /// 1 Hz playback tick, delivered by the presentation timer (which only
     /// exists while `Playing`). Advances the elapsed-time display.
     pub fn tick(&mut self) {
@@ -1203,6 +1263,15 @@ impl Broker {
                 self.begin_load(source, paused);
             }
             Command::SeekRelative(delta) => {
+                if self.output_unavailable {
+                    if let Some(delta) = bounded_seek_delta(Duration::from_secs_f64(self.output_position),
+                        self.track.as_ref().and_then(|track| track.duration), delta) {
+                        self.output_position += delta;
+                        self.shared.set_playhead_frames((self.output_position * self.shared.sample_rate() as f64).round() as u64);
+                    }
+                    self.refresh();
+                    return Flow::Continue;
+                }
                 if let Some(track) = &self.track {
                     if let Some(delta) = bounded_seek_delta(self.shared.position(), track.duration, delta) {
                         log_info!("BROKER", "seek {delta:+.1}s");
@@ -1290,6 +1359,13 @@ impl Broker {
                     }
                 }
             }
+            Command::TogglePause if self.output_unavailable && self.shared.phase() != Phase::Stopped => {
+                self.output_resume = !self.output_resume;
+                self.refresh();
+            }
+            Command::TogglePause if self.resume_after_seek.is_some() => {
+                self.resume_after_seek = self.resume_after_seek.map(|resume| !resume);
+            }
             Command::TogglePause => match self.shared.phase() {
                 Phase::Playing => self.set_phase(Phase::Paused, "toggle"),
                 Phase::Paused => self.set_phase(Phase::Playing, "toggle"),
@@ -1308,6 +1384,11 @@ impl Broker {
                 p => log_warn!("BROKER", "toggle ignored while {p}"),
             },
             Command::Stop => {
+                self.output_reload = false;
+                self.output_resume = false;
+                self.output_position = 0.0;
+                self.seek_after_open = None;
+                self.resume_after_seek = None;
                 log_info!("BROKER", "stop");
                 self.send_decoder(DecoderCmd::Stop);
                 self.shared.bump_generation();
@@ -1370,6 +1451,12 @@ impl Broker {
                 log_debug!("BROKER", "window toggle is presentation-side");
             }
             Command::Quit => {
+                self.output_epoch = None;
+                self.output_reload = false;
+                self.output_resume = false;
+                self.output_unavailable = true;
+                self.seek_after_open = None;
+                self.resume_after_seek = None;
                 log_info!("BROKER", "quit — shutting decoder down (kills yt-dlp child)");
                 self.persist(); // final flush; X, Alt+Q and debug Ctrl+C land here
                 self.send_decoder(DecoderCmd::Shutdown);
@@ -1387,6 +1474,7 @@ impl Broker {
         log_debug!("BROKER", "status: {st:?}");
         match st {
             Status::Opened { source, sample_rate, channels, title, duration } => {
+                if self.output_unavailable { return; }
                 if self.pending_source.as_ref().is_some_and(|pending| *pending != source) {
                     log_debug!("BROKER", "obsolete Opened ignored after a different track was selected: {source}");
                     return;
@@ -1421,8 +1509,32 @@ impl Broker {
                     },
                 );
                 self.persist();
+                if let Some(position) = self.seek_after_open.take() {
+                    self.send_decoder(DecoderCmd::SeekRelative(position));
+                }
+            }
+            Status::OutputReady { epoch } => {
+                if self.output_epoch != Some(epoch) { return; }
+                self.output_epoch = None;
+                self.output_unavailable = false;
+                if self.output_reload {
+                    let source = self.pending_source.clone()
+                        .or_else(|| self.track.as_ref().map(|track| track.source.clone()))
+                        .or_else(|| self.last_opened_source.clone());
+                    let position = self.output_position;
+                    let resume = self.output_resume;
+                    self.output_reload = false;
+                    if let Some(source) = source {
+                        self.begin_load(source, !resume || position > 0.0);
+                        if position > 0.0 {
+                            self.seek_after_open = Some(position);
+                            self.resume_after_seek = Some(resume);
+                        }
+                    }
+                }
             }
             Status::Finished => {
+                if self.output_unavailable { return; }
                 if self.track.is_none() {
                     log_debug!("BROKER", "obsolete Finished ignored while no selected track is open");
                     return;
@@ -1470,7 +1582,11 @@ impl Broker {
                 // including a repeat-toggle race at the EOF boundary.
                 self.handle_command(Command::Stop);
             }
-            Status::Seeked => {
+            Status::Seeked | Status::SeekFailed => {
+                if self.output_unavailable { return; }
+                if let Some(resume) = self.resume_after_seek.take() {
+                    self.set_phase(if resume { Phase::Playing } else { Phase::Paused }, "audio output restored");
+                }
                 // The decoder already moved SharedState's playhead; this only
                 // repaints the panel (matters while paused — the 1 Hz timer
                 // is not running).
@@ -1616,6 +1732,156 @@ mod tests {
             title: None,
             duration: None,
         });
+    }
+
+    fn device_test_broker(playing: bool) -> (Broker, crossbeam_channel::Receiver<DecoderCmd>, Source) {
+        let (mut broker, _, receiver) = broker_with_sink();
+        let source = Source::File("C:\\media\\second.mp4".into());
+        broker.shared.set_sample_rate(48_000);
+        broker.handle_command(Command::Load { source: source.clone(), paused: !playing });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+            channels: 1, title: Some("Second".into()), duration: Some(Duration::from_secs(60)) });
+        broker.local_queue = vec![Source::File("C:\\media\\first.mp4".into()), source.clone()];
+        broker.queue_index = Some(1);
+        broker.last_folder = Some("C:\\media".into());
+        (broker, receiver, source)
+    }
+
+    #[test]
+    fn device_recovery_preserves_queue_position_and_playing_or_paused_intent() {
+        for playing in [false, true] {
+            let (mut broker, receiver, source) = device_test_broker(playing);
+            let snapshot = broker.persist_snapshot();
+            for cycle in 0..12 {
+                let position = 2.0 + cycle as f64;
+                broker.shared.set_playhead_frames((position * broker.shared.sample_rate() as f64) as u64);
+                broker.audio_output_lost();
+                assert_eq!(broker.shared.phase(), Phase::Paused);
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+                broker.audio_output_lost();
+                assert!(receiver.try_recv().is_err(), "duplicate loss must not queue more stops");
+                broker.handle_status(Status::Finished);
+                broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+                    channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
+                assert_eq!(broker.shared.phase(), Phase::Paused, "retired statuses cannot resume or advance");
+                let epoch = 2 + cycle * 2;
+                let rate = if cycle % 2 == 0 { 44_100 } else { 48_000 };
+                broker.shared.set_sample_rate(rate);
+                broker.audio_output_prepared(epoch);
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+                broker.handle_status(Status::OutputReady { epoch: epoch + 100 });
+                assert!(receiver.try_recv().is_err());
+                broker.handle_status(Status::OutputReady { epoch });
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded)) if loaded == source));
+                broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+                    channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
+                assert_eq!(broker.shared.phase(), Phase::Paused, "seek completes before output resumes");
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(delta)) if (delta - position).abs() < 1e-6));
+                broker.shared.set_playhead_frames((position * rate as f64) as u64);
+                broker.handle_status(Status::Seeked);
+                assert_eq!(broker.shared.phase(), if playing { Phase::Playing } else { Phase::Paused });
+                assert_eq!(broker.queue_index, Some(1));
+                assert_eq!(broker.persist_snapshot(), snapshot);
+                assert_eq!(broker.shared.sample_rate(), rate);
+            }
+        }
+    }
+
+    #[test]
+    fn device_recovery_honors_manual_pause_stop_and_quit() {
+        let (mut broker, receiver, source) = device_test_broker(true);
+        broker.audio_output_lost();
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.handle_command(Command::TogglePause); // user cancels automatic resume
+        broker.audio_output_prepared(4);
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.handle_status(Status::OutputReady { epoch: 4 });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_status(Status::Opened { source, sample_rate: 22_050, channels: 1, title: None, duration: None });
+        assert_eq!(broker.shared.phase(), Phase::Paused);
+        broker.audio_output_lost();
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.handle_command(Command::Stop);
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.audio_output_prepared(6);
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.handle_status(Status::OutputReady { epoch: 6 });
+        assert!(receiver.try_recv().is_err(), "a stopped player cannot auto-restart");
+        broker.audio_output_lost();
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.audio_output_prepared(8);
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(broker.handle_command(Command::Quit), Flow::Exit));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Shutdown)));
+        broker.handle_status(Status::OutputReady { epoch: 8 });
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn device_recovery_uses_latest_selection_and_seek_failure_does_not_stall() {
+        let (mut broker, receiver, _) = device_test_broker(true);
+        broker.shared.set_playhead_frames(48_000 * 5);
+        broker.audio_output_lost();
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        let latest = Source::File("new.mp4".into());
+        broker.handle_command(Command::Load { source: latest.clone(), paused: false });
+        assert!(receiver.try_recv().is_err(), "no decoder load while the output is absent");
+        broker.audio_output_prepared(4);
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.handle_status(Status::OutputReady { epoch: 4 });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded)) if loaded == latest));
+        broker.handle_status(Status::Opened { source: latest.clone(), sample_rate: 48_000, channels: 2, title: None, duration: None });
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        broker.shared.set_playhead_frames(48_000 * 3);
+        broker.audio_output_lost();
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.audio_output_prepared(6);
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        broker.handle_status(Status::OutputReady { epoch: 6 });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_status(Status::Opened { source: latest, sample_rate: 48_000, channels: 2, title: None, duration: None });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(3.0))));
+        broker.handle_status(Status::SeekFailed);
+        assert_eq!(broker.shared.phase(), Phase::Playing, "unseekable sources restart instead of remaining paused");
+    }
+
+    #[test]
+    fn another_device_loss_during_recovery_seek_retains_position_and_resume_intent() {
+        let (mut broker, receiver, source) = device_test_broker(true);
+        broker.shared.set_playhead_frames(48_000 * 5);
+        for epoch in [4, 6] {
+            broker.audio_output_lost();
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+            broker.audio_output_prepared(epoch);
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+            broker.handle_status(Status::OutputReady { epoch });
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
+            broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+                channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(5.0))));
+            assert_eq!(broker.shared.phase(), Phase::Paused);
+        }
+        broker.handle_command(Command::TogglePause); // cancel resume while the seek is pending
+        broker.handle_status(Status::Seeked);
+        assert_eq!(broker.shared.phase(), Phase::Paused);
+    }
+
+    #[test]
+    fn decoded_source_rate_does_not_replace_device_rate_or_container_duration() {
+        let (mut broker, _, _) = broker_with_sink();
+        broker.shared.set_sample_rate(48_000);
+        let duration = Duration::from_secs(21);
+        broker.handle_status(Status::Opened {
+            source: Source::File("he-aac.mp4".into()), sample_rate: 22_050,
+            channels: 1, title: None, duration: Some(duration),
+        });
+        assert_eq!(broker.shared.sample_rate(), 48_000);
+        assert_eq!(broker.track.as_ref().unwrap().sample_rate, 22_050);
+        assert_eq!(broker.track.as_ref().unwrap().channels, 1);
+        assert_eq!(broker.track.as_ref().unwrap().duration, Some(duration));
+        broker.shared.add_frames_played(48_000);
+        assert_eq!(broker.shared.position(), Duration::from_secs(1));
     }
 
     #[test]
