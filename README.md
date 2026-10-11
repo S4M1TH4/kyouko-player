@@ -83,7 +83,7 @@ onto the overlay. An optional startup argument opens a file or URL immediately:
 
 ```powershell
 .\target\release\kyouko-player.exe "C:\Music\track.mp3"
-.\target\release\kyouko-player.exe "https://www.youtube.com/watch?v=VIDEO_ID"
+.\target\release\kyouko-player.exe "https://www.youtube.com/watch?v=DdUoGjniJ7s"
 ```
 
 Scroll over an equalizer column to adjust that band by 1 dB. Left-click the track
