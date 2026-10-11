@@ -63,6 +63,9 @@ crossbeam-channel = "0.5"
 serde_json = "1" # decode escaped playlist titles without splitting songs at newlines
 windows-core = "0.62"
 
+[build-dependencies]
+winres = "0.1.12" # compile the executable's Windows icon/version resources
+
 [profile.release]
 opt-level = 3        # "z" would starve the decode loop; 3 keeps biquads + symphonia fast
 lto = "fat"

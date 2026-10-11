@@ -7,7 +7,7 @@
 //! loop { GetMessageW }                        // parks in the kernel, zero CPU
 //!   WM_APP_BROKER  → drain cmd_rx (try_recv)  → broker.handle_command → sync()
 //!   WM_APP_STATUS  → drain status_rx          → broker.handle_status  → sync()
-//!   WM_APP_TRAY    → left-click: pause/resume; right-click: Show/Hide Echo + Quit
+//!   WM_APP_TRAY    → selection: show/hide overlay; right-click: no action
 //!   WM_TIMER (1 Hz, ONLY while Playing) → broker.tick() → sync()
 //! ```
 //!

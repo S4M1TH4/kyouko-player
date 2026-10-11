@@ -9,8 +9,8 @@
 //!
 //! The window is moved/sized by the caller and then purely painted through
 //! `UpdateLayeredWindow` — there is no WM_PAINT path at all. The window is
-//! draggable over panel text (`HTCAPTION`), except Track Info. Track Info
-//! and the Braille EQ strip use `HTCLIENT` for list clicks and EQ scrolling.
+//! draggable over panel text (`HTCAPTION`), except Track Info and the quit X.
+//! Those controls and the Braille EQ strip use `HTCLIENT`.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -47,6 +47,17 @@ pub const WINDOW_W: i32 = 80;
 const EQ_ROWS: usize = 4;
 /// Negative = per-em height: the glyph cell stays exact at any DPI.
 const FONT_HEIGHT: i32 = -9;
+const QUIT_BUTTON_W: i32 = 8;
+
+fn quit_button_rect(line_h: i32) -> RECT {
+    RECT { left: WINDOW_W - PAD - QUIT_BUTTON_W, top: PAD,
+        right: WINDOW_W - PAD, bottom: PAD + line_h }
+}
+
+pub fn quit_button_at(x: i32, y: i32, line_h: i32) -> bool {
+    let rect = quit_button_rect(line_h);
+    (rect.left..rect.right).contains(&x) && (rect.top..rect.bottom).contains(&y)
+}
 
 pub fn track_info_at(x: i32, y: i32, line_h: i32) -> bool {
     line_h > 0 && (0..WINDOW_W).contains(&x)
@@ -272,6 +283,16 @@ fn eq_band_index(x: i32, width: i32) -> usize {
     (x.clamp(0, width - 1) * EQ_BANDS as i32 / width) as usize
 }
 
+/// ASCII header tokens avoid font fallback and leave ample room for quit X.
+fn status_token(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Playing => "PLY",
+        Phase::Paused => "PSD",
+        Phase::Stopped => "STP",
+        Phase::Loading => "LDG",
+    }
+}
+
 fn accent(phase: Phase) -> [u8; 3] {
     match phase {
         Phase::Playing => [0xA8, 0xE0, 0xBE], // mint — active state, unchanged
@@ -402,10 +423,14 @@ impl Renderer {
         Some(eq_band_index(x, self.width))
     }
 
-    /// The only client input regions: Track Info and the Braille strip.
+    /// Client input regions: quit X, Track Info and the Braille strip.
     /// Volume/EQ/repeat text remains part of the native drag surface.
     pub fn client_input_at(&self, x: i32, y: i32) -> bool {
-        self.track_info_at(x, y) || self.eq_band_at(x, y).is_some()
+        self.quit_button_at(x, y) || self.track_info_at(x, y) || self.eq_band_at(x, y).is_some()
+    }
+
+    pub fn quit_button_at(&self, x: i32, y: i32) -> bool {
+        quit_button_at(x, y, self.line_h)
     }
 
     pub fn track_info_at(&self, x: i32, y: i32) -> bool {
@@ -414,6 +439,32 @@ impl Renderer {
 
     pub fn track_info_y(&self) -> i32 {
         PAD + 2 * self.line_h
+    }
+
+    fn draw_panel_text(&self, panel: &str, phase: Phase) {
+        unsafe {
+            for (i, line) in panel.lines().enumerate() {
+                if i == 0 {
+                    // Branding and compact state share the existing header
+                    // row, leaving the quit button pinned on the right.
+                    let mut wide: Vec<u16> = format!("KYOUKO {}", status_token(phase)).encode_utf16().collect();
+                    let mut rect = RECT { left: PAD, top: PAD,
+                        right: quit_button_rect(self.line_h).left, bottom: PAD + self.line_h };
+                    DrawTextW(self.mem_dc, &mut wide, &mut rect, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                } else {
+                    let wide: Vec<u16> = line.encode_utf16().collect();
+                    let _ = TextOutW(self.mem_dc, PAD, PAD + i as i32 * self.line_h, &wide);
+                }
+            }
+        }
+    }
+
+    fn draw_quit_button(&self) {
+        unsafe {
+            let mut rect = quit_button_rect(self.line_h);
+            DrawTextW(self.mem_dc, &mut ['X' as u16], &mut rect,
+                windows::Win32::Graphics::Gdi::DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
     }
 
     /// Draw all four physical rows explicitly. Rasterize each glyph's exact
@@ -455,10 +506,8 @@ impl Renderer {
             std::ptr::write_bytes(self.bits, 0, len);
 
             SetTextColor(self.mem_dc, COLORREF(0x00FF_FFFF));
-            for (i, line) in panel.lines().enumerate() {
-                let wide: Vec<u16> = line.encode_utf16().collect();
-                let _ = TextOutW(self.mem_dc, PAD, PAD + i as i32 * self.line_h, &wide);
-            }
+            self.draw_panel_text(panel, phase);
+            self.draw_quit_button();
 
             // Braille equalizer: 10 columns across the full width, filling
             // middle-out from the invisible baseline between the two inner
@@ -850,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_layout_ends_after_eq_and_only_track_info_and_eq_are_client_input() {
+    fn compact_layout_keeps_size_and_routes_only_quit_track_info_and_eq_as_client_input() {
         let shared = crate::broker::SharedState::new();
         let panel = crate::broker::render_panel(&shared, None);
         let renderer = Renderer::new(&panel).unwrap();
@@ -861,7 +910,9 @@ mod tests {
             for x in 0..renderer.width {
                 let track = (PAD + 2 * renderer.line_h..PAD + 3 * renderer.line_h).contains(&y);
                 let eq = (renderer.eq_top..renderer.height - PAD).contains(&y);
-                assert_eq!(renderer.client_input_at(x, y), track || eq, "client region ({x}, {y})");
+                let quit = (WINDOW_W - PAD - 8..WINDOW_W - PAD).contains(&x)
+                    && (PAD..PAD + renderer.line_h).contains(&y);
+                assert_eq!(renderer.client_input_at(x, y), quit || track || eq, "client region ({x}, {y})");
                 assert_eq!(renderer.eq_band_at(x, y), eq.then_some((x / 8) as usize), "wheel region ({x}, {y})");
             }
         }
@@ -872,6 +923,84 @@ mod tests {
         for y in [-1, renderer.height] {
             assert!(!renderer.client_input_at(0, y));
             assert_eq!(renderer.eq_band_at(0, y), None);
+        }
+    }
+
+    #[test]
+    fn quit_button_edges_and_header_pixels_share_one_box_without_growing_the_window() {
+        let renderer = Renderer::new("KYOUKO PLAYING\ntime\ntrack\nvolume\neq/repeat").unwrap();
+        let rect = quit_button_rect(renderer.line_h);
+        assert_eq!(renderer.width, 80);
+        assert_eq!(renderer.height, 2 * PAD + 9 * renderer.line_h);
+        for (x, y) in [(rect.left, rect.top), (rect.right - 1, rect.top),
+            (rect.left, rect.bottom - 1), (rect.right - 1, rect.bottom - 1)] {
+            assert!(renderer.quit_button_at(x, y));
+            assert!(renderer.client_input_at(x, y));
+        }
+        for (x, y) in [(rect.left - 1, rect.top), (rect.right, rect.top),
+            (rect.left, rect.top - 1), (rect.left, rect.bottom)] {
+            assert!(!renderer.quit_button_at(x, y));
+        }
+        assert!(!quit_button_at(72, PAD, 0));
+        unsafe {
+            let len = (renderer.width * renderer.height) as usize * 4;
+            std::ptr::write_bytes(renderer.bits, 0, len);
+            SetTextColor(renderer.mem_dc, COLORREF(0x00FF_FFFF));
+            renderer.draw_panel_text("KYOUKO PLAYING WITH A VERY LONG HEADER\ntime\ntrack\nvolume\neq/repeat", Phase::Playing);
+            assert!(GdiFlush().as_bool());
+            let lit_in_button = || {
+                let pixels = std::slice::from_raw_parts(renderer.bits, len);
+                (rect.top..rect.bottom).flat_map(|y| (rect.left..rect.right).map(move |x| (y * renderer.width + x) as usize))
+                    .filter(|&index| pixels[index * 4..index * 4 + 3].iter().any(|&value| value != 0)).count()
+            };
+            assert_eq!(lit_in_button(), 0, "header must not overlap the quit glyph");
+            renderer.draw_quit_button();
+            assert!(GdiFlush().as_bool());
+            assert!(lit_in_button() > 0, "X must be visibly painted inside its hit box");
+        }
+    }
+
+    #[test]
+    fn branding_and_compact_tokens_render_fully_before_pinned_quit() {
+        let shared = crate::broker::SharedState::new();
+        for (phase, token, header) in [(Phase::Playing, "PLY", "KYOUKO PLY"),
+            (Phase::Paused, "PSD", "KYOUKO PSD"), (Phase::Stopped, "STP", "KYOUKO STP"),
+            (Phase::Loading, "LDG", "KYOUKO LDG")] {
+            assert_eq!(status_token(phase), token);
+            assert!(token.is_ascii());
+            shared.set_phase(phase);
+            let panel = crate::broker::render_panel(&shared, None);
+            let renderer = Renderer::new(&panel).unwrap();
+            let reference = Renderer::new(&panel).unwrap();
+            assert_eq!(renderer.size(), (80, 2 * PAD + 9 * renderer.line_h));
+            let quit = quit_button_rect(renderer.line_h);
+            unsafe {
+                let len = (renderer.width * renderer.height) as usize * 4;
+                std::ptr::write_bytes(renderer.bits, 0, len);
+                std::ptr::write_bytes(reference.bits, 0, len);
+                SetTextColor(renderer.mem_dc, COLORREF(0x00FF_FFFF));
+                SetTextColor(reference.mem_dc, COLORREF(0x00FF_FFFF));
+                let wide: Vec<u16> = header.encode_utf16().collect();
+                let mut extent = SIZE::default();
+                GetTextExtentPoint32W(renderer.mem_dc, &wide, &mut extent).unwrap();
+                assert!(PAD + extent.cx < quit.left, "{header} needs no ellipsis and cannot overlap X");
+                renderer.draw_panel_text(&panel, phase);
+                // Reference paints the full brand and token without clipping
+                // or ellipsis; pixel equality proves no letters are lost.
+                TextOutW(reference.mem_dc, PAD, PAD, &wide).unwrap();
+                assert!(GdiFlush().as_bool());
+                let first_row = (PAD * renderer.width) as usize * 4;
+                let after_row = ((PAD + renderer.line_h) * renderer.width) as usize * 4;
+                assert_eq!(&std::slice::from_raw_parts(renderer.bits, len)[first_row..after_row],
+                    &std::slice::from_raw_parts(reference.bits, len)[first_row..after_row], "full {header} pixels");
+                renderer.draw_quit_button();
+                assert!(GdiFlush().as_bool());
+                let pixels = std::slice::from_raw_parts(renderer.bits, len);
+                assert!((quit.top..quit.bottom).any(|y| (quit.left..quit.right).any(|x| {
+                    let index = (y * renderer.width + x) as usize * 4;
+                    pixels[index..index + 3].iter().any(|&value| value != 0)
+                })), "X stays painted at the right edge");
+            }
         }
     }
 

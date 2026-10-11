@@ -44,17 +44,16 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, NIN_SELECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, IsWindow, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
     PostMessageW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
-    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MF_STRING, MSG,
-    SPI_GETWORKAREA, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE,
+    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MSG,
+    SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE,
     WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
-    WM_NULL, WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WM_MBUTTONUP, WA_INACTIVE,
+    WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WM_MBUTTONUP, WA_INACTIVE,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{implement, Ref};
@@ -70,9 +69,6 @@ use crate::{log_debug, log_error, log_info, log_warn};
 
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 1000;
-/// Non-zero command IDs for the two retained tray menu items.
-const MENU_TOGGLE_WINDOW: usize = 1;
-const MENU_QUIT: usize = 2;
 const WM_TRACKLIST_CLOSED: u32 = 0x8004;
 const WM_TRACKLIST_FINISH_CLICK: u32 = 0x8005;
 const DRAWER_ALPHA: u8 = 245;
@@ -703,8 +699,7 @@ fn phase_name(p: Phase) -> &'static str {
 fn drain_commands(s: &mut UiState) -> bool {
     loop {
         match s.cmd_rx.try_recv() {
-            Ok(Command::ToggleWindow) => toggle_visible(s, SW_SHOWNOACTIVATE),
-            Ok(Command::ToggleOverlay) => toggle_visible(s, SW_SHOW),
+            Ok(Command::ToggleOverlay) => toggle_visible(s),
             Ok(cmd) => {
                 if s.broker.handle_command(cmd) == Flow::Exit {
                     return true;
@@ -728,71 +723,43 @@ fn drain_statuses(s: &mut UiState) {
     }
 }
 
-fn on_tray(s: &mut UiState, lp: LPARAM) {
-    match lp.0 as u32 {
-        // Left-click = play/pause, dispatched through the command channel so
-        // the broker stays the single decision point (NIN_SELECT covers
-        // NOTIFYICON_VERSION_4 shells; version 0 delivers WM_LBUTTONUP).
-        WM_LBUTTONUP | NIN_SELECT => post_command(Command::TogglePause),
-        WM_RBUTTONUP | WM_CONTEXTMENU => popup_menu(s),
-        _ => {}
+fn tray_command(notification: u32) -> Option<Command> {
+    // Tray selection controls visibility only. No tray message controls
+    // playback or opens a context menu (including right-click events).
+    match notification & 0xffff {
+        WM_LBUTTONUP | NIN_SELECT => Some(Command::ToggleOverlay),
+        _ => None,
     }
 }
 
-fn toggle_visible(s: &mut UiState, show_command: SHOW_WINDOW_CMD) {
+fn quit_click_command(renderer: &Renderer, x: i32, y: i32) -> Option<Command> {
+    renderer.quit_button_at(x, y).then_some(Command::Quit)
+}
+
+fn right_click_command(renderer: &Renderer, message: u32, lp: LPARAM, bounds: RECT) -> Option<Command> {
+    if !matches!(message, WM_RBUTTONDOWN | WM_NCRBUTTONDOWN) { return None; }
+    // Client messages carry client coordinates; caption messages carry
+    // signed screen coordinates, including monitors left/above the primary.
+    let caption = message == WM_NCRBUTTONDOWN;
+    let x = x_lparam(lp) - if caption { bounds.left } else { 0 };
+    let y = y_lparam(lp) - if caption { bounds.top } else { 0 };
+    let (width, height) = renderer.size();
+    if !(0..width).contains(&x) || !(0..height).contains(&y) || renderer.quit_button_at(x, y) {
+        return None;
+    }
+    Some(Command::TogglePause)
+}
+
+fn toggle_visible(s: &mut UiState) {
     let drawer = s.drawer.take();
     s.hidden = !s.hidden;
     let hwnd = s.hwnd;
     let hidden = s.hidden;
     if let Some(drawer) = drawer { close_drawer(drawer.hwnd); }
     unsafe {
-        let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { show_command });
+        let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { SW_SHOW });
     }
     log_info!("UI", "echo window: {}", if hidden { "hidden" } else { "shown" });
-}
-
-/// The tray popup retains only Show/Hide Echo and Quit. Returning the command
-/// ID avoids menu-message handlers, sticky reopen state, and mouse hooks.
-fn popup_menu(s: &UiState) {
-    unsafe {
-        let mut pt = POINT::default();
-        if let Err(e) = GetCursorPos(&mut pt) {
-            log_warn!("UI", "tray menu cursor position unavailable: {e}");
-            return;
-        }
-        let menu = match CreatePopupMenu() {
-            Ok(menu) => menu,
-            Err(e) => {
-                log_warn!("UI", "tray menu creation failed: {e}");
-                return;
-            }
-        };
-        let label = if s.hidden { w!("Show Echo") } else { w!("Hide Echo") };
-        if let Err(e) = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_WINDOW, label)
-            .and_then(|()| AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit")))
-        {
-            let _ = DestroyMenu(menu);
-            log_warn!("UI", "tray menu population failed: {e}");
-            return;
-        }
-        let _ = SetForegroundWindow(s.hwnd);
-        log_debug!("UI", "tray menu: {} / Quit", if s.hidden { "Show Echo" } else { "Hide Echo" });
-        let selected = TrackPopupMenu(
-            menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-            pt.x, pt.y, None, s.hwnd, None,
-        ).0 as usize;
-        let _ = DestroyMenu(menu);
-        // Complete tray-menu dismissal before dispatching the selected action.
-        let _ = PostMessageW(Some(s.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        match selected {
-            MENU_TOGGLE_WINDOW => post_command(Command::ToggleWindow),
-            MENU_QUIT => {
-                log_info!("UI", "tray quit chosen");
-                post_command(Command::Quit);
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Window, tray, and hotkey interactions share the broker command channel. The
@@ -1104,7 +1071,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_TRAY => {
-                on_tray(s, lp);
+                if let Some(command) = tray_command(lp.0 as u32) { post_command(command); }
                 LRESULT(0)
             }
             m if m == s.taskbar_created => {
@@ -1119,9 +1086,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_NCHITTEST => {
-                // Only Track Info and the Braille strip are client regions.
+                // Quit X, Track Info and the Braille strip are client regions.
                 // All other text, including volume/EQ/repeat, is a native
-                // drag surface without playback click controls.
+                // drag surface. Its right-clicks arrive as WM_NCRBUTTONDOWN
+                // and are handled below without invoking the system menu.
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
                 // WM_NCHITTEST's lParam is SCREEN coordinates — convert to
@@ -1135,11 +1103,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
             WM_LBUTTONDOWN => {
-                // Track Info is the only left-click action. Braille strip
-                // clicks are consumed; its gains remain wheel-driven.
+                // X uses the same graceful Quit command as Alt+Q; Track Info
+                // opens the list. Braille clicks remain a no-op.
                 let x = x_lparam(lp);
                 let y = y_lparam(lp);
-                if s.renderer.track_info_at(x, y) {
+                if let Some(command) = quit_click_command(&s.renderer, x, y) {
+                    post_command(command);
+                } else if s.renderer.track_info_at(x, y) {
                     toggle_tracklist(state);
                 }
                 // Left-clicks on the Braille EQ strip do nothing (tuning is
@@ -1148,13 +1118,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_RBUTTONDOWN | WM_NCRBUTTONDOWN => {
-                // Right-click anywhere pauses/resumes. Both message flavors
-                // arrive: Track Info/EQ are HTCLIENT (WM_RBUTTONDOWN), the
-                // remaining text is HTCAPTION (WM_NCRBUTTONDOWN).
-                log_debug!("UI", "right-click: toggle pause");
-                post_command(Command::TogglePause);
+                let mut bounds = RECT::default();
+                if msg == WM_NCRBUTTONDOWN && GetWindowRect(hwnd, &mut bounds).is_err() {
+                    return LRESULT(0);
+                }
+                if let Some(command) = right_click_command(&s.renderer, msg, lp, bounds) {
+                    post_command(command);
+                }
+                // Consuming caption right-down prevents default system-menu
+                // handling while leaving left-button HTCAPTION dragging intact.
                 LRESULT(0)
             }
+            // Toggle only on down: release/context messages cannot toggle a
+            // second time or bring back a native/context menu.
+            WM_RBUTTONUP | WM_NCRBUTTONUP | WM_CONTEXTMENU => LRESULT(0),
             WM_MOUSEWHEEL => {
                 // WM_MOUSEWHEEL's lParam is SCREEN coordinates (unlike the
                 // mouse-button messages) — convert to client space against
@@ -1181,7 +1158,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_CLOSE => {
                 // Closing the echo hides it; playback continues. Quit is
-                // available through the tray menu and debug-console Ctrl+C.
+                // available through X, Alt+Q and debug-console Ctrl+C.
                 let _ = ShowWindow(s.hwnd, SW_HIDE);
                 s.hidden = true;
                 dismiss_tracklist(state);
@@ -1222,6 +1199,73 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_selection_only_changes_visibility_and_right_clicks_dispatch_nothing() {
+        for notification in [WM_LBUTTONUP, NIN_SELECT, (1 << 16) | NIN_SELECT] {
+            assert!(matches!(tray_command(notification), Some(Command::ToggleOverlay)));
+        }
+        for notification in [WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP,
+            WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_CONTEXTMENU, 0, u32::MAX] {
+            assert!(tray_command(notification).is_none());
+        }
+    }
+
+    #[test]
+    fn quit_button_dispatches_the_same_command_as_alt_q() {
+        let renderer = Renderer::new("KYOUKO PLAYING\ntime\ntrack\nvolume\neq/repeat").unwrap();
+        assert!(matches!(quit_click_command(&renderer, 72, 4), Some(Command::Quit)));
+        assert!(matches!(hotkey_command(HOTKEY_QUIT as usize), Some(Command::Quit)));
+        for (x, y) in [(68, 4), (77, 4), (72, 2), (72, 20), (-1, 4), (80, 4)] {
+            assert!(quit_click_command(&renderer, x, y).is_none());
+        }
+    }
+
+    fn packed_point(x: i32, y: i32) -> LPARAM {
+        LPARAM((((y as u16 as u32) << 16) | x as u16 as u32) as isize)
+    }
+
+    #[test]
+    fn right_click_client_and_caption_surfaces_toggle_once_except_quit() {
+        let renderer = Renderer::new("KYOUKO PLAYING\ntime\ntrack\nvolume\neq/repeat").unwrap();
+        let (width, height) = renderer.size();
+        let bounds = RECT { left: -1200, top: -600, right: -1200 + width, bottom: -600 + height };
+        // Exercise all pixels and both message coordinate systems without
+        // sending synthetic Windows input or calling the window procedure.
+        for y in 0..height {
+            for x in 0..width {
+                let expected = !renderer.quit_button_at(x, y);
+                for (down, up, lp) in [
+                    (WM_RBUTTONDOWN, WM_RBUTTONUP, packed_point(x, y)),
+                    (WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, packed_point(bounds.left + x, bounds.top + y)),
+                ] {
+                    assert_eq!(matches!(right_click_command(&renderer, down, lp, bounds), Some(Command::TogglePause)), expected);
+                    assert!(right_click_command(&renderer, up, lp, bounds).is_none());
+                    assert!(right_click_command(&renderer, WM_CONTEXTMENU, lp, bounds).is_none());
+                }
+            }
+        }
+        // The title/status/volume drag surface still uses caption hit-testing;
+        // list/EQ/X client carve-outs are unchanged.
+        assert!(!renderer.client_input_at(10, 4));
+        assert!(renderer.client_input_at(72, 4));
+        assert!(renderer.client_input_at(10, renderer.track_info_y()));
+    }
+
+    #[test]
+    fn right_clicks_outside_window_and_left_messages_do_not_toggle() {
+        let renderer = Renderer::new("KYOUKO PLAYING\ntime\ntrack\nvolume\neq/repeat").unwrap();
+        let (width, height) = renderer.size();
+        let bounds = RECT { left: 1000, top: 500, right: 1000 + width, bottom: 500 + height };
+        for (x, y) in [(-1, 4), (width, 4), (10, -1), (10, height)] {
+            assert!(right_click_command(&renderer, WM_RBUTTONDOWN, packed_point(x, y), bounds).is_none());
+            assert!(right_click_command(&renderer, WM_NCRBUTTONDOWN,
+                packed_point(bounds.left + x, bounds.top + y), bounds).is_none());
+        }
+        for message in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL, 0, u32::MAX] {
+            assert!(right_click_command(&renderer, message, packed_point(10, 4), bounds).is_none());
+        }
+    }
 
     #[test]
     fn global_hotkey_ids_route_to_the_requested_commands() {

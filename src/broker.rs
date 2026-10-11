@@ -344,7 +344,7 @@ pub enum Command {
     /// saved track (or the first entry) paused. Fall back to last_track.
     RestoreState { last_folder: Option<String>, last_track: Option<String>, last_playlist_index: Option<usize> },
     /// Flip between Playing and Paused; restart the retained track when
-    /// Stopped (window/tray clicks and the pause hotkey).
+    /// Stopped (Alt+/ or a floating-window right-click outside X).
     TogglePause,
     /// Jump the playhead by a signed offset in seconds (global hotkeys).
     SeekRelative(f64),
@@ -376,9 +376,7 @@ pub enum Command {
     ToggleEq,
     /// Toggle track repeat (mpv `loop-file`): Finished replays the source.
     ToggleLoop,
-    /// Show/hide the echo window (handled by the presentation layer).
-    ToggleWindow,
-    /// Global hotkey to show/hide the floating window (presentation-only).
+    /// Global hotkey or tray selection to show/hide the floating window.
     ToggleOverlay,
     Quit,
 }
@@ -1368,12 +1366,12 @@ impl Broker {
                 self.persist();
             }
             // Presentation-only: intercepted by the Win32 command drain.
-            Command::ToggleWindow | Command::ToggleOverlay => {
+            Command::ToggleOverlay => {
                 log_debug!("BROKER", "window toggle is presentation-side");
             }
             Command::Quit => {
                 log_info!("BROKER", "quit — shutting decoder down (kills yt-dlp child)");
-                self.persist(); // final flush; tray and debug Ctrl+C land here
+                self.persist(); // final flush; X, Alt+Q and debug Ctrl+C land here
                 self.send_decoder(DecoderCmd::Shutdown);
                 self.pending_source = None;
                 self.track = None;

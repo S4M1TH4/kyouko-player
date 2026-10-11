@@ -1,7 +1,7 @@
 //! Tray icon — fully procedural. The glyph (mountain + echo arcs) is computed
 //! in `super::glyph`, supersampled 4× into a 32bpp alpha DIB, and turned into
-//! an HICON via `CreateIconIndirect`. No `.ico` asset, no resource file, no
-//! `build.rs`: the binary is the only artifact.
+//! an HICON via `CreateIconIndirect`. The executable's separate PE icon is
+//! generated from the same geometry by `build.rs`; no runtime asset is needed.
 //!
 //! A top-down DIB (negative `biHeight`) is used deliberately: it removes the
 //! bottom-up scanline ambiguity that raw `CreateIcon` AND/XOR masks carry.

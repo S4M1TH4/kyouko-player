@@ -1,6 +1,7 @@
-//! The kyouko glyph: a mountain and its echo — computed, never shipped.
+//! The kyouko glyph: a mountain and its echo — shared procedural geometry.
 //! Geometry is defined in a 16×16 logical space but can be rendered at any
 //! resolution; the tray icon supersamples at 4× (64×64) for smooth edges.
+//! `build.rs` also uses this geometry for the embedded executable icon.
 //! Pure math, no platform types.
 
 const APEX_X: f32 = 5.0;

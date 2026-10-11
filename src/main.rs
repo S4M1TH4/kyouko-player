@@ -49,6 +49,10 @@ mod process;
 mod stream_buffer;
 mod ui;
 
+#[cfg(test)]
+#[path = "../build/icon.rs"]
+mod executable_icon;
+
 use crossbeam_channel::bounded;
 
 use std::sync::Arc;
