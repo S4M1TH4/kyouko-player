@@ -1,4 +1,4 @@
-//! The Windows presentation pump: 80 px layered window, tray integration,
+//! The Windows presentation pump: 80 px layered window, global hotkeys,
 //! and a `GetMessageW` loop that parks in the kernel whenever nothing is
 //! happening. Every channel push from any thread arrives here as exactly one
 //! posted message — data in channels, wake-ups in the window queue.
@@ -6,7 +6,6 @@
 //! Wake-up routing (`WM_APP`):
 //! * `WM_APP_BROKER` (0x8001) — a Command is waiting in `cmd_rx`
 //! * `WM_APP_STATUS` (0x8002) — a Status is waiting in `status_rx`
-//! * `WM_APP_TRAY`   (0x8003) — tray icon mouse events
 //!
 //! Timer discipline: the 1 Hz panel timer exists **only** while `Playing`.
 //! Pause/Stop kill it, so a paused player has zero scheduled wake-ups — the
@@ -42,11 +41,11 @@ use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, NIN_SELECT};
+use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, GetWindowRect, IsWindow, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    PostMessageW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    PostMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
     CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MSG,
     SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
@@ -62,8 +61,7 @@ use crate::audio::AudioOut;
 
 use super::render::{Renderer,
     TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position};
-use super::tray::Tray;
-use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
+use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS};
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status, TrackList};
 use crate::{log_debug, log_error, log_info, log_warn};
 
@@ -223,7 +221,6 @@ struct UiState {
     status_rx: Receiver<Status>,
     shared: Arc<SharedState>,
     renderer: Renderer,
-    tray: Tray,
     /// Owns the cpal stream; mirrors the phase onto WASAPI play/pause.
     audio_out: AudioOut,
     /// 1 Hz timer only exists while Playing — this is the "render loop sleeps
@@ -231,7 +228,6 @@ struct UiState {
     timer_on: bool,
     last_phase: Phase,
     hidden: bool,
-    taskbar_created: u32,
     hotkeys: GlobalHotkeys,
     drawer: Option<DrawerHandle>,
     next_drawer_token: usize,
@@ -291,8 +287,6 @@ pub fn run(
         }
     };
 
-    let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
-
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wndproc),
         hInstance: hinstance,
@@ -321,8 +315,7 @@ pub fn run(
     let drop_target: IDropTarget = DropTarget::new().into();
 
     // The state box rides through WM_NCCREATE via lpCreateParams and is
-    // reclaimed after the pump exits. Tray icon is registered once the hwnd
-    // exists (add() below).
+    // reclaimed after the pump exits.
     let state = Box::into_raw(Box::new(UiState {
         hwnd: HWND::default(),
         broker,
@@ -330,12 +323,10 @@ pub fn run(
         status_rx,
         shared,
         renderer,
-        tray: Tray::new(),
         audio_out,
         timer_on: false,
         last_phase: Phase::Stopped,
         hidden: false,
-        taskbar_created,
         hotkeys: GlobalHotkeys::default(),
             drawer: None,
             next_drawer_token: 0,
@@ -376,7 +367,6 @@ pub fn run(
                 log_warn!("UI", "RegisterDragDrop failed: {e}");
             }
         }
-        (*state).tray.add(hwnd);
         // Content exists before the window is shown — no first-paint flash.
         let eq = (*state).shared.eq_gains();
         (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase(), &eq);
@@ -406,7 +396,7 @@ pub fn run(
             DispatchMessageW(&msg);
         }
 
-        // Reclaim state: Tray::drop removes the icon, Renderer::drop frees GDI.
+        // Reclaim state: Renderer::drop frees the GDI resources.
         drop(Box::from_raw(state));
     }
     // Pair with OleInitialize (S_OK and S_FALSE both count). The drop
@@ -676,7 +666,6 @@ fn sync(s: &mut UiState) {
             s.timer_on = false;
             log_info!("UI", "1 Hz panel timer OFF — zero wake-ups until resumed");
         }
-        s.tray.set_tooltip(&format!("kyouko — {}", phase_name(phase)));
         s.last_phase = phase;
     }
     if let Some(panel) = s.broker.take_refresh() {
@@ -684,15 +673,6 @@ fn sync(s: &mut UiState) {
         s.renderer.draw(s.hwnd, &panel, phase, &eq);
     }
     refresh_tracklist(s);
-}
-
-fn phase_name(p: Phase) -> &'static str {
-    match p {
-        Phase::Stopped => "stopped",
-        Phase::Loading => "loading",
-        Phase::Playing => "playing",
-        Phase::Paused => "paused",
-    }
 }
 
 /// true = a Quit was processed → caller must destroy the window.
@@ -720,15 +700,6 @@ fn drain_statuses(s: &mut UiState) {
             Ok(st) => s.broker.handle_status(st),
             Err(_) => return,
         }
-    }
-}
-
-fn tray_command(notification: u32) -> Option<Command> {
-    // Tray selection controls visibility only. No tray message controls
-    // playback or opens a context menu (including right-click events).
-    match notification & 0xffff {
-        WM_LBUTTONUP | NIN_SELECT => Some(Command::ToggleOverlay),
-        _ => None,
     }
 }
 
@@ -762,7 +733,7 @@ fn toggle_visible(s: &mut UiState) {
     log_info!("UI", "echo window: {}", if hidden { "hidden" } else { "shown" });
 }
 
-/// Window, tray, and hotkey interactions share the broker command channel. The
+/// Window and hotkey interactions share the broker command channel. The
 /// broker stays the single decision point, with one wake per interaction.
 fn post_command(cmd: Command) {
     if let Some(tx) = CMD_TX.get() {
@@ -1070,15 +1041,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 sync(s);
                 LRESULT(0)
             }
-            WM_APP_TRAY => {
-                if let Some(command) = tray_command(lp.0 as u32) { post_command(command); }
-                LRESULT(0)
-            }
-            m if m == s.taskbar_created => {
-                // Explorer restarted: re-register the tray icon.
-                s.tray.add(s.hwnd);
-                LRESULT(0)
-            }
             WM_TIMER if wp.0 as usize == TIMER_ID => {
                 // Elapsed-time tick; only scheduled while Playing.
                 s.broker.tick();
@@ -1181,7 +1143,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let _ = KillTimer(Some(s.hwnd), TIMER_ID);
                     s.timer_on = false;
                 }
-                s.tray.remove();
                 dismiss_tracklist(state);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -1199,17 +1160,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tray_selection_only_changes_visibility_and_right_clicks_dispatch_nothing() {
-        for notification in [WM_LBUTTONUP, NIN_SELECT, (1 << 16) | NIN_SELECT] {
-            assert!(matches!(tray_command(notification), Some(Command::ToggleOverlay)));
-        }
-        for notification in [WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_CONTEXTMENU, 0, u32::MAX] {
-            assert!(tray_command(notification).is_none());
-        }
-    }
 
     #[test]
     fn quit_button_dispatches_the_same_command_as_alt_q() {
@@ -1305,19 +1255,18 @@ mod tests {
     }
 
     #[test]
-    fn hidden_window_registers_hotkeys_on_create_and_releases_them_on_destroy() {
+    fn hidden_window_keeps_hotkeys_through_visibility_toggles_and_quit() {
         use crate::broker::DecoderLink;
-        use windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE;
         let shared = SharedState::new();
-        let (decoder_tx, _decoder_rx) = crossbeam_channel::bounded(8);
-        let (_command_tx, cmd_rx) = crossbeam_channel::bounded(32);
+        let (decoder_tx, decoder_rx) = crossbeam_channel::bounded(8);
+        let (command_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
         let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, Arc::new(|| {})));
         let renderer = Renderer::new(broker.view()).unwrap();
         let mut state = Box::new(UiState {
             hwnd: HWND::default(), broker, cmd_rx, status_rx, shared, renderer,
-            tray: Tray::new(), audio_out: AudioOut::new(None), timer_on: false,
-            last_phase: Phase::Stopped, hidden: true, taskbar_created: 0,
+            audio_out: AudioOut::new(None), timer_on: false,
+            last_phase: Phase::Stopped, hidden: true,
             hotkeys: GlobalHotkeys::default(), drawer: None, next_drawer_token: 0,
         });
         unsafe {
@@ -1325,13 +1274,25 @@ mod tests {
             let class = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: instance.into(),
                 lpszClassName: w!("kyouko_hotkey_test"), ..Default::default() };
             assert_ne!(RegisterClassW(&class), 0);
-            let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("kyouko_hotkey_test"), w!(""),
-                WS_POPUP, 0, 0, 20, 20, None, None, Some(instance.into()),
+            // Keep the native test window offscreen and non-activating. Test
+            // broker commands directly, without injecting mouse/keyboard input.
+            let hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, w!("kyouko_hotkey_test"), w!(""),
+                WS_POPUP, -32000, -32000, 20, 20, None, None, Some(instance.into()),
                 Some(&mut *state as *mut UiState as *const c_void)).unwrap();
             state.hwnd = hwnd;
             assert!(!windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool());
             let registered = state.hotkeys.registered;
             println!("native hotkeys registered: {}/{}", registered.iter().filter(|&&active| active).count(), HOTKEY_BINDINGS.len());
+            for hidden in [false, true] {
+                command_tx.send(hotkey_command(HOTKEY_TOGGLE_OVERLAY as usize).unwrap()).unwrap();
+                assert!(!drain_commands(&mut state));
+                assert_eq!(state.hidden, hidden);
+                assert_eq!(windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool(), !hidden);
+                assert_eq!(state.hotkeys.registered, registered, "visibility cannot unregister global hotkeys");
+            }
+            command_tx.send(hotkey_command(HOTKEY_QUIT as usize).unwrap()).unwrap();
+            assert!(drain_commands(&mut state), "Alt+Q must exit even when the overlay is hidden");
+            assert!(matches!(decoder_rx.try_recv(), Ok(crate::broker::DecoderCmd::Shutdown)));
             DestroyWindow(hwnd).unwrap();
             assert!(!IsWindow(Some(hwnd)).as_bool());
             assert_eq!(state.hotkeys.registered, [false; HOTKEY_BINDINGS.len()]);

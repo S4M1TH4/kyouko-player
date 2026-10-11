@@ -6,9 +6,9 @@
 //!
 //! ```text
 //!                    Command (bounded 32)              DecoderCmd (bounded 8)
-//!   [window / tray / hotkeys] ──────────────▶ [MAIN / broker] ───────────────▶ [decoder thread]
+//!   [window / hotkeys] ────────────────────▶ [MAIN / broker] ───────────────▶ [decoder thread]
 //!    native Win32 messages                   blocked in GetMessageW*          parked in recv()/select!
-//!                                             owns: window, tray, Stream
+//!                                             owns: window, Stream
 //!                                                    ▲                              │ pooled AudioChunk (bounded)
 //!                                                    │ Status (bounded 16)          ▼
 //!                                                    └──────────────────── [WASAPI callback thread]
@@ -30,8 +30,8 @@
 //!
 //! # Ownership
 //!
-//! The broker (main thread) alone owns every OS handle: the 200 px layered
-//! window, the tray icon, and the cpal `Stream`. Nothing crosses thread
+//! The broker (main thread) alone owns every OS handle: the 80 px layered
+//! window and the cpal `Stream`. Nothing crosses thread
 //! boundaries except messages, so no `Sync` bounds are ever needed on handles.
 //!
 //! # Shutdown protocol
@@ -39,7 +39,7 @@
 //! `Quit` → broker sends `DecoderCmd::Shutdown` → decoder kills any yt-dlp
 //! child (never orphaned, network stops) → main joins the decoder → exit.
 //! Debug-console Ctrl+C / console close use the same graceful shutdown path.
-//! Release builds are GUI/tray processes with no console or stdin reader.
+//! Release builds are GUI overlay processes with no console or stdin reader.
 
 mod audio;
 mod broker;
@@ -117,7 +117,7 @@ fn main() {
 
     // The four message arteries. Bounded everywhere: a full queue is the
     // scheduler — senders block (park), nobody ever spins.
-    let (cmd_tx, cmd_rx) = bounded::<Command>(32); // window, tray, hotkeys, and startup
+    let (cmd_tx, cmd_rx) = bounded::<Command>(32); // window, hotkeys, and startup
     let (decoder_tx, decoder_rx) = bounded::<DecoderCmd>(8); // broker → decoder
     let (status_tx, status_rx) = bounded::<Status>(16); // decoder → broker
     CMD_TX.set(cmd_tx.clone()).ok();

@@ -3,11 +3,10 @@
 //! Step 2 shape — the Win32 pump:
 //!
 //! ```text
-//! create 80px layered window + procedural tray icon
+//! create 80px layered window + global hotkeys
 //! loop { GetMessageW }                        // parks in the kernel, zero CPU
 //!   WM_APP_BROKER  → drain cmd_rx (try_recv)  → broker.handle_command → sync()
 //!   WM_APP_STATUS  → drain status_rx          → broker.handle_status  → sync()
-//!   WM_APP_TRAY    → selection: show/hide overlay; right-click: no action
 //!   WM_TIMER (1 Hz, ONLY while Playing) → broker.tick() → sync()
 //! ```
 //!
@@ -20,12 +19,9 @@
 //! starts/stops the timer on phase transitions and repaints when the broker's
 //! panel is dirty. Everything else is message plumbing.
 
-pub mod glyph;
 mod headless;
 #[cfg(windows)]
 mod render;
-#[cfg(windows)]
-mod tray;
 #[cfg(windows)]
 mod win32;
 
@@ -41,11 +37,10 @@ use crate::broker::{Broker, Command, Status};
 /// can inject commands. `main` fills it before spawning any threads.
 pub static CMD_TX: OnceLock<Sender<Command>> = OnceLock::new();
 
-// WM_APP + 1..3. Kept as literals so the constants exist on every target;
-// win32.rs uses them as window messages, tray.rs as the callback message.
+// WM_APP + 1..2. Kept as literals so the constants exist on every target;
+// win32.rs uses them as channel wake-up messages.
 pub const WM_APP_BROKER: u32 = 0x8001;
 pub const WM_APP_STATUS: u32 = 0x8002;
-pub const WM_APP_TRAY: u32 = 0x8003;
 
 static PUMP_HWND: OnceLock<isize> = OnceLock::new();
 
@@ -56,7 +51,7 @@ pub fn set_pump_hwnd(hwnd: isize) {
     PUMP_HWND.set(hwnd).ok();
 }
 
-/// window / tray / global hotkeys / debug Ctrl+C → broker.
+/// window / global hotkeys / debug Ctrl+C → broker.
 pub fn wake_broker() {
     post(WM_APP_BROKER);
 }

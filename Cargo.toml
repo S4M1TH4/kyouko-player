@@ -11,7 +11,7 @@ description = "The mountain echo; only heard, never seen. A zero-resource, event
 
 [dependencies]
 # Raw Win32. Only the feature gates we actually touch; additive for the
-# Win32 UI/tray module (step 2). No abstraction layers on top of this.
+# Win32 overlay module. No abstraction layers on top of this.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -23,7 +23,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Ole",
     "Win32_System_SystemServices",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_UI_Shell",
+    "Win32_UI_Shell", # DragQueryFileW/HDROP for OLE file and folder drops
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",

@@ -1,5 +1,5 @@
 //! Build-time ICO encoder. Uses standard 32-bit DIB frames with alpha and
-//! transparency masks; all resolutions share the runtime tray's geometry.
+//! transparency masks; all resolutions share the mountain-and-echo geometry.
 #[path = "../src/ui/glyph.rs"]
 mod glyph;
 
@@ -49,7 +49,7 @@ fn dib(size: usize) -> Vec<u8> {
             let alpha = (coverage * 255 / SUPERSAMPLE.pow(2)) as u8;
             let bottom_up_y = size - 1 - y;
             let pixel = 40 + (bottom_up_y * size + x) * 4;
-            // ICO stores straight alpha, unlike the premultiplied tray DIB.
+            // ICO stores straight alpha.
             frame[pixel..pixel + 4].copy_from_slice(&[RGB[2], RGB[1], RGB[0], alpha]);
             if alpha == 0 {
                 frame[40 + xor_size + bottom_up_y * mask_stride + x / 8] |= 0x80 >> (x % 8);

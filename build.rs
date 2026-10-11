@@ -9,7 +9,7 @@ fn main() {
         return;
     }
 
-    // Derive every resolution from the tray's geometry, avoiding a stale or
+    // Derive every resolution from the glyph's geometry, avoiding a stale or
     // machine-local asset. No icon generation happens at application startup.
     let path = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"))
         .join("kyouko.ico");

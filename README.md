@@ -1,6 +1,6 @@
 # kyouko-player
 
-A zero-resource, event-driven audio player and OS media broker written in Rust. `kyouko-player` runs as a background process with a lightweight Win32 system tray handle and a minimalist transparent status window, consuming minimal CPU and RAM.
+A zero-resource, event-driven audio player and OS media broker written in Rust. `kyouko-player` runs as a background process with a minimalist transparent 80px Win32 status overlay and global hotkeys, consuming minimal CPU and RAM. It has no system tray icon. Use `Alt + Shift + /` to hide/show the overlay and `Alt + Q` or its top-right `X` to quit gracefully.
 
 The application contains no heavy UI framework overhead, no text rendering animations, and no album art decoders. When playback is paused or idle, execution threads yield completely to native Windows synchronization primitives (`MsgWaitForMultipleObjects` / `WaitMessage`).
 
@@ -73,5 +73,5 @@ When running in an interactive terminal, control playback state and DSP paramete
 * `src/main.rs` — Application entrypoint and signal orchestrator
 * `src/audio/` — Decoders, ring buffers, and output stream engine
 * `src/dsp/` — Biquad filter implementation for EQ processing
-* `src/platform/` — Win32 API wrappers, system tray, and OS event loop
+* `src/ui/` — Win32 overlay, tracklist drawer, global hotkeys, and OS event loop
 * `src/sources/` — File stream reader and `yt-dlp` stdin pipe wrapper

@@ -333,7 +333,7 @@ fn advance_playlist(source: &Source) -> Option<Source> {
     }
 }
 
-/// Input side: floating window, global hotkeys, and tray icon. All of them
+/// Input side: floating window, global hotkeys, and startup. All of them
 /// converge here — the broker is the single decision point.
 #[derive(Clone, Debug)]
 pub enum Command {
@@ -376,7 +376,7 @@ pub enum Command {
     ToggleEq,
     /// Toggle track repeat (mpv `loop-file`): Finished replays the source.
     ToggleLoop,
-    /// Global hotkey or tray selection to show/hide the floating window.
+    /// Alt+Shift+/ global hotkey to show/hide the floating window.
     ToggleOverlay,
     Quit,
 }
@@ -1053,7 +1053,7 @@ impl Broker {
     }
 
     /// Current panel text — read by the Win32 renderer in step 2 (e.g. when
-    /// it needs to repaint from scratch after `TaskbarCreated` or a resize).
+    /// it needs to repaint from scratch after creation or a resize).
     #[allow(dead_code)] // consumed in step 2
     pub fn view(&self) -> &str {
         &self.view
