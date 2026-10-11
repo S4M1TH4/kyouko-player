@@ -33,6 +33,8 @@ pub struct PersistedState {
     pub volume: f32,
     /// Band gains in dB, 31 Hz → 16 kHz.
     pub eq_gains: [f32; EQ_BANDS],
+    /// EQ bypass state; legacy configs default to enabled.
+    pub eq_enabled: bool,
     /// Raw last track: a local file path or a YouTube URL.
     pub last_track: Option<String>,
     /// Absolute path of the active local folder, rescanned on startup.
@@ -46,7 +48,7 @@ pub struct PersistedState {
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
-            volume: 0.8, eq_gains: [0.0; EQ_BANDS], last_track: None,
+            volume: 0.8, eq_gains: [0.0; EQ_BANDS], eq_enabled: true, last_track: None,
             last_folder: None, last_playlist_index: None, loop_enabled: false,
         }
     }
@@ -93,8 +95,9 @@ pub fn store_to(path: &Path, state: &PersistedState) {
         eq.push_str(&format!("{gain:.2}"));
     }
     let body = format!(
-        "# kyouko-player state — rewritten automatically, safe to edit\nvolume={:.3}\neq_gains={eq}\nlast_track={}\nlast_folder={}\nlast_playlist_index={}\nloop={}\n",
+        "# kyouko-player state — rewritten automatically, safe to edit\nvolume={:.3}\neq_gains={eq}\neq_enabled={}\nlast_track={}\nlast_folder={}\nlast_playlist_index={}\nloop={}\n",
         state.volume,
+        state.eq_enabled,
         state.last_track.as_deref().unwrap_or(""),
         state.last_folder.as_deref().unwrap_or(""),
         state.last_playlist_index.map(|index| index.to_string()).unwrap_or_default(),
@@ -138,6 +141,10 @@ fn parse(text: &str) -> PersistedState {
                     }
                 }
             }
+            "eq_enabled" => {
+                if value.eq_ignore_ascii_case("true") { state.eq_enabled = true; }
+                else if value.eq_ignore_ascii_case("false") { state.eq_enabled = false; }
+            }
             "last_track" => {
                 state.last_track = if value.is_empty() { None } else { Some(value.to_string()) };
             }
@@ -170,6 +177,7 @@ mod tests {
         let state = PersistedState {
             volume: 0.05,
             eq_gains: [6.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.5, 0.0, 8.0, 0.0],
+            eq_enabled: false,
             last_track: Some(r"C:\My Music\kyouko test file.mp3".into()),
             last_folder: Some(r"C:\My Music".into()),
             last_playlist_index: None,
@@ -257,5 +265,21 @@ mod tests {
         assert_eq!(loaded.eq_gains[0], 3.5);
         assert!(loaded.eq_gains[1..].iter().all(|g| *g == 0.0));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn eq_enabled_round_trip_and_legacy_or_invalid_defaults() {
+        let path = temp_path("eq-enabled");
+        for enabled in [false, true] {
+            let state = PersistedState { eq_enabled: enabled, ..Default::default() };
+            store_to(&path, &state);
+            assert_eq!(load_from(&path), state);
+        }
+        for text in ["volume=0.5\n", "eq_enabled=\n", "eq_enabled=banana\n"] {
+            assert!(parse(text).eq_enabled, "legacy/invalid state defaults to EQ ON");
+        }
+        assert!(!parse("eq_enabled=FALSE\n").eq_enabled);
+        assert!(parse("eq_enabled=TRUE\n").eq_enabled);
+        fs::remove_file(path).unwrap();
     }
 }

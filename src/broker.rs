@@ -346,7 +346,7 @@ pub enum Command {
     /// Flip between Playing and Paused; restart the retained track when
     /// Stopped (window/tray clicks and the pause hotkey).
     TogglePause,
-    /// Jump the playhead by a signed offset in seconds (window and hotkeys).
+    /// Jump the playhead by a signed offset in seconds (global hotkeys).
     SeekRelative(f64),
     /// Next / previous track: playlist sources step their entry index
     /// (clamped at the start); everything else restarts from 00:00.
@@ -364,8 +364,12 @@ pub enum Command {
     JumpToTrack(usize),
     Stop,
     /// 0.0..=1.0 linear gain, applied in the decoder (callback stays a memcpy).
-    /// Window wheel (+/-10% steps) adjusts the volume through this command.
+    /// The global volume hotkeys adjust through this clamped setting.
     SetVolume(f32),
+    /// Decrease volume by ten percentage points, clamped at zero.
+    VolumeDown,
+    /// Signed percentage-point adjustment, clamped to 0..=100%.
+    VolumeStep(i32),
     /// Band gain in dB, clamped to ±12. `None` = all bands.
     EqGain { band: Option<usize>, gain_db: f32 },
     /// Flip EQ bypass (off = biquads skipped, saved band gains untouched).
@@ -374,6 +378,8 @@ pub enum Command {
     ToggleLoop,
     /// Show/hide the echo window (handled by the presentation layer).
     ToggleWindow,
+    /// Global hotkey to show/hide the floating window (presentation-only).
+    ToggleOverlay,
     Quit,
 }
 
@@ -722,6 +728,7 @@ impl Broker {
         PersistedState {
             volume: self.shared.volume(),
             eq_gains: self.shared.eq_gains(),
+            eq_enabled: self.shared.eq_enabled(),
             last_track: self.last_opened_source.as_ref().map(|source| source.raw().to_string()),
             last_folder: self.last_folder.clone(),
             last_playlist_index: self.last_opened_source.as_ref().and_then(|source| match source {
@@ -1318,6 +1325,12 @@ impl Broker {
                 log_info!("BROKER", "volume: {:.0}%", v * 100.0);
                 self.persist();
             }
+            Command::VolumeDown => {
+                return self.handle_command(Command::VolumeStep(-10));
+            }
+            Command::VolumeStep(points) => {
+                return self.handle_command(Command::SetVolume(self.shared.volume() + points as f32 / 100.0));
+            }
             Command::EqGain { band, gain_db } => {
                 match band {
                     Some(b) if b < EQ_BANDS => {
@@ -1339,13 +1352,13 @@ impl Broker {
                 }
                 self.persist();
             }
-            // Bypass only: eq_enabled gates the biquad pass in the decoder;
-            // the saved band gains are untouched, so nothing to persist.
+            // Persist bypass separately; saved band gains remain untouched.
             Command::ToggleEq => {
                 let on = !self.shared.eq_enabled();
                 self.shared.set_eq_enabled(on);
                 log_info!("BROKER", "eq: {}", if on { "ON" } else { "OFF" });
                 self.refresh();
+                self.persist();
             }
             Command::ToggleLoop => {
                 let on = !self.shared.loop_enabled();
@@ -1355,7 +1368,7 @@ impl Broker {
                 self.persist();
             }
             // Presentation-only: intercepted by the Win32 command drain.
-            Command::ToggleWindow => {
+            Command::ToggleWindow | Command::ToggleOverlay => {
                 log_debug!("BROKER", "window toggle is presentation-side");
             }
             Command::Quit => {
@@ -1529,8 +1542,7 @@ fn row(content: &str) -> String {
 ///
 /// Compact 80 px layout: the window interior fits ~14 Consolas cells, so
 /// every line is tuned to that budget and the title truncates. The dual
-/// status row's column layout is fixed by ui/render.rs's STATUS_*_COLS
-/// hit-test table — keep the two in sync.
+/// status row keeps fixed display columns; its text has no toggle hit zones.
 pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     let timeline = match track.and_then(|t| t.duration) {
         Some(d) => format!("{}/{}", fmt_mmss(shared.position()), fmt_mmss(d)),
@@ -1554,11 +1566,8 @@ pub fn render_panel(shared: &SharedState, track: Option<&TrackMeta>) -> String {
     p.push('\n');
     p.push_str(&row(&format!("vol {bar} {:>3}%", (v * 100.0).round() as u32)));
     p.push('\n');
-    // Dual status row: eq state + repeat state side-by-side. The column
-    // layout is fixed by ui/render.rs's STATUS_*_COLS hit-test table
-    // (`eq:ON ` at columns 0..6, `rep:OFF` at 7..14) — keep the format in
-    // sync. The eq state is padded to 3 cells so `rep:` starts at a fixed
-    // column regardless of ON/OFF width.
+    // Display-only dual status row: EQ is padded to 3 cells so `rep:`
+    // remains at the same column regardless of ON/OFF width.
     p.push_str(&row(&format!(
         "eq:{:<3} rep:{}",
         if shared.eq_enabled() { "ON" } else { "OFF" },
@@ -1990,20 +1999,70 @@ mod tests {
     }
 
     #[test]
-    fn toggle_eq_bypasses_without_touching_gains_or_persistence() {
+    fn toggle_eq_preserves_gains_and_persists_bypass_and_panel_state() {
         let (mut broker, sink, _rx) = broker_with_sink();
         broker.handle_command(Command::EqGain { band: Some(0), gain_db: 6.0 });
         let saves = sink.lock().unwrap().len();
         broker.handle_command(Command::ToggleEq);
         assert!(!broker.shared.eq_enabled(), "first toggle bypasses EQ");
         assert_eq!(broker.shared.eq_gains()[0], 6.0, "bypass must not touch gains");
+        assert!(!sink.lock().unwrap().last().unwrap().eq_enabled);
+        assert!(broker.take_refresh().unwrap().contains("eq:OFF"));
         broker.handle_command(Command::ToggleEq);
         assert!(broker.shared.eq_enabled());
+        assert!(sink.lock().unwrap().last().unwrap().eq_enabled);
+        assert!(broker.take_refresh().unwrap().contains("eq:ON"));
         assert_eq!(
             sink.lock().unwrap().len(),
-            saves,
-            "eq bypass is runtime-only: no save trigger"
+            saves + 2,
+            "each EQ toggle persists independently from gains"
         );
+    }
+
+    #[test]
+    fn volume_hotkeys_step_clamp_refresh_and_persist_without_decoder_commands() {
+        let (mut broker, sink, rx) = broker_with_sink();
+        for phase in [Phase::Stopped, Phase::Paused, Phase::Playing] {
+            broker.shared.set_phase(phase);
+            broker.shared.set_volume(0.55);
+            broker.handle_command(Command::VolumeDown);
+            assert!((broker.shared.volume() - 0.45).abs() < 0.00001);
+            assert!(broker.take_refresh().unwrap().contains(" 45%"));
+            assert_eq!(sink.lock().unwrap().last().unwrap().volume, broker.shared.volume());
+            broker.handle_command(Command::VolumeStep(10));
+            assert!((broker.shared.volume() - 0.55).abs() < 0.00001);
+            assert!(broker.take_refresh().unwrap().contains(" 55%"));
+            assert_eq!(sink.lock().unwrap().last().unwrap().volume, broker.shared.volume());
+            broker.shared.set_volume(0.05);
+            broker.handle_command(Command::VolumeDown);
+            assert_eq!(broker.shared.volume(), 0.0);
+            assert!(broker.take_refresh().unwrap().contains("  0%"));
+            broker.shared.set_volume(0.95);
+            broker.handle_command(Command::VolumeStep(10));
+            assert_eq!(broker.shared.volume(), 1.0);
+            assert!(broker.take_refresh().unwrap().contains("100%"));
+            assert_eq!(sink.lock().unwrap().last().unwrap().volume, 1.0);
+            assert_eq!(broker.shared.phase(), phase);
+        }
+        assert_eq!(sink.lock().unwrap().len(), 12);
+        assert!(rx.try_recv().is_err(), "volume shortcuts never reload or stop audio");
+    }
+
+    #[test]
+    fn quit_hotkey_command_persists_and_requests_graceful_decoder_shutdown() {
+        let (mut broker, sink, rx) = broker_with_sink();
+        broker.shared.set_phase(Phase::Playing);
+        broker.shared.set_volume(0.4);
+        broker.shared.set_eq_enabled(false);
+        broker.shared.set_loop_enabled(true);
+        assert!(matches!(broker.handle_command(Command::Quit), Flow::Exit));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Shutdown)));
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        let snapshots = sink.lock().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].volume, 0.4);
+        assert!(!snapshots[0].eq_enabled);
+        assert!(snapshots[0].loop_enabled);
     }
 
     #[test]
@@ -2881,7 +2940,7 @@ mod tests {
         assert!(line.starts_with("eq:ON"), "eq chunk first: {line}");
         assert!(line.contains("rep:OFF"), "repeat chunk after eq: {line}");
         // The repeat chunk sits at a fixed column regardless of the eq
-        // state width (matches render.rs's STATUS_REPEAT_COLS hit table).
+        // state width, preserving the display-only status row layout.
         shared.set_eq_enabled(false);
         let off = render_panel(&shared, None).lines().nth(4).unwrap().to_string();
         assert_eq!(off.find("rep:"), line.find("rep:"), "repeat column drifts: {off}");

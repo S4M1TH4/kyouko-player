@@ -82,6 +82,7 @@ fn main() {
     let restored = config::load();
     let shared = SharedState::new();
     shared.set_volume(restored.volume);
+    shared.set_eq_enabled(restored.eq_enabled);
     for (band, gain) in restored.eq_gains.iter().enumerate() {
         shared.set_eq_gain(band, *gain);
     }
@@ -101,8 +102,9 @@ fn main() {
     };
     log_info!(
         "MAIN",
-        "restored: volume {:.0}%, eq ({}), loop {}, last_track {}, last_folder {}",
+        "restored: volume {:.0}%, eq {} ({}), loop {}, last_track {}, last_folder {}",
         restored.volume * 100.0,
+        if restored.eq_enabled { "ON" } else { "OFF" },
         eq_desc,
         if restored.loop_enabled { "ON" } else { "OFF" },
         restored.last_track.as_deref().unwrap_or("<none>"),

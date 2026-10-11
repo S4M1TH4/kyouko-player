@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetMonitorInfoW, Inval
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, UnregisterHotKey,
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_ESCAPE,
-    VK_OEM_2, VK_OEM_COMMA, VK_OEM_PERIOD,
+    VK_L, VK_Q, VK_OEM_1, VK_OEM_2, VK_OEM_COMMA, VK_OEM_PERIOD, VK_OEM_MINUS, VK_OEM_PLUS,
 };
 use windows::Win32::System::Com::{
     DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TrackPopupMenu, TranslateMessage,
     CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MF_STRING, MSG,
-    SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SPI_GETWORKAREA, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE,
     WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_PAINT, WM_RBUTTONDOWN,
@@ -61,7 +61,7 @@ use windows::core::{implement, Ref};
 
 use crate::audio::AudioOut;
 
-use super::render::{CONTROL_BAR_H, Renderer, StatusToggle, WINDOW_W,
+use super::render::{Renderer,
     TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position};
 use super::tray::Tray;
 use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_TRAY};
@@ -82,6 +82,12 @@ const HOTKEY_SEEK_FORWARD: i32 = 0x101;
 const HOTKEY_PREV_TRACK: i32 = 0x102;
 const HOTKEY_NEXT_TRACK: i32 = 0x103;
 const HOTKEY_TOGGLE_PAUSE: i32 = 0x104;
+const HOTKEY_TOGGLE_LOOP: i32 = 0x105;
+const HOTKEY_TOGGLE_EQ: i32 = 0x106;
+const HOTKEY_TOGGLE_OVERLAY: i32 = 0x107;
+const HOTKEY_QUIT: i32 = 0x108;
+const HOTKEY_VOLUME_DOWN: i32 = 0x109;
+const HOTKEY_VOLUME_UP: i32 = 0x10A;
 
 struct HotkeyBinding {
     id: i32,
@@ -90,12 +96,18 @@ struct HotkeyBinding {
     label: &'static str,
 }
 
-const HOTKEY_BINDINGS: [HotkeyBinding; 5] = [
+const HOTKEY_BINDINGS: [HotkeyBinding; 11] = [
     HotkeyBinding { id: HOTKEY_SEEK_BACK, modifiers: MOD_ALT, key: VK_OEM_COMMA, label: "Alt+," },
     HotkeyBinding { id: HOTKEY_SEEK_FORWARD, modifiers: MOD_ALT, key: VK_OEM_PERIOD, label: "Alt+." },
     HotkeyBinding { id: HOTKEY_PREV_TRACK, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_COMMA, label: "Alt+Shift+," },
     HotkeyBinding { id: HOTKEY_NEXT_TRACK, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_PERIOD, label: "Alt+Shift+." },
     HotkeyBinding { id: HOTKEY_TOGGLE_PAUSE, modifiers: MOD_ALT, key: VK_OEM_2, label: "Alt+/" },
+    HotkeyBinding { id: HOTKEY_TOGGLE_LOOP, modifiers: MOD_ALT, key: VK_L, label: "Alt+L" },
+    HotkeyBinding { id: HOTKEY_TOGGLE_EQ, modifiers: MOD_ALT, key: VK_OEM_1, label: "Alt+;" },
+    HotkeyBinding { id: HOTKEY_TOGGLE_OVERLAY, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_2, label: "Alt+Shift+/" },
+    HotkeyBinding { id: HOTKEY_QUIT, modifiers: MOD_ALT, key: VK_Q, label: "Alt+Q" },
+    HotkeyBinding { id: HOTKEY_VOLUME_DOWN, modifiers: MOD_ALT, key: VK_OEM_MINUS, label: "Alt+-" },
+    HotkeyBinding { id: HOTKEY_VOLUME_UP, modifiers: MOD_ALT, key: VK_OEM_PLUS, label: "Alt+=" },
 ];
 
 fn hotkey_command(id: usize) -> Option<Command> {
@@ -105,6 +117,12 @@ fn hotkey_command(id: usize) -> Option<Command> {
         HOTKEY_PREV_TRACK => Some(Command::PrevTrack),
         HOTKEY_NEXT_TRACK => Some(Command::NextTrack),
         HOTKEY_TOGGLE_PAUSE => Some(Command::TogglePause),
+        HOTKEY_TOGGLE_LOOP => Some(Command::ToggleLoop),
+        HOTKEY_TOGGLE_EQ => Some(Command::ToggleEq),
+        HOTKEY_TOGGLE_OVERLAY => Some(Command::ToggleOverlay),
+        HOTKEY_QUIT => Some(Command::Quit),
+        HOTKEY_VOLUME_DOWN => Some(Command::VolumeDown),
+        HOTKEY_VOLUME_UP => Some(Command::VolumeStep(10)),
         _ => None,
     }
 }
@@ -112,7 +130,7 @@ fn hotkey_command(id: usize) -> Option<Command> {
 #[derive(Default)]
 struct GlobalHotkeys {
     hwnd: HWND,
-    registered: [bool; 5],
+    registered: [bool; HOTKEY_BINDINGS.len()],
 }
 
 impl GlobalHotkeys {
@@ -685,7 +703,8 @@ fn phase_name(p: Phase) -> &'static str {
 fn drain_commands(s: &mut UiState) -> bool {
     loop {
         match s.cmd_rx.try_recv() {
-            Ok(Command::ToggleWindow) => toggle_visible(s),
+            Ok(Command::ToggleWindow) => toggle_visible(s, SW_SHOWNOACTIVATE),
+            Ok(Command::ToggleOverlay) => toggle_visible(s, SW_SHOW),
             Ok(cmd) => {
                 if s.broker.handle_command(cmd) == Flow::Exit {
                     return true;
@@ -720,14 +739,14 @@ fn on_tray(s: &mut UiState, lp: LPARAM) {
     }
 }
 
-fn toggle_visible(s: &mut UiState) {
+fn toggle_visible(s: &mut UiState, show_command: SHOW_WINDOW_CMD) {
     let drawer = s.drawer.take();
     s.hidden = !s.hidden;
     let hwnd = s.hwnd;
     let hidden = s.hidden;
     if let Some(drawer) = drawer { close_drawer(drawer.hwnd); }
     unsafe {
-        let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE });
+        let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { show_command });
     }
     log_info!("UI", "echo window: {}", if hidden { "hidden" } else { "shown" });
 }
@@ -1100,57 +1119,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_NCHITTEST => {
-                // Interactive zones = client area (clicks reach
-                // WM_LBUTTONDOWN): the bottom control strip, the Braille EQ
-                // strip (wheel tunes it; left-click there is a no-op), and
-                // the eq/repeat status chunks. Everywhere else = caption, so
-                // Windows natively drag-moves the window with left-click and
-                // no custom drag state exists anywhere.
+                // Only Track Info and the Braille strip are client regions.
+                // All other text, including volume/EQ/repeat, is a native
+                // drag surface without playback click controls.
                 let mut rc = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut rc);
                 // WM_NCHITTEST's lParam is SCREEN coordinates — convert to
-                // client space before the strip/status geometry tests.
+                // client space before testing the shared input geometry.
                 let x = x_lparam(lp) - rc.left;
                 let y = y_lparam(lp) - rc.top;
-                if y >= rc.bottom - rc.top - CONTROL_BAR_H
-                    || s.renderer.eq_band_at(x, y).is_some()
-                    || s.renderer.status_toggle_at(x, y).is_some()
-                    || s.renderer.track_info_at(x, y)
-                {
+                if s.renderer.client_input_at(x, y) {
                     LRESULT(HTCLIENT as isize)
                 } else {
                     LRESULT(HTCAPTION as isize)
                 }
             }
             WM_LBUTTONDOWN => {
-                // Client left-clicks arrive only over the HTCLIENT zones:
-                // the control strip (four equal-width columns map to
-                // prev / -5s / +5s / next) and the eq/repeat status chunks.
+                // Track Info is the only left-click action. Braille strip
+                // clicks are consumed; its gains remain wheel-driven.
                 let x = x_lparam(lp);
                 let y = y_lparam(lp);
-                let height = s.renderer.size().1;
-                if y >= height - CONTROL_BAR_H {
-                    let col = (x.clamp(0, WINDOW_W - 1) * 4 / WINDOW_W) as usize;
-                    log_debug!("UI", "control bar click col {col}");
-                    match col {
-                        0 => post_command(Command::PrevTrack),
-                        1 => post_command(Command::SeekRelative(-5.0)),
-                        2 => post_command(Command::SeekRelative(5.0)),
-                        _ => post_command(Command::NextTrack),
-                    }
-                } else if s.renderer.track_info_at(x, y) {
+                if s.renderer.track_info_at(x, y) {
                     toggle_tracklist(state);
-                } else if let Some(toggle) = s.renderer.status_toggle_at(x, y) {
-                    match toggle {
-                        StatusToggle::Eq => {
-                            log_debug!("UI", "status click: toggle eq");
-                            post_command(Command::ToggleEq);
-                        }
-                        StatusToggle::Repeat => {
-                            log_debug!("UI", "status click: toggle repeat");
-                            post_command(Command::ToggleLoop);
-                        }
-                    }
                 }
                 // Left-clicks on the Braille EQ strip do nothing (tuning is
                 // wheel-driven); the window never enters a drag from an
@@ -1159,8 +1149,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_RBUTTONDOWN | WM_NCRBUTTONDOWN => {
                 // Right-click anywhere pauses/resumes. Both message flavors
-                // arrive: the bar is HTCLIENT (WM_RBUTTONDOWN), the rest of
-                // the window is HTCAPTION (WM_NCRBUTTONDOWN).
+                // arrive: Track Info/EQ are HTCLIENT (WM_RBUTTONDOWN), the
+                // remaining text is HTCAPTION (WM_NCRBUTTONDOWN).
                 log_debug!("UI", "right-click: toggle pause");
                 post_command(Command::TogglePause);
                 LRESULT(0)
@@ -1186,21 +1176,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         crate::broker::EQ_BAND_HZ[band]
                     );
                     post_command(Command::EqGain { band: Some(band), gain_db: new });
-                } else {
-                    // Anywhere else on the panel: ±10% master volume.
-                    // Routing here relies on
-                    // the system "scroll inactive windows" setting (on by
-                    // default) since a WS_EX_NOACTIVATE window never holds
-                    // focus.
-                    let old = s.shared.volume();
-                    let new = (if delta >= 0 { old + 0.1 } else { old - 0.1 }).clamp(0.0, 1.0);
-                    log_info!(
-                        "UI",
-                        "wheel volume: {}% -> {}%",
-                        (old * 100.0).round() as i32,
-                        (new * 100.0).round() as i32
-                    );
-                    post_command(Command::SetVolume(new));
                 }
                 LRESULT(0)
             }
@@ -1255,7 +1230,13 @@ mod tests {
         assert!(matches!(hotkey_command(HOTKEY_PREV_TRACK as usize), Some(Command::PrevTrack)));
         assert!(matches!(hotkey_command(HOTKEY_NEXT_TRACK as usize), Some(Command::NextTrack)));
         assert!(matches!(hotkey_command(HOTKEY_TOGGLE_PAUSE as usize), Some(Command::TogglePause)));
-        for unknown in [0, 1, 0x105, usize::MAX, (i32::MAX as usize) + 1] {
+        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_LOOP as usize), Some(Command::ToggleLoop)));
+        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_EQ as usize), Some(Command::ToggleEq)));
+        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_OVERLAY as usize), Some(Command::ToggleOverlay)));
+        assert!(matches!(hotkey_command(HOTKEY_QUIT as usize), Some(Command::Quit)));
+        assert!(matches!(hotkey_command(HOTKEY_VOLUME_DOWN as usize), Some(Command::VolumeDown)));
+        assert!(matches!(hotkey_command(HOTKEY_VOLUME_UP as usize), Some(Command::VolumeStep(10))));
+        for unknown in [0, 1, 0x10B, usize::MAX, (i32::MAX as usize) + 1] {
             assert!(hotkey_command(unknown).is_none());
         }
     }
@@ -1263,10 +1244,15 @@ mod tests {
     #[test]
     fn global_hotkey_bindings_use_unique_ids_and_exact_oem_keys() {
         let expected = [(MOD_ALT.0, 0xBC), (MOD_ALT.0, 0xBE),
-            (MOD_ALT.0 | MOD_SHIFT.0, 0xBC), (MOD_ALT.0 | MOD_SHIFT.0, 0xBE), (MOD_ALT.0, 0xBF)];
+            (MOD_ALT.0 | MOD_SHIFT.0, 0xBC), (MOD_ALT.0 | MOD_SHIFT.0, 0xBE), (MOD_ALT.0, 0xBF),
+            (MOD_ALT.0, 0x4C), (MOD_ALT.0, 0xBA), (MOD_ALT.0 | MOD_SHIFT.0, 0xBF),
+            (MOD_ALT.0, 0x51), (MOD_ALT.0, 0xBD), (MOD_ALT.0, 0xBB)];
+        assert_eq!(HOTKEY_BINDINGS.len(), expected.len());
         let mut ids = std::collections::HashSet::new();
+        let mut combinations = std::collections::HashSet::new();
         for (binding, (modifiers, key)) in HOTKEY_BINDINGS.iter().zip(expected) {
             assert!(ids.insert(binding.id));
+            assert!(combinations.insert((binding.modifiers.0, binding.key.0)));
             assert!((0..=0xBFFF).contains(&binding.id));
             assert_eq!(binding.modifiers.0, modifiers);
             assert_eq!(binding.key.0, key);
@@ -1301,10 +1287,10 @@ mod tests {
             state.hwnd = hwnd;
             assert!(!windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool());
             let registered = state.hotkeys.registered;
-            println!("native hotkeys registered: {}/5", registered.iter().filter(|&&active| active).count());
+            println!("native hotkeys registered: {}/{}", registered.iter().filter(|&&active| active).count(), HOTKEY_BINDINGS.len());
             DestroyWindow(hwnd).unwrap();
             assert!(!IsWindow(Some(hwnd)).as_bool());
-            assert_eq!(state.hotkeys.registered, [false; 5]);
+            assert_eq!(state.hotkeys.registered, [false; HOTKEY_BINDINGS.len()]);
             // Reacquire each available binding to prove WM_DESTROY freed it.
             // Existing third-party shortcuts are logged and left untouched.
             for (binding, active) in HOTKEY_BINDINGS.iter().zip(registered) {

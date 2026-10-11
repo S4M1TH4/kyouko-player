@@ -1808,6 +1808,7 @@ mod tests {
 
     fn restore_test_controls(shared: &SharedState, saved: &crate::config::PersistedState) {
         shared.set_volume(saved.volume);
+        shared.set_eq_enabled(saved.eq_enabled);
         for (band, gain) in saved.eq_gains.iter().enumerate() { shared.set_eq_gain(band, *gain); }
     }
 

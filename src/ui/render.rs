@@ -9,9 +9,8 @@
 //!
 //! The window is moved/sized by the caller and then purely painted through
 //! `UpdateLayeredWindow` — there is no WM_PAINT path at all. The window is
-//! also draggable from anywhere (`HTCAPTION` in the wndproc) except the
-//! bottom playback control bar (`HTCLIENT` there), without ever being
-//! activated.
+//! draggable over panel text (`HTCAPTION`), except Track Info. Track Info
+//! and the Braille EQ strip use `HTCLIENT` for list clicks and EQ scrolling.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -43,11 +42,6 @@ const PAD: i32 = 3;
 /// At the 9 px Consolas em this leaves room for ~14 text cells per line, so
 /// the panel formats in `render_panel` are tuned to that budget.
 pub const WINDOW_W: i32 = 80;
-/// Height of the playback control strip at the window's very bottom. The
-/// wndproc hit-tests against this exact value (bottom strip = HTCLIENT →
-/// button clicks; everywhere else = HTCAPTION → native drag), so draw and
-/// hit geometry can never drift apart.
-pub const CONTROL_BAR_H: i32 = 16;
 /// Braille equalizer rows: two fill rows above the middle baseline and two
 /// below (6 levels per row → the ±12 dB gain range exactly).
 const EQ_ROWS: usize = 4;
@@ -186,58 +180,6 @@ impl Drop for TrackListRenderer {
     }
 }
 
-/// Which clickable status chunk sits under a point?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatusToggle {
-    /// The `eq:ON/OFF` chunk (toggles `Command::ToggleEq`).
-    Eq,
-    /// The `rep:ON/OFF` chunk (toggles `Command::ToggleLoop`).
-    Repeat,
-}
-
-/// Clickable columns (in Consolas advance units from the left pad) of the
-/// dual status line's two chunks: `eq:ON ` spans columns 0..6 and
-/// `rep:OFF` columns 7..14. `render_panel` in broker.rs formats the line
-/// with exactly this column table — drawing and hit-testing share it, so
-/// they can never drift apart. Both chunks sit at fixed columns regardless
-/// of ON/OFF width (the eq state is padded to 3 cells).
-const STATUS_EQ_COLS: (i32, i32) = (0, 6);
-const STATUS_REPEAT_COLS: (i32, i32) = (7, 7);
-
-/// Which status chunk (if any) does a CLIENT-coordinate point hit? The
-/// clickable band is the last panel line's full label+state chunks; the
-/// gap between them (and the rest of the panel) stays caption (drag).
-/// Pure so hit geometry stays unit-testable without GDI.
-pub fn status_toggle_at(
-    x: i32,
-    y: i32,
-    eq_top: i32,
-    line_h: i32,
-    char_w: i32,
-) -> Option<StatusToggle> {
-    let y0 = eq_top - line_h; // last panel line: the eq/repeat status row
-    if y < y0 || y >= eq_top {
-        return None;
-    }
-    let col_x = |col: i32| PAD + col * char_w;
-    let (eq_col, eq_len) = STATUS_EQ_COLS;
-    if x >= col_x(eq_col) && x < col_x(eq_col + eq_len) {
-        return Some(StatusToggle::Eq);
-    }
-    let (rp_col, rp_len) = STATUS_REPEAT_COLS;
-    if x >= col_x(rp_col) && x < col_x(rp_col + rp_len) {
-        return Some(StatusToggle::Repeat);
-    }
-    None
-}
-
-/// Control-bar glyphs, in column order: prev track / -5s / +5s / next track.
-/// The wndproc's `WM_LBUTTONDOWN` column mapping must match this order.
-const W_PREV: &str = "<<";
-const W_BACK: &str = "<";
-const W_FWD: &str = ">";
-const W_NEXT: &str = ">>";
-
 /// Braille glyph holding `levels` fill steps in one cell: blank at 0, the
 /// 6-step dot progression for 1..=6, saturated full cell beyond. The
 /// progression fills the cell bottom-up: ⠠ ⠤ ⠴ ⠶ ⠾ ⠿.
@@ -344,9 +286,6 @@ pub struct Renderer {
     width: i32,
     height: i32,
     line_h: i32,
-    /// Monospace advance width of one Consolas cell — the unit behind the
-    /// status-line column table (`STATUS_*_COLS`).
-    char_w: i32,
     /// Client y where the Braille equalizer strip begins (panel text ends);
     /// recomputed on every draw from the panel's line count.
     eq_top: i32,
@@ -400,7 +339,6 @@ impl Renderer {
             let mut tm = TEXTMETRICW::default();
             GetTextMetricsW(mem_dc, &mut tm).ok()?;
             let line_h = tm.tmHeight + tm.tmExternalLeading;
-            let char_w = tm.tmAveCharWidth.max(1);
 
             let widest = sample
                 .lines()
@@ -420,9 +358,8 @@ impl Renderer {
             }
 
             let rows = sample.lines().count() as i32;
-            // Panel text, the Braille equalizer strip, and the playback
-            // control strip at the bottom.
-            let height = 2 * PAD + rows * line_h + EQ_ROWS as i32 * line_h + CONTROL_BAR_H;
+            // Panel text and four Braille rows, with padding on both ends.
+            let height = 2 * PAD + rows * line_h + EQ_ROWS as i32 * line_h;
 
             let mut bi = BITMAPINFO::default();
             bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
@@ -440,7 +377,6 @@ impl Renderer {
                 width: WINDOW_W,
                 height,
                 line_h,
-                char_w,
                 eq_top: PAD + rows * line_h,
                 screen_dc,
                 mem_dc,
@@ -457,19 +393,19 @@ impl Renderer {
     }
 
     /// Which equalizer band (if any) does a CLIENT-coordinate point hover?
-    /// The strip spans the Braille rows between the panel text and the
-    /// control bar; the column split is exact tenths of the window width.
+    /// Only the four Braille rows accept EQ wheel input; the column split
+    /// is exact tenths of the window width.
     pub fn eq_band_at(&self, x: i32, y: i32) -> Option<usize> {
-        if y < self.eq_top || y >= self.eq_top + EQ_ROWS as i32 * self.line_h {
+        if !(0..self.width).contains(&x) || y < self.eq_top || y >= self.eq_top + EQ_ROWS as i32 * self.line_h {
             return None;
         }
         Some(eq_band_index(x, self.width))
     }
 
-    /// Which clickable status chunk (eq / repeat) does a CLIENT-coordinate
-    /// point hit, if any? Delegates to the pure column-table helper.
-    pub fn status_toggle_at(&self, x: i32, y: i32) -> Option<StatusToggle> {
-        status_toggle_at(x, y, self.eq_top, self.line_h, self.char_w)
+    /// The only client input regions: Track Info and the Braille strip.
+    /// Volume/EQ/repeat text remains part of the native drag surface.
+    pub fn client_input_at(&self, x: i32, y: i32) -> bool {
+        self.track_info_at(x, y) || self.eq_band_at(x, y).is_some()
     }
 
     pub fn track_info_at(&self, x: i32, y: i32) -> bool {
@@ -531,25 +467,6 @@ impl Renderer {
             self.eq_top = PAD + panel.lines().count() as i32 * self.line_h;
             self.draw_eq_strip(eq);
 
-            // Playback control strip: one glyph centered in each of the four
-            // equal columns (the wndproc maps clicks back through the same
-            // geometry). Drawn white — the alpha pass below tints it with the
-            // phase accent like every other lit pixel.
-            let bar_top = self.height - CONTROL_BAR_H;
-            let col_w = self.width / 4;
-            let text_y = bar_top + ((CONTROL_BAR_H - self.line_h) / 2).max(0);
-            for (i, label) in [W_PREV, W_BACK, W_FWD, W_NEXT].iter().enumerate() {
-                let wide: Vec<u16> = label.encode_utf16().collect();
-                let mut extent = SIZE::default();
-                let _ = GetTextExtentPoint32W(self.mem_dc, &wide, &mut extent);
-                let _ = TextOutW(
-                    self.mem_dc,
-                    i as i32 * col_w + (col_w - extent.cx) / 2,
-                    text_y,
-                    &wide,
-                );
-            }
-
             // Complete batched GDI writes before touching the DIB through its
             // raw pointer; otherwise text can race the alpha pass or clearing
             // the next frame, leaving stale/duplicated pixels.
@@ -575,19 +492,6 @@ impl Renderer {
                 px[1] = (u32::from(color[1]) * u32::from(lum) / 255) as u8; // G
                 px[2] = (u32::from(color[0]) * u32::from(lum) / 255) as u8; // R
                 px[3] = lum; // A
-            }
-
-            // Bar separator: a dim accent line across the bar top so the
-            // strip reads as controls, not stray glyphs. Premultiplied at
-            // ~35% into the surface, after the luminance pass.
-            let sep = (bar_top * self.width) as usize * 4;
-            for px in std::slice::from_raw_parts_mut(self.bits, len)[sep..sep + self.width as usize * 4]
-                .chunks_exact_mut(4)
-            {
-                px[0] = color[2] / 3; // B (premultiplied ~1/3 alpha)
-                px[1] = color[1] / 3; // G
-                px[2] = color[0] / 3; // R
-                px[3] = 85;
             }
 
             let blend = BLENDFUNCTION {
@@ -946,38 +850,29 @@ mod tests {
     }
 
     #[test]
-    fn status_toggle_hit_regions() {
-        // Renderer-shaped geometry: 5 panel lines of 11 px, char_w 5 →
-        // eq_top = 58; the status row spans y ∈ [47, 58).
-        let (eq_top, line_h, char_w) = (PAD + 5 * 11, 11, 5);
-        let col_x = |col: i32| PAD + col * char_w;
-        let mid = eq_top - line_h / 2;
-        // eq chunk (columns 0..6) hits Eq anywhere in its band.
-        for col in [0, 3, 5] {
-            assert_eq!(
-                status_toggle_at(col_x(col), mid, eq_top, line_h, char_w),
-                Some(StatusToggle::Eq),
-                "eq chunk col {col}"
-            );
+    fn compact_layout_ends_after_eq_and_only_track_info_and_eq_are_client_input() {
+        let shared = crate::broker::SharedState::new();
+        let panel = crate::broker::render_panel(&shared, None);
+        let renderer = Renderer::new(&panel).unwrap();
+        assert_eq!(panel.lines().count(), 5);
+        assert_eq!(renderer.size(), (WINDOW_W, 2 * PAD + 9 * renderer.line_h));
+        assert_eq!(renderer.height, renderer.eq_top + EQ_ROWS as i32 * renderer.line_h + PAD);
+        for y in 0..renderer.height {
+            for x in 0..renderer.width {
+                let track = (PAD + 2 * renderer.line_h..PAD + 3 * renderer.line_h).contains(&y);
+                let eq = (renderer.eq_top..renderer.height - PAD).contains(&y);
+                assert_eq!(renderer.client_input_at(x, y), track || eq, "client region ({x}, {y})");
+                assert_eq!(renderer.eq_band_at(x, y), eq.then_some((x / 8) as usize), "wheel region ({x}, {y})");
+            }
         }
-        // The gap between the chunks (column 6) stays caption (drag).
-        assert_eq!(status_toggle_at(col_x(6), mid, eq_top, line_h, char_w), None);
-        // repeat chunk (columns 7..14) hits Repeat.
-        for col in [7, 10, 13] {
-            assert_eq!(
-                status_toggle_at(col_x(col), mid, eq_top, line_h, char_w),
-                Some(StatusToggle::Repeat),
-                "repeat chunk col {col}"
-            );
+        for x in [-1, renderer.width] {
+            assert!(!renderer.client_input_at(x, renderer.track_info_y()));
+            assert_eq!(renderer.eq_band_at(x, renderer.eq_top), None);
         }
-        // Beyond the repeat chunk: caption again.
-        assert_eq!(status_toggle_at(col_x(14), mid, eq_top, line_h, char_w), None);
-        // The whole hit band fits inside the 80 px window.
-        assert!(col_x(14) <= WINDOW_W, "repeat chunk right edge {} clips", col_x(14));
-        // Vertically outside the status row (panel above, EQ strip below):
-        // no status hit.
-        assert_eq!(status_toggle_at(col_x(0), eq_top - line_h - 1, eq_top, line_h, char_w), None);
-        assert_eq!(status_toggle_at(col_x(0), eq_top, eq_top, line_h, char_w), None);
+        for y in [-1, renderer.height] {
+            assert!(!renderer.client_input_at(0, y));
+            assert_eq!(renderer.eq_band_at(0, y), None);
+        }
     }
 
     #[test]
