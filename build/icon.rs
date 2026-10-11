@@ -85,9 +85,9 @@ mod tests {
             assert_eq!(u32_at(frame, 8), (size * 2) as u32);
             let color_end = 40 + size * size * 4;
             let pixels = &frame[40..color_end];
-            assert!(pixels.chunks_exact(4).any(|p| p[3] == 255));
-            assert!(pixels.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
-            for (pixel_index, pixel) in pixels.chunks_exact(4).enumerate() {
+            assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[3] == 255));
+            assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[3] > 0 && p[3] < 255));
+            for (pixel_index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
                 assert_eq!(&pixel[..3], &[RGB[2], RGB[1], RGB[0]]);
                 let y = pixel_index / size;
                 let x = pixel_index % size;
@@ -135,7 +135,7 @@ mod tests {
             };
             let resource = FindResourceW(
                 Some(module),
-                PCWSTR(1 as *const u16),
+                PCWSTR(std::ptr::without_provenance(1)),
                 PCWSTR(14 as *const u16),
             );
             assert!(!resource.is_invalid(), "PE must contain RT_GROUP_ICON ID 1");
@@ -165,7 +165,7 @@ mod tests {
                 );
                 let image = LoadImageW(
                     Some(HINSTANCE(module.0)),
-                    PCWSTR(1 as *const u16),
+                    PCWSTR(std::ptr::without_provenance(1)),
                     IMAGE_ICON,
                     size as i32,
                     size as i32,

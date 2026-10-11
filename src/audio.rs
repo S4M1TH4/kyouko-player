@@ -193,28 +193,33 @@ struct OutputReplacement {
 
 impl AudioControls {
     fn replace_output(&self, mut replacement: OutputReplacement) {
-        let mut slot = self.output_slot.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(previous) = slot.take() {
-            // Rapid notifications coalesce to the latest pool, while retaining
-            // the original consumer of the still-running producer.
-            replacement.retired = previous.retired;
-        }
-        *slot = Some(replacement);
+        let previous = {
+            let mut slot = self.output_slot.lock().unwrap_or_else(|error| error.into_inner());
+            let mut previous = slot.take();
+            if let Some(previous) = &mut previous {
+                // Keep the oldest consumer while coalescing to the latest pool.
+                std::mem::swap(&mut replacement.retired, &mut previous.retired);
+            }
+            *slot = Some(replacement);
+            previous
+        };
+        // Pool destruction must not hold up the decoder's acknowledgement.
+        drop(previous);
     }
     /// Kill the active yt-dlp child, if any. Safe to call any time; it is a
     /// no-op while playing local files. Idempotent.
     pub fn interrupt(&self) {
-        if let Some(buffer) = self.buffer_slot.lock().unwrap_or_else(|e| e.into_inner())
-            .as_ref().and_then(Weak::upgrade)
-        {
+        let buffer = self.buffer_slot.lock().unwrap_or_else(|e| e.into_inner())
+            .as_ref().and_then(Weak::upgrade);
+        if let Some(buffer) = buffer {
             buffer.cancel();
         }
-        if let Ok(mut slot) = self.child_slot.lock() {
-            if let Some(child) = slot.as_mut() {
-                log_warn!("AUDIO", "interrupt: killing external source process");
+        let interrupted = if let Ok(mut slot) = self.child_slot.lock()
+            && let Some(child) = slot.as_mut() {
                 let _ = child.kill();
-            }
-        }
+                true
+            } else { false };
+        if interrupted { log_warn!("AUDIO", "interrupt: killed external source process"); }
     }
 
     pub fn hook(self) -> Arc<dyn Fn() + Send + Sync> {
@@ -249,7 +254,8 @@ pub fn spawn(
             let child_slot = Arc::clone(&child_slot);
             let buffer_slot = buffer_slot.clone();
             let output_slot = output_slot.clone();
-            move || run_decoder(shared, cmds, status_tx, chunk_tx, drained_rx, child_slot, buffer_slot, output_slot)
+            move || run_decoder(shared, cmds, status_tx, chunk_tx, drained_rx,
+                AudioControls { child_slot, buffer_slot, output_slot })
         })
         .expect("spawn decoder thread");
     AudioHandles { chunk_rx, drained_tx, decoder, controls: AudioControls { child_slot, buffer_slot, output_slot } }
@@ -709,40 +715,34 @@ fn run_decoder(
     status_tx: Sender<Status>,
     mut chunk_tx: ChunkSender,
     drained_rx: Receiver<u64>,
-    child_slot: Arc<Mutex<Option<Child>>>,
-    buffer_slot: BufferSlot,
-    output_slot: OutputSlot,
+    controls: AudioControls,
 ) {
     log_info!("DECODER", "online — parked on command channel (zero CPU)");
     let mut cache: Option<StreamCache> = None;
-    loop {
-        let first = match cmds.recv() {
-            Ok(cmd) => {
-                let replacement = output_slot.lock().unwrap_or_else(|error| error.into_inner()).take();
-                if let Some(replacement) = replacement {
-                    chunk_tx = replacement.sender;
-                    drop(replacement.retired);
-                    let _ = status_tx.send(Status::OutputReady { epoch: replacement.epoch });
-                    crate::ui::wake_status();
-                }
-                log_debug!("DECODER", "recv {cmd:?}");
-                match cmd {
-                    DecoderCmd::Load(s) => s,
-                    // Nothing is open — a seek has nothing to move.
-                    DecoderCmd::SeekRelative(_) => continue,
-                    DecoderCmd::Stop => { cache = None; continue; }
-                    DecoderCmd::Shutdown => break,
-                }
-            }
-            Err(_) => break,
+    while let Ok(cmd) = cmds.recv() {
+        let replacement = controls.output_slot.lock().unwrap_or_else(|error| error.into_inner()).take();
+        if let Some(replacement) = replacement {
+            chunk_tx = replacement.sender;
+            drop(replacement.retired);
+            let _ = status_tx.send(Status::OutputReady { epoch: replacement.epoch });
+            crate::ui::wake_status();
+        }
+        log_debug!("DECODER", "recv {cmd:?}");
+        let first = match cmd {
+            DecoderCmd::Load(s) => s,
+            // Nothing is open — a seek has nothing to move.
+            DecoderCmd::SeekRelative(_) => continue,
+            DecoderCmd::Stop => { cache = None; continue; }
+            DecoderCmd::Shutdown => break,
         };
         let mut next = Some(first);
         'tracks: while let Some(source) = next.take() {
             select_stream_cache(&mut cache, &source, shared.loop_enabled());
-            let exit = play_source(
-                &shared, &cmds, &status_tx, &chunk_tx, &drained_rx, &child_slot,
-                &buffer_slot, &mut cache, source,
-            );
+            let exit = play_source(&PlaybackContext {
+                shared: &shared, cmds: &cmds, status_tx: &status_tx,
+                chunk_tx: &chunk_tx, drained_rx: &drained_rx,
+                child_slot: &controls.child_slot, buffer_slot: &controls.buffer_slot,
+            }, &mut cache, source);
             match exit {
                 PlayExit::NewSource(s) => next = Some(s),
                 PlayExit::Eof => {
@@ -871,11 +871,10 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Ok(mut slot) = self.slot.lock() {
-            if let Some(mut child) = slot.take() {
-                let _ = child.kill(); // no-op if it already exited
-                let _ = child.wait(); // reap
-            }
+        let child = self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut child) = child {
+            let _ = child.kill(); // no-op if it already exited
+            let _ = child.wait(); // reap
         }
     }
 }
@@ -1007,11 +1006,10 @@ fn open_track_inner(
     };
 
     let mut hint = Hint::new();
-    if let Source::File(path) = source {
-        if let Some(ext) = path.rsplit(['.', '/', '\\']).next() {
+    if let Source::File(path) = source
+        && let Some(ext) = path.rsplit(['.', '/', '\\']).next() {
             hint.with_extension(ext);
         }
-    }
     let seekable = mss.is_seekable() || stream_buffer.is_some();
     let probed = get_probe()
         .format(&hint, mss, &Default::default(), &MetadataOptions::default())
@@ -1108,31 +1106,29 @@ fn send_chunk(
     chunk.data[..samples.len()].copy_from_slice(samples);
     chunk.len = samples.len();
     chunk.generation = generation;
-    loop {
-        match chunk_tx.ready.try_send(chunk) {
-            Ok(()) => {
-                chunk_tx.published(generation, samples.len());
-                return SendOutcome::Sent;
-            }
-            Err(TrySendError::Full(c)) => {
-                chunk = c;
-                select! {
-                    send(chunk_tx.ready, chunk) -> res => match res {
-                        Ok(()) => {
-                            chunk_tx.published(generation, samples.len());
-                            return SendOutcome::Sent;
-                        }
-                        Err(_send_err) => return SendOutcome::SinkGone,
-                    },
-                    recv(cmds) -> msg => {
-                        recycle(&chunk_tx.recycle, chunk);
-                        return send_command(msg);
-                    },
-                    recv(chunk_tx.sink_gone) -> _ => return SendOutcome::SinkGone,
-                }
-            }
-            Err(TrySendError::Disconnected(_)) => return SendOutcome::SinkGone,
+    match chunk_tx.ready.try_send(chunk) {
+        Ok(()) => {
+            chunk_tx.published(generation, samples.len());
+            SendOutcome::Sent
         }
+        Err(TrySendError::Full(c)) => {
+            chunk = c;
+            select! {
+                send(chunk_tx.ready, chunk) -> res => match res {
+                    Ok(()) => {
+                        chunk_tx.published(generation, samples.len());
+                        SendOutcome::Sent
+                    }
+                    Err(_send_err) => SendOutcome::SinkGone,
+                },
+                recv(cmds) -> msg => {
+                    recycle(&chunk_tx.recycle, chunk);
+                    send_command(msg)
+                },
+                recv(chunk_tx.sink_gone) -> _ => SendOutcome::SinkGone,
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => SendOutcome::SinkGone,
     }
 }
 
@@ -1193,11 +1189,10 @@ fn fetch_title_blocking(
     let mut raw = String::new();
     let read_ok = std::io::BufReader::new(stdout).read_to_string(&mut raw).is_ok();
     // Reap regardless of how the read ended (natural exit or kill).
-    if let Ok(mut slot) = child_slot.lock() {
-        if let Some(mut c) = slot.take() {
-            let _ = c.kill(); // no-op after natural exit
-            let _ = c.wait();
-        }
+    let child = child_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(mut c) = child {
+        let _ = c.kill(); // no-op after natural exit
+        let _ = c.wait();
     }
     let title = if read_ok { clean_title(&raw) } else { String::new() };
     if title.is_empty() {
@@ -1213,7 +1208,6 @@ fn fetch_title_blocking(
 /// only, without HTTP requests. Returns true when the playhead moved. Resets codec
 /// state, stale buffers, the chunk generation and the playhead so decoding
 /// resumes seamlessly at the new position.
-#[allow(clippy::too_many_arguments)]
 fn seek_relative(
     track: &mut ActiveTrack,
     shared: &SharedState,
@@ -1279,17 +1273,22 @@ fn seek_relative(
     }
 }
 
+struct PlaybackContext<'a> {
+    shared: &'a Arc<SharedState>,
+    cmds: &'a Receiver<DecoderCmd>,
+    status_tx: &'a Sender<Status>,
+    chunk_tx: &'a ChunkSender,
+    drained_rx: &'a Receiver<u64>,
+    child_slot: &'a Arc<Mutex<Option<Child>>>,
+    buffer_slot: &'a BufferSlot,
+}
+
 fn play_source(
-    shared: &Arc<SharedState>,
-    cmds: &Receiver<DecoderCmd>,
-    status_tx: &Sender<Status>,
-    chunk_tx: &ChunkSender,
-    drained_rx: &Receiver<u64>,
-    child_slot: &Arc<Mutex<Option<Child>>>,
-    buffer_slot: &BufferSlot,
+    context: &PlaybackContext<'_>,
     cache: &mut Option<StreamCache>,
     source: Source,
 ) -> PlayExit {
+    let &PlaybackContext { shared, cmds, status_tx, chunk_tx, drained_rx, child_slot, buffer_slot } = context;
     let mut generation = shared.generation();
     chunk_tx.begin(generation);
     let cached = cache
@@ -1445,7 +1444,7 @@ fn play_source(
                 Ok(d) => d,
                 Err(SymphoniaError::DecodeError(_)) => {
                     bad_packets += 1;
-                    if bad_packets <= 3 || bad_packets % 200 == 0 {
+                    if bad_packets <= 3 || bad_packets.is_multiple_of(200) {
                         log_warn!("DECODER", "bad packet #{} — skipping", bad_packets);
                     }
                     continue;
@@ -1668,13 +1667,12 @@ fn play_source(
                                 }
                                 // Store the same allocation before notifying the
                                 // broker; its repeat Load will reopen at byte 0.
-                                if shared.loop_enabled() {
-                                    if let Some(buffer) = track.stream_buffer.as_ref().filter(|buffer| buffer.complete()) {
+                                if shared.loop_enabled()
+                                    && let Some(buffer) = track.stream_buffer.as_ref().filter(|buffer| buffer.complete()) {
                                         *cache = Some(StreamCache {
                                             source: source.clone(), buffer: buffer.clone(), title: replay_title.clone(),
                                         });
                                     }
-                                }
                                 let _ = status_tx.send(Status::Finished);
                                 crate::ui::wake_status();
                                 return PlayExit::Eof;
@@ -1789,9 +1787,7 @@ impl Biquad {
         if self.z.len() != channels {
             self.z = vec![[0.0; 4]; channels];
         } else {
-            for z in &mut self.z {
-                *z = [0.0; 4];
-            }
+            self.z.fill([0.0; 4]);
         }
     }
 
@@ -2525,8 +2521,11 @@ mod tests {
         let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
         let (_drained_tx, drained_rx) = bounded(4);
         let decoder_shared = shared.clone();
-        let decoder = thread::spawn(move || play_source(&decoder_shared, &cmd_rx, &status_tx, &chunk_tx, &drained_rx,
-            &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), &mut cache, source));
+        let decoder = thread::spawn(move || play_source(&PlaybackContext {
+            shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
+            chunk_tx: &chunk_tx, drained_rx: &drained_rx,
+            child_slot: &Arc::new(Mutex::new(None)), buffer_slot: &Arc::new(Mutex::new(None)),
+        }, &mut cache, source));
         assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { .. }));
         let first = chunk_rx.queue.recv_timeout(Duration::from_secs(5)).unwrap();
         // No drain notification is sent. The complete short WAV reaches the
@@ -2586,8 +2585,11 @@ mod tests {
         let decoder_shared = shared.clone();
         let decoder = thread::spawn(move || {
             for _ in 0..2 {
-                assert!(matches!(play_source(&decoder_shared, &cmd_rx, &status_tx, &chunk_tx, &drained_rx,
-                    &child_slot, &buffer_slot, &mut cache, source.clone()), PlayExit::Eof));
+                assert!(matches!(play_source(&PlaybackContext {
+                    shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
+                    chunk_tx: &chunk_tx, drained_rx: &drained_rx,
+                    child_slot: &child_slot, buffer_slot: &buffer_slot,
+                }, &mut cache, source.clone()), PlayExit::Eof));
                 assert!(child_slot.lock().unwrap().is_none(), "repeat must not spawn yt-dlp");
                 assert!(buffer_slot.lock().unwrap().is_none(), "repeat must not spawn a downloader");
             }
@@ -2714,8 +2716,11 @@ mod tests {
             let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
             let (drained_tx, drained_rx) = bounded(4);
             let decoder_shared = shared.clone();
-            let decoder = thread::spawn(move || play_source(&decoder_shared, &cmd_rx, &status_tx, &chunk_tx, &drained_rx,
-                &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), &mut cache, source));
+            let decoder = thread::spawn(move || play_source(&PlaybackContext {
+                shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
+                chunk_tx: &chunk_tx, drained_rx: &drained_rx,
+                child_slot: &Arc::new(Mutex::new(None)), buffer_slot: &Arc::new(Mutex::new(None)),
+            }, &mut cache, source));
             let duration = match status_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 Status::Opened { sample_rate: 48_000, channels: 1, duration, .. } => duration,
                 other => panic!("source must report its actual PCM format: {other:?}"),
@@ -2911,7 +2916,9 @@ mod tests {
         let child_slot = Arc::new(Mutex::new(None));
         let decoder_shared = shared.clone();
         let decoder = thread::spawn(move || {
-            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, child_slot, Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
+            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, AudioControls {
+                child_slot, buffer_slot: Arc::new(Mutex::new(None)), output_slot: Arc::new(Mutex::new(None)),
+            });
         });
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
             cmd_tx.clone(), Arc::new(|| {}),

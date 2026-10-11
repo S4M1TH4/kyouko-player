@@ -1,77 +1,151 @@
 # kyouko-player
 
-A zero-resource, event-driven audio player and OS media broker written in Rust. `kyouko-player` runs as a background process with a minimalist transparent 80px Win32 status overlay and global hotkeys, consuming minimal CPU and RAM. It has no system tray icon. Use `Alt + Shift + /` to hide/show the overlay and `Alt + Q` or its top-right `X` to quit gracefully.
+## Synopsis
 
-The application contains no heavy UI framework overhead, no text rendering animations, and no album art decoders. When playback is paused or idle, execution threads yield completely to native Windows synchronization primitives (`MsgWaitForMultipleObjects` / `WaitMessage`).
+A high-performance, minimalist Win32 media player designed for global hotkey
+operation and resource efficiency. A compact floating overlay provides playback
+status, track selection, and equalizer adjustment.
 
-## Technical Architecture
+Execution is event driven. Idle and paused playback park the worker threads and
+stop the audio output; no polling or animation loop runs. An unfinished network
+download continues until its stream buffer is complete.
 
-* **Event Loop:** Thread blocking relies strictly on native OS message queues rather than polling timeouts (`loop { sleep() }`).
-* **Audio Pipeline:** Decodes media streams via native decoders directly into the `cpal` audio output buffer.
-* **Stream Piping:** Streams remote media directly from `yt-dlp` stdout buffering without intermediate disk writes.
-* **Signal Processing:** Implements an in-memory software DSP chain for multiband biquad equalization.
+## Architecture
+
+The broker owns playback state, queues, and persistence. The Win32 UI receives
+native messages and dispatches commands. A dedicated decoder thread performs
+file and stream reads, Symphonia decoding, equalization, resampling, and volume
+processing before handing prepared samples to CPAL/WASAPI.
+
+The real-time sample callback uses preallocated PCM blocks and nonblocking
+operations on bounded rings. It performs no heap allocation or deallocation,
+file I/O, logging, or application mutex acquisition. Playback controls and
+counters use lock-free atomics. The PCM pool holds at least 1.5 seconds of audio
+and primes 500 ms before playback; the device uses its native rate and layout.
+
+The overlay renders through a persistent GDI memory DC and bitmap, presenting
+the completed image with `UpdateLayeredWindow`. Identical visual snapshots skip
+rendering. The elapsed-time timer runs at 1 Hz only while playing.
+
+Release builds select `#![windows_subsystem = "windows"]` conditionally:
+
+```rust
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+```
+
+The release process runs without a console window. Debug builds retain console
+logging. The application has no terminal command reader or system tray icon.
 
 ## Features
 
-* Sub-1% CPU usage and sub-15MB RAM footprint on Windows 11.
-* Direct local audio and video file decoding (extracts audio tracks from container formats).
-* Headless YouTube stream piping via `yt-dlp` integration (`--ytdl-format=140`).
-* Real-time ASCII signal and EQ status logging in terminal stdout for debugging.
-* In-memory biquad equalizer controlled via terminal commands.
-* Global media key shortcuts via Windows System Media Transport Controls (SMTC).
+- Fixed 80 px overlay with KYOUKO branding, a compact status indicator,
+  elapsed time, track information, volume, EQ/repeat status, and a close button.
+- Interactive 10-band Braille equalizer, with gains from -12 to +12 dB.
+- Eleven global Win32 hotkeys, active even when the overlay is hidden.
+- Tracklist popup with the current selection highlighted and direct track jumps.
+- Local audio and audio tracks from supported video containers; YouTube,
+  Bilibili, and Niconico streams through `yt-dlp`.
+- Local folder queues sorted newest first. The last folder and selected track
+  are restored at startup, staged paused until playback is requested.
+- One automatic retry per failed track, then playlist advancement when a next
+  entry is available.
+- One compressed stream buffer in RAM, limited to 60 MiB. Seeking uses downloaded
+  data; repeating a completely cached stream avoids extraction and download.
+- Audio output error recovery and headphone jack hot-swap handling. Recovery
+  preserves selection, playback intent, and position where seeking is supported.
+- Atomic persistence of volume, EQ, repeat, folder, and track selection.
+- Build-time icon generation at 16, 32, 48, and 256 px, embedded as Windows PE
+  icon resource ID 1.
 
-## Requirements
+## Global hotkeys
 
-### Prerequisites
+| Shortcut | Action |
+| --- | --- |
+| `Alt + ,` | Seek backward 5 seconds |
+| `Alt + .` | Seek forward 5 seconds |
+| `Alt + /` | Pause/resume; restart the selected track after playback ends |
+| `Alt + Shift + ,` | Previous track |
+| `Alt + Shift + .` | Next track |
+| `Alt + L` | Toggle repeat |
+| `Alt + ;` | Toggle equalizer |
+| `Alt + Shift + /` | Hide/show overlay |
+| `Alt + Q` | Quit gracefully |
+| `Alt + -` | Lower volume by 10 percentage points |
+| `Alt + =` | Raise volume by 10 percentage points |
 
-* **OS:** Windows 11 / Windows 10 (x86_64)
-* **Rust Toolchain:** `rustc` 1.99+ and `cargo`
-* **External Dependency:** `yt-dlp` (must be accessible in system `PATH` for remote stream support)
-
-## Building from Source
-
-Clone the repository and build using Cargo:
-
-```powershell
-git clone https://github.com/S4M1TH4/kyouko-player.git
-cd Kyouko-Player
-cargo build --release
-```
-
-The compiled executable will be located at `target/release/kyouko-player.exe`.
+Hotkeys use native `RegisterHotKey`. A binding already reserved by another
+application cannot be registered; debug logs report individual conflicts.
 
 ## Usage
 
-### Local File Playback
-
-Pass local file paths directly via command-line arguments:
-
-```powershell
-.\target\release\kyouko-player.exe C:\Path\To\audio.flv
-```
-
-### YouTube Streaming
-
-Stream audio directly from YouTube URLs:
+Launch the executable, then drag a local file, folder, or supported stream link
+onto the overlay. An optional startup argument opens a file or URL immediately:
 
 ```powershell
-.\target\release\kyouko-player.exe https://www.youtube.com/watch?v=DdUoGjniJ7s
+.\target\release\kyouko-player.exe "C:\Music\track.mp3"
+.\target\release\kyouko-player.exe "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
-### CLI Terminal Commands
+Scroll over an equalizer column to adjust that band by 1 dB. Left-click the track
+information line to open the tracklist, then select an entry to start it.
+Right-click the overlay outside X to pause/resume. Drag the text area to move the
+window. Click X to quit; the full click is consumed before shutdown.
 
-When running in an interactive terminal, control playback state and DSP parameters using standard keyboard input:
+Settings are stored in `%LOCALAPPDATA%\kyouko-player\state.cfg`, falling back to
+`state.cfg` in the working directory when `LOCALAPPDATA` is unavailable.
 
-* `space` — Toggle Play / Pause
-* `s` — Stop Playback
-* `eq <band> <gain_db>` — Adjust Biquad EQ band gain (e.g., `eq 60 +3.0`)
-* `eq reset` — Reset all equalizer bands to flat (0 dB)
-* `q` or `Ctrl+C` — Terminate process and release system resources
+## Build
 
-## Project Structure
+Requirements:
 
-* `src/main.rs` — Application entrypoint and signal orchestrator
-* `src/audio/` — Decoders, ring buffers, and output stream engine
-* `src/dsp/` — Biquad filter implementation for EQ processing
-* `src/ui/` — Win32 overlay, tracklist drawer, global hotkeys, and OS event loop
-* `src/sources/` — File stream reader and `yt-dlp` stdin pipe wrapper
+- Windows 10 or 11.
+- Rust and Cargo with edition 2024 support; tested with Rust 1.99.0.
+- For the MSVC target, Visual Studio C++ Build Tools and the Windows SDK,
+  including the Resource Compiler (`rc.exe`).
+- `yt-dlp` on `PATH` for network playback. Local playback has no external
+  decoder-process dependency.
+
+```text
+cargo build --release
+```
+
+The executable is `target/release/kyouko-player.exe`. Icon resources are generated
+from repository geometry during compilation; no external icon asset is needed.
+Resource compilation failures stop the build. The MSVC build uses SDK `rc.exe`;
+GNU targets require a compatible `windres` toolchain.
+
+To retain diagnostic console output:
+
+```text
+cargo run
+```
+
+Set `KYOUKO_LOG` to `error`, `warn`, `info`, or `debug` to select log verbosity.
+
+## Verification
+
+```text
+cargo check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release
+```
+
+The default tests run without network access or an audio device. Diagnostics
+that require saved local media, WASAPI output, or live streaming are opt-in
+ignored tests.
+
+## Source map
+
+| Path | Responsibility |
+| --- | --- |
+| `src/main.rs` | Startup and lifecycle orchestration |
+| `src/broker.rs` | Commands, queues, playback state, and persistence policy |
+| `src/audio.rs` | Decoding, DSP, PCM pool, and output stream ownership |
+| `src/audio_device.rs` | Windows audio endpoint notifications |
+| `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |
+| `src/config.rs` | State configuration and atomic saves |
+| `src/process.rs` | External process launch policy |
+| `src/logging.rs` | Diagnostic logging |
+| `src/ui/` | Win32 overlay, tracklist, rendering, and hotkeys |
+| `build.rs`, `build/icon.rs` | Icon generation and PE resource embedding |

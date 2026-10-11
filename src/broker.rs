@@ -281,7 +281,8 @@ fn collect_media_from_paths(paths: &[String]) -> Option<LocalBatch> {
     if files.is_empty() {
         return None;
     }
-    files.sort_by(|a, b| mtime_of(source_path(b)).cmp(&mtime_of(source_path(a))));
+    // Stat once per entry, rather than doing disk I/O for every comparison.
+    files.sort_by_cached_key(|source| std::cmp::Reverse(mtime_of(source_path(source))));
     Some(LocalBatch { files, last_folder })
 }
 
@@ -316,7 +317,7 @@ fn scan_folder(dir: &str) -> Vec<Source> {
         })
         .collect();
     // Newest first; Option ordering puts undated entries at the end.
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     files.into_iter().map(|(_, source)| source).collect()
 }
 
@@ -398,7 +399,6 @@ pub enum DecoderCmd {
 
 /// Decoder → broker. Rare events; the bounded channel cannot deadlock because
 /// the broker selects on both inputs every iteration.
-#[allow(dead_code)] // Opened/Finished are constructed by the audio module in step 3
 #[derive(Debug)]
 pub enum Status {
     /// The one decoder has installed the replacement device's PCM pool.
@@ -604,9 +604,7 @@ pub struct TrackMeta {
     pub source: Source,
     pub title: Option<String>,
     pub duration: Option<Duration>,
-    #[allow(dead_code)] // read by the stream (re)configuration in step 3
     pub sample_rate: u32,
-    #[allow(dead_code)] // read by the stream (re)configuration in step 3
     pub channels: u16,
 }
 
@@ -633,11 +631,10 @@ impl DecoderLink {
     }
 
     pub fn send(&self, cmd: DecoderCmd) {
-        if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown | DecoderCmd::Load(_)) {
-            if let Some(f) = &self.interrupt {
+        if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown | DecoderCmd::Load(_))
+            && let Some(f) = &self.interrupt {
                 f();
             }
-        }
         if let Err(e) = self.tx.send(cmd) {
             log_error!("BROKER", "decoder channel dead: {e}");
         }
@@ -765,9 +762,8 @@ impl Broker {
 
     fn restore_startup(&mut self, last_folder: Option<String>, last_track: Option<String>, last_playlist_index: Option<usize>) {
         let restored_source = last_track.as_deref().map(Source::from_raw).map(|mut source| {
-            if let Source::Youtube { playlist_index: index @ Some(_), .. } = &mut source {
-                if let Some(saved) = last_playlist_index.filter(|&n| n > 0) { *index = Some(saved); }
-            }
+            if let Source::Youtube { playlist_index: index @ Some(_), .. } = &mut source
+                && let Some(saved) = last_playlist_index.filter(|&n| n > 0) { *index = Some(saved); }
             source
         });
         self.last_opened_source = restored_source.clone();
@@ -923,6 +919,22 @@ impl Broker {
                 current: self.queue_index.filter(|&index| index < self.local_queue.len()),
                 loading: false,
             }
+        }
+    }
+
+    /// Compare against the drawer's snapshot without cloning its title list.
+    pub fn track_list_matches(&self, view: &TrackList) -> bool {
+        if self.yt_queue_url.is_some() {
+            view.loading == self.yt_queue_loading
+                && view.current == self.current_yt_index().and_then(|n| n.checked_sub(1))
+                    .filter(|&index| index < self.yt_queue.len())
+                && view.titles == self.yt_queue
+        } else {
+            !view.loading
+                && view.current == self.queue_index.filter(|&index| index < self.local_queue.len())
+                && view.titles.len() == self.local_queue.len()
+                && view.titles.iter().zip(&self.local_queue)
+                    .all(|(title, source)| title == source.display_name())
         }
     }
 
@@ -1114,7 +1126,6 @@ impl Broker {
 
     /// Current panel text — read by the Win32 renderer in step 2 (e.g. when
     /// it needs to repaint from scratch after creation or a resize).
-    #[allow(dead_code)] // consumed in step 2
     pub fn view(&self) -> &str {
         &self.view
     }
@@ -1272,12 +1283,11 @@ impl Broker {
                     self.refresh();
                     return Flow::Continue;
                 }
-                if let Some(track) = &self.track {
-                    if let Some(delta) = bounded_seek_delta(self.shared.position(), track.duration, delta) {
+                if let Some(track) = &self.track
+                    && let Some(delta) = bounded_seek_delta(self.shared.position(), track.duration, delta) {
                         log_info!("BROKER", "seek {delta:+.1}s");
                         self.send_decoder(DecoderCmd::SeekRelative(delta));
                     }
-                }
             }
             Command::NextTrack => self.navigate(1),
             Command::PrevTrack => self.navigate(-1),
@@ -1479,17 +1489,20 @@ impl Broker {
                     log_debug!("BROKER", "obsolete Opened ignored after a different track was selected: {source}");
                     return;
                 }
+                let track = TrackMeta { source, title, duration, sample_rate, channels };
                 log_info!(
                     "BROKER",
-                    "opened: {source} — {} Hz, {channels} ch{}",
-                    sample_rate,
-                    duration
+                    "opened: {} — {} Hz, {} ch{}",
+                    track.source,
+                    track.sample_rate,
+                    track.channels,
+                    track.duration
                         .map(|d| format!(", {}", fmt_mmss(d)))
                         .unwrap_or_default()
                 );
-                self.last_opened_source = Some(source.clone());
+                self.last_opened_source = Some(track.source.clone());
                 self.pending_source = None; // the track now carries it
-                self.track = Some(TrackMeta { source, title, duration, sample_rate, channels });
+                self.track = Some(track);
                 self.shared.reset_playhead();
                 // A staged load resolves to Paused instead of Playing: the
                 // track is buffered and resume is instant, but the output
@@ -1627,7 +1640,7 @@ impl Broker {
     }
 }
 
-// ── Panel: the exact text the 200 px window will draw (ASCII only) ──────────
+// ── Panel: compact text for the 80 px window (ASCII only) ──────────────────
 
 /// Bound the requested target before sending a relative seek to the
 /// decoder. Unknown-duration streams still have a zero lower bound.
@@ -2754,6 +2767,34 @@ mod tests {
     fn local_track_list_is_empty_without_a_queue() {
         let (broker, _, _) = broker_with_sink();
         assert_eq!(broker.track_list(), TrackList::default());
+    }
+
+    #[test]
+    fn drawer_snapshot_comparison_catches_selection_title_loading_and_queue_changes() {
+        let (mut broker, _saves, _decoder_rx) = broker_with_sink();
+        let empty = broker.track_list();
+        assert!(broker.track_list_matches(&empty));
+        broker.local_queue = vec![Source::File(r"C:\album\one.wav".into()), Source::File(r"C:\album\two.wav".into())];
+        broker.queue_index = Some(0);
+        let local = broker.track_list();
+        assert!(broker.track_list_matches(&local));
+        assert!(!broker.track_list_matches(&empty));
+        broker.queue_index = Some(1);
+        assert!(!broker.track_list_matches(&local));
+        let second = broker.track_list();
+        broker.local_queue[1] = Source::File(r"C:\album\renamed.wav".into());
+        assert!(!broker.track_list_matches(&second));
+        broker.yt_queue_url = Some("https://youtube.com/playlist?list=test".into());
+        broker.yt_queue = vec!["First".into(), "Second".into()];
+        broker.yt_queue_loading = true;
+        let streaming = broker.track_list();
+        assert!(broker.track_list_matches(&streaming));
+        assert!(!broker.track_list_matches(&second));
+        broker.yt_queue_loading = false;
+        assert!(!broker.track_list_matches(&streaming));
+        let resolved = broker.track_list();
+        broker.yt_queue[0] = "Revised".into();
+        assert!(!broker.track_list_matches(&resolved));
     }
 
     #[test]

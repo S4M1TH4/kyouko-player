@@ -81,12 +81,11 @@ pub fn load_from(path: &Path) -> PersistedState {
 }
 
 pub fn store_to(path: &Path, state: &PersistedState) {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && fs::create_dir_all(parent).is_err() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() && fs::create_dir_all(parent).is_err() {
             log_warn!("CFG", "cannot create config dir {}", parent.display());
             return;
         }
-    }
     let mut eq = String::with_capacity(EQ_BANDS * 7);
     for (i, gain) in state.eq_gains.iter().enumerate() {
         if i > 0 {
@@ -248,12 +247,12 @@ mod tests {
     fn loop_flag_round_trip_and_garbage() {
         let path = temp_path("loop");
         store_to(&path, &PersistedState { loop_enabled: true, ..Default::default() });
-        assert_eq!(load_from(&path).loop_enabled, true);
+        assert!(load_from(&path).loop_enabled);
         store_to(&path, &PersistedState { loop_enabled: false, ..Default::default() });
-        assert_eq!(load_from(&path).loop_enabled, false);
+        assert!(!load_from(&path).loop_enabled);
         fs::write(&path, "loop=banana
 ").unwrap();
-        assert_eq!(load_from(&path).loop_enabled, false); // strict parse → default
+        assert!(!load_from(&path).loop_enabled); // strict parse → default
         let _ = fs::remove_file(&path);
     }
 

@@ -303,6 +303,12 @@ fn accent(phase: Phase) -> [u8; 3] {
     }
 }
 
+struct OverlayFrame {
+    panel: String,
+    phase: Phase,
+    eq: [f32; EQ_BANDS],
+}
+
 pub struct Renderer {
     width: i32,
     height: i32,
@@ -315,6 +321,9 @@ pub struct Renderer {
     bitmap: HBITMAP,
     bits: *mut u8,
     font: HFONT,
+    last_frame: Option<OverlayFrame>,
+    #[cfg(test)]
+    presentations: usize,
 }
 
 impl Renderer {
@@ -404,6 +413,9 @@ impl Renderer {
                 bitmap,
                 bits: bits as *mut u8,
                 font,
+                last_frame: None,
+                #[cfg(test)]
+                presentations: 0,
             })
         }
     }
@@ -499,8 +511,13 @@ impl Renderer {
 
     /// Paint `panel` with `phase`'s accent color and the 10-band gains as
     /// the Braille equalizer. Safe to call any number of times; each call is
-    /// a full repaint of the layered surface.
+    /// a full repaint through the persistent memory DC when content changes.
+    /// Layered presentation is atomic; unchanged snapshots do no GDI work.
     pub fn draw(&mut self, hwnd: HWND, panel: &str, phase: Phase, eq: &[f32; EQ_BANDS]) {
+        if self.last_frame.as_ref().is_some_and(|frame|
+            frame.panel == panel && frame.phase == phase && frame.eq == *eq) {
+            return;
+        }
         unsafe {
             let len = (self.width * self.height) as usize * 4;
             std::ptr::write_bytes(self.bits, 0, len);
@@ -531,7 +548,7 @@ impl Renderer {
             // the glyph pixels themselves. Alpha 1 (~0.4% of premultiplied
             // black) is imperceptible but keeps the full rect hit-testable.
             let color = accent(phase);
-            for px in std::slice::from_raw_parts_mut(self.bits, len).chunks_exact_mut(4) {
+            for px in std::slice::from_raw_parts_mut(self.bits, len).as_chunks_mut::<4>().0 {
                 let lum = px[0].max(px[1]).max(px[2]);
                 if lum == 0 {
                     px[3] = 1;
@@ -551,7 +568,7 @@ impl Renderer {
             };
             if crate::logging::enabled(crate::logging::LVL_DEBUG) {
                 let lit = std::slice::from_raw_parts(self.bits, len)
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .filter(|p| p[3] > 0)
                     .count();
                 log_debug!("RENDER", "draw: {lit}/{} px lit", len / 4);
@@ -574,6 +591,18 @@ impl Renderer {
                 ULW_ALPHA,
             ) {
                 log_error!("RENDER", "UpdateLayeredWindow failed: {e}");
+            } else {
+                // Commit only after presentation succeeds, so failures retry.
+                if let Some(frame) = &mut self.last_frame {
+                    frame.panel.clear();
+                    frame.panel.push_str(panel);
+                    frame.phase = phase;
+                    frame.eq = *eq;
+                } else {
+                    self.last_frame = Some(OverlayFrame { panel: panel.into(), phase, eq: *eq });
+                }
+                #[cfg(test)]
+                { self.presentations += 1; }
             }
         }
     }
@@ -593,6 +622,38 @@ impl Drop for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_skips_identical_frames_but_presents_eq_phase_and_text_changes() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
+        };
+        let panel = "header\ntime\ntrack\nvolume\neq repeat";
+        let mut renderer = Renderer::new(panel).unwrap();
+        let (width, height) = renderer.size();
+        unsafe {
+            // A hidden native surface exercises real layered presentation;
+            // there is no injected mouse input or desktop interaction.
+            let hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, w!("STATIC"), w!(""),
+                WS_POPUP, -32000, -32000, width, height, None, None,
+                Some(GetModuleHandleW(None).unwrap().into()), None).unwrap();
+            let mut gains = [0.0; EQ_BANDS];
+            renderer.draw(hwnd, panel, Phase::Playing, &gains);
+            assert_eq!(renderer.presentations, 1);
+            for _ in 0..3 { renderer.draw(hwnd, panel, Phase::Playing, &gains); }
+            assert_eq!(renderer.presentations, 1, "unchanged events do no presentation work");
+            gains[2] = 5.0;
+            renderer.draw(hwnd, panel, Phase::Playing, &gains);
+            assert_eq!(renderer.presentations, 2, "EQ is not part of the text panel");
+            renderer.draw(hwnd, panel, Phase::Paused, &gains);
+            assert_eq!(renderer.presentations, 3, "phase changes header and accent");
+            renderer.draw(hwnd, "header\nnew time\ntrack\nvolume\neq repeat", Phase::Paused, &gains);
+            assert_eq!(renderer.presentations, 4);
+            assert_eq!(renderer.size(), (width, height));
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
 
     #[test]
     fn track_info_hit_test_only_carves_out_the_third_text_row() {
@@ -721,7 +782,7 @@ mod tests {
                 assert!(GdiFlush().as_bool());
                 let pixels = std::slice::from_raw_parts(renderer.bits, len);
                 let mut lit_rows = [false; EQ_ROWS];
-                for (pixel_index, pixel) in pixels.chunks_exact(4).enumerate() {
+                for (pixel_index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
                     if pixel[..3].iter().all(|channel| *channel == 0) {
                         continue;
                     }
@@ -811,7 +872,7 @@ mod tests {
                 renderer.draw_eq_strip(&gains);
                 assert!(GdiFlush().as_bool());
                 let pixels = std::slice::from_raw_parts(renderer.bits, len);
-                let actual: Vec<_> = pixels.chunks_exact(4).enumerate()
+                let actual: Vec<_> = pixels.as_chunks::<4>().0.iter().enumerate()
                     .filter(|(_, pixel)| pixel[..3].iter().any(|channel| *channel != 0))
                     .map(|(index, _)| (index as i32 % renderer.width, index as i32 / renderer.width))
                     .collect();

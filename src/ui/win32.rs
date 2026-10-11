@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
     CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MSG,
     SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WNDCLASSW, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE,
+    WNDCLASSW, WM_CANCELMODE, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE,
     WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_PAINT, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WM_MBUTTONUP, WA_INACTIVE,
@@ -70,6 +70,7 @@ const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 1000;
 const WM_TRACKLIST_CLOSED: u32 = 0x8004;
 const WM_TRACKLIST_FINISH_CLICK: u32 = 0x8005;
+const WM_QUIT_FINISH_CLICK: u32 = 0x8006;
 const DRAWER_ALPHA: u8 = 245;
 
 const HOTKEY_SEEK_BACK: i32 = 0x100;
@@ -142,11 +143,10 @@ impl GlobalHotkeys {
 
     fn unregister(&mut self) {
         for (slot, binding) in self.registered.iter_mut().zip(&HOTKEY_BINDINGS) {
-            if std::mem::take(slot) {
-                if let Err(error) = unsafe { UnregisterHotKey(Some(self.hwnd), binding.id) } {
+            if std::mem::take(slot)
+                && let Err(error) = unsafe { UnregisterHotKey(Some(self.hwnd), binding.id) } {
                     log_warn!("UI", "cannot unregister hotkey {}: {error}", binding.label);
                 }
-            }
         }
     }
 }
@@ -177,6 +177,41 @@ impl DrawerClickState {
     }
 
     fn busy(&self) -> bool { self.pending.is_some() || self.close_queued }
+}
+
+#[derive(Default, PartialEq)]
+enum QuitClickState {
+    #[default]
+    Idle,
+    Pressed,
+    Queued,
+    Dispatched,
+}
+
+impl QuitClickState {
+    fn busy(&self) -> bool { *self != Self::Idle }
+
+    fn press(&mut self) -> bool {
+        if self.busy() { return false; }
+        *self = Self::Pressed;
+        true
+    }
+
+    fn release(&mut self, message: u32) -> bool {
+        if message != WM_LBUTTONUP || *self != Self::Pressed { return false; }
+        *self = Self::Queued;
+        true
+    }
+
+    fn finish(&mut self) -> Option<Command> {
+        if *self != Self::Queued { return None; }
+        *self = Self::Dispatched;
+        Some(Command::Quit)
+    }
+
+    fn cancel_press(&mut self) {
+        if *self == Self::Pressed { *self = Self::Idle; }
+    }
 }
 
 fn drawer_hit_test(bounds: RECT, point: POINT) -> LRESULT {
@@ -230,6 +265,7 @@ struct UiState {
     last_phase: Phase,
     hidden: bool,
     hotkeys: GlobalHotkeys,
+    quit_click: QuitClickState,
     drawer: Option<DrawerHandle>,
     next_drawer_token: usize,
 }
@@ -330,6 +366,7 @@ pub fn run(
         last_phase: Phase::Stopped,
         hidden: false,
         hotkeys: GlobalHotkeys::default(),
+        quit_click: QuitClickState::default(),
             drawer: None,
             next_drawer_token: 0,
     }));
@@ -364,11 +401,10 @@ pub fn run(
         set_pump_hwnd(hwnd.0 as isize);
         // Accept OLE drops (browser links arrive as text/URL formats, files
         // and folders as CF_HDROP) — see `DropTarget` below.
-        if ole.is_ok() {
-            if let Err(e) = RegisterDragDrop(hwnd, &drop_target) {
+        if ole.is_ok()
+            && let Err(e) = RegisterDragDrop(hwnd, &drop_target) {
                 log_warn!("UI", "RegisterDragDrop failed: {e}");
             }
-        }
         // Content exists before the window is shown — no first-paint flash.
         let eq = (*state).shared.eq_gains();
         (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase(), &eq);
@@ -499,12 +535,11 @@ fn dismiss_tracklist(state: *mut UiState) {
 }
 
 fn toggle_tracklist(state: *mut UiState) {
-    if let Some(drawer) = unsafe { (*state).drawer.take() } {
-        if unsafe { IsWindow(Some(drawer.hwnd)).as_bool() } {
+    if let Some(drawer) = unsafe { (*state).drawer.take() }
+        && unsafe { IsWindow(Some(drawer.hwnd)).as_bool() } {
             close_drawer(drawer.hwnd);
             return;
         }
-    }
     let owner = unsafe { (*state).hwnd };
     let view = unsafe { (*state).broker.track_list() };
     let work = drawer_workarea(owner);
@@ -535,8 +570,8 @@ fn refresh_tracklist(s: &UiState) {
     unsafe {
         let state = GetWindowLongPtrW(drawer.hwnd, GWLP_USERDATA) as *mut DrawerState;
         if state.is_null() || (*state).click.busy() { return; }
+        if s.broker.track_list_matches(&(*state).view) { return; }
         let view = s.broker.track_list();
-        if (*state).view == view { return; }
         let work = drawer_workarea(s.hwnd);
         let layout = TrackListLayout::new(view.titles.len(), work.right - work.left, work.bottom - work.top);
         let first = if (*state).view.current != view.current {
@@ -1048,7 +1083,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 sync(s);
                 LRESULT(0)
             }
-            WM_TIMER if wp.0 as usize == TIMER_ID => {
+            WM_TIMER if wp.0 == TIMER_ID => {
                 // Elapsed-time tick; only scheduled while Playing.
                 s.broker.tick();
                 sync(s);
@@ -1072,12 +1107,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
             WM_LBUTTONDOWN => {
-                // X uses the same graceful Quit command as Alt+Q; Track Info
-                // opens the list. Braille clicks remain a no-op.
+                // Like the drawer, X must retain the surface and capture until
+                // the matching mouse-up is consumed. Quitting on down exposes
+                // the underlying app to the second half of this click.
+                if s.quit_click.busy() { return LRESULT(0); }
                 let x = x_lparam(lp);
                 let y = y_lparam(lp);
-                if let Some(command) = quit_click_command(&s.renderer, x, y) {
-                    post_command(command);
+                if quit_click_command(&s.renderer, x, y).is_some() {
+                    if s.quit_click.press() { SetCapture(hwnd); }
                 } else if s.renderer.track_info_at(x, y) {
                     toggle_tracklist(state);
                 }
@@ -1085,6 +1122,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // wheel-driven); the window never enters a drag from an
                 // HTCLIENT zone.
                 LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                if s.quit_click.release(msg) {
+                    // Leave capture and the unchanged window alive until this
+                    // handler returns, then dispatch the usual graceful Quit.
+                    if let Err(error) = PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0)) {
+                        s.quit_click = QuitClickState::Idle;
+                        log_warn!("UI", "cannot queue quit click: {error}");
+                        if GetCapture() == hwnd { let _ = ReleaseCapture(); }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_QUIT_FINISH_CLICK => {
+                if let Some(command) = s.quit_click.finish() { post_command(command); }
+                // Capture stays ours through broker shutdown and DestroyWindow.
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED | WM_CANCELMODE => {
+                s.quit_click.cancel_press();
+                // Preserve native cancellation/caption-drag behavior. A Quit
+                // already queued after mouse-up remains valid.
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_RBUTTONDOWN | WM_NCRBUTTONDOWN => {
                 let mut bounds = RECT::default();
@@ -1175,6 +1235,103 @@ mod tests {
         assert!(matches!(hotkey_command(HOTKEY_QUIT as usize), Some(Command::Quit)));
         for (x, y) in [(68, 4), (77, 4), (72, 2), (72, 20), (-1, 4), (80, 4)] {
             assert!(quit_click_command(&renderer, x, y).is_none());
+        }
+    }
+
+    #[test]
+    fn quit_click_consumes_the_matching_release_before_dispatching_once() {
+        let mut click = QuitClickState::default();
+        assert!(!click.release(WM_LBUTTONUP));
+        assert!(click.finish().is_none());
+        assert!(click.press());
+        assert!(click.busy());
+        assert!(!click.press());
+        assert!(click.finish().is_none(), "mouse-down must not quit");
+        for message in [WM_RBUTTONUP, WM_MBUTTONUP, WM_LBUTTONDOWN] {
+            assert!(!click.release(message));
+            assert!(click.finish().is_none());
+        }
+        assert!(click.release(WM_LBUTTONUP));
+        assert!(click.busy(), "retain the window/capture until deferred completion");
+        assert!(!click.release(WM_LBUTTONUP));
+        assert!(matches!(click.finish(), Some(Command::Quit)));
+        assert!(click.finish().is_none());
+        assert!(click.busy(), "block new clicks until the broker destroys the window");
+        assert!(!click.press());
+    }
+
+    #[test]
+    fn lost_capture_cancels_only_an_unfinished_quit_press() {
+        let mut click = QuitClickState::default();
+        assert!(click.press());
+        click.cancel_press();
+        assert!(!click.busy());
+        assert!(!click.release(WM_LBUTTONUP));
+        assert!(click.finish().is_none());
+        assert!(click.press());
+        assert!(click.release(WM_LBUTTONUP));
+        click.cancel_press();
+        assert!(matches!(click.finish(), Some(Command::Quit)), "capture loss after release cannot cancel a completed click");
+        click.cancel_press();
+        assert!(click.busy());
+        assert!(click.finish().is_none());
+    }
+
+    #[test]
+    fn hidden_quit_window_stays_alive_until_release_and_deferred_broker_shutdown() {
+        use crate::broker::DecoderLink;
+        // No synthetic mouse input: exercise the click state and our private
+        // completion message on an offscreen native window.
+        unsafe extern "system" fn test_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            if msg == WM_CREATE { return LRESULT(0); } // do not contend with hotkey tests
+            unsafe { wndproc(hwnd, msg, wp, lp) }
+        }
+        let shared = SharedState::new();
+        let (decoder_tx, decoder_rx) = crossbeam_channel::bounded(8);
+        let (command_tx, cmd_rx) = crossbeam_channel::bounded(32);
+        let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
+        CMD_TX.set(command_tx).unwrap();
+        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, Arc::new(|| {})));
+        let renderer = Renderer::new(broker.view()).unwrap();
+        let (width, height) = renderer.size();
+        let mut state = Box::new(UiState {
+            hwnd: HWND::default(), broker, cmd_rx, status_rx, shared, renderer,
+            audio_out: AudioOut::new(None), timer_on: false,
+            last_phase: Phase::Stopped, hidden: true,
+            hotkeys: GlobalHotkeys::default(), drawer: None, next_drawer_token: 0,
+            quit_click: QuitClickState::default(),
+        });
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = WNDCLASSW { lpfnWndProc: Some(test_wndproc), hInstance: instance.into(),
+                lpszClassName: w!("kyouko_quit_click_test"), ..Default::default() };
+            assert_ne!(RegisterClassW(&class), 0);
+            let hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                w!("kyouko_quit_click_test"), w!(""), WS_POPUP, -32000, -32000, width, height,
+                None, None, Some(instance.into()), Some(&mut *state as *mut UiState as *const c_void)).unwrap();
+            state.hwnd = hwnd;
+            assert!(state.quit_click.press());
+            assert!(IsWindow(Some(hwnd)).as_bool());
+            assert!(state.cmd_rx.is_empty());
+            assert!(decoder_rx.is_empty(), "no early Shutdown while the mouse is held");
+            assert!(state.quit_click.release(WM_LBUTTONUP));
+            PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0)).unwrap();
+            assert!(IsWindow(Some(hwnd)).as_bool());
+            assert!(state.cmd_rx.is_empty(), "posting is deferred until mouse-up has returned");
+            let mut message = MSG::default();
+            assert!(GetMessageW(&mut message, Some(hwnd), WM_QUIT_FINISH_CLICK, WM_QUIT_FINISH_CLICK).0 > 0);
+            DispatchMessageW(&message);
+            assert!(IsWindow(Some(hwnd)).as_bool(), "completion only queues graceful Quit");
+            assert_eq!(state.cmd_rx.len(), 1);
+            // Duplicate completion messages cannot send another Quit.
+            PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0)).unwrap();
+            assert!(GetMessageW(&mut message, Some(hwnd), WM_QUIT_FINISH_CLICK, WM_QUIT_FINISH_CLICK).0 > 0);
+            DispatchMessageW(&message);
+            assert_eq!(state.cmd_rx.len(), 1);
+            assert!(drain_commands(&mut state));
+            assert!(matches!(decoder_rx.try_recv(), Ok(crate::broker::DecoderCmd::Shutdown)));
+            destroy(&mut state);
+            assert!(!IsWindow(Some(hwnd)).as_bool());
         }
     }
 
@@ -1275,6 +1432,7 @@ mod tests {
             audio_out: AudioOut::new(None), timer_on: false,
             last_phase: Phase::Stopped, hidden: true,
             hotkeys: GlobalHotkeys::default(), drawer: None, next_drawer_token: 0,
+            quit_click: QuitClickState::default(),
         });
         unsafe {
             let instance = GetModuleHandleW(None).unwrap();
