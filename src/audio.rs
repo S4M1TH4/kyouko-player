@@ -2676,11 +2676,12 @@ mod tests {
         let saved = crate::config::load();
         let mut files: Vec<_> = if let Some(folder) = &saved.last_folder {
             std::fs::read_dir(folder).unwrap().flatten().map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|ext| matches!(ext.to_str(), Some("ogg" | "mp3" | "flac" | "wav" | "m4a" | "mp4"))))
+                .filter(|path| path.is_file() && crate::broker::is_media_path(path))
                 .collect()
         } else {
             let file = std::path::PathBuf::from(saved.last_track.as_ref().expect("state.cfg needs a local track or folder"));
             assert!(file.is_file(), "saved last_track must be a local media file");
+            assert!(crate::broker::is_media_path(&file), "saved last_track must have a supported media extension");
             vec![file]
         };
         files.sort();

@@ -32,10 +32,10 @@ pub const EQ_BAND_HZ: [u32; EQ_BANDS] =
     [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 pub const EQ_MAX_GAIN_DB: f32 = 12.0;
 
-/// Extensions a folder scan queues. Deliberately matches the symphonia
-/// feature set this binary was built with (.opus waits for symphonia 0.6).
-const MEDIA_EXTENSIONS: [&str; 10] =
-    ["mp3", "flac", "wav", "m4a", "aac", "mp4", "mkv", "webm", "ogg", "aiff"];
+/// Containers readable by the enabled Symphonia features. A recognized
+/// container still needs a supported audio codec, checked when the decoder opens it.
+const MEDIA_EXTENSIONS: [&str; 9] =
+    ["mp3", "flac", "wav", "m4a", "aac", "mp4", "mkv", "webm", "ogg"];
 
 // ── Message vocabulary ───────────────────────────────────────────────────────
 
@@ -122,7 +122,7 @@ pub(crate) fn parse_playlist_titles(raw: &[u8]) -> Result<Vec<String>, String> {
 }
 
 /// Does this path carry a supported media extension?
-fn is_media_path(path: &Path) -> bool {
+pub(crate) fn is_media_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| MEDIA_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
@@ -306,8 +306,7 @@ fn scan_folder(dir: &str) -> Vec<Source> {
             if path.is_dir() {
                 return None;
             }
-            let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-            if !MEDIA_EXTENSIONS.contains(&ext.as_str()) {
+            if !is_media_path(&path) {
                 return None;
             }
             let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
@@ -858,7 +857,13 @@ impl Broker {
     }
 
     fn restore_startup(&mut self, last_folder: Option<String>, last_track: Option<String>, last_playlist_index: Option<usize>) {
-        let restored_source = last_track.as_deref().map(Source::from_raw).map(|mut source| {
+        let restored_source = last_track.as_deref().map(Source::from_raw).filter(|source| {
+            if let Source::File(path) = source && !is_media_path(Path::new(path)) {
+                log_warn!("BROKER", "saved file has an unsupported extension: {path}");
+                return false;
+            }
+            true
+        }).map(|mut source| {
             if let Source::Youtube { playlist_index: index @ Some(_), .. } = &mut source
                 && let Some(saved) = last_playlist_index.filter(|&n| n > 0) { *index = Some(saved); }
             source
@@ -1325,6 +1330,9 @@ impl Broker {
                                 return Flow::Continue;
                             }
                         }
+                    } else if !is_media_path(Path::new(path)) {
+                        log_warn!("BROKER", "file has an unsupported extension: {path} — playback state unchanged");
+                        return Flow::Continue;
                     }
                 }
                 if !queue_managed {
@@ -2915,6 +2923,66 @@ mod tests {
             other => panic!("expected restart of first file, got {other:?}"),
         }
         assert_eq!(broker.queue_index, Some(0));
+    }
+
+    #[test]
+    fn unsupported_file_loads_and_restored_history_never_reach_the_decoder() {
+        let (mut broker, sink, rx) = broker_with_sink();
+        let source = Source::File("playing.mp3".into());
+        broker.handle_command(Command::Load { source: source.clone(), paused: false });
+        let _ = rx.try_recv().unwrap();
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
+            source, sample_rate: 48_000, channels: 2, title: None, duration: None });
+        let saved = broker.persist_snapshot();
+        let saves = sink.lock().unwrap().len();
+        let load_id = broker.shared.load_id();
+        let queue = broker.local_queue.clone();
+        for extension in ["aiff", "aif", "caf", "mp1", "mp2", "opus", "txt", ""] {
+            let path = format!("unsupported.{extension}");
+            for paused in [false, true] {
+                broker.handle_command(Command::Load { source: Source::File(path.clone()), paused });
+                assert_eq!(broker.shared.phase(), Phase::Playing);
+                assert_eq!(broker.shared.load_id(), load_id);
+                assert_eq!(broker.local_queue, queue);
+                assert_eq!(broker.persist_snapshot().last_track, saved.last_track);
+                assert_eq!(sink.lock().unwrap().len(), saves);
+                assert!(rx.is_empty());
+            }
+            let (mut restored, _, restored_rx) = broker_with_sink();
+            restored.handle_command(Command::RestoreState { last_folder: None,
+                last_track: Some(path), last_playlist_index: None });
+            assert_eq!(restored.shared.phase(), Phase::Stopped);
+            assert!(restored.local_queue.is_empty());
+            assert!(restored.persist_snapshot().last_track.is_none());
+            assert!(restored_rx.is_empty());
+        }
+    }
+
+    #[test]
+    fn folder_and_drop_filters_exclude_disabled_formats_and_keep_supported_containers() {
+        let dir = std::env::temp_dir().join(format!("kyouko-drop-{}-formats", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let supported = ["MP3", "flac", "wav", "m4a", "aac", "mp4", "mkv", "webm", "ogg"];
+        let unsupported = ["aiff", "AIF", "caf", "mp1", "mp2", "opus", "txt"];
+        let paths: Vec<String> = supported.iter().chain(&unsupported).map(|ext| {
+            let path = dir.join(format!("track.{ext}"));
+            std::fs::write(&path, b"extension-only fixture").unwrap();
+            path.to_string_lossy().into_owned()
+        }).collect();
+        for inputs in [paths.clone(), vec![dir.to_string_lossy().into_owned()]] {
+            let batch = collect_media_from_paths(&inputs).unwrap();
+            assert_eq!(batch.files.len(), supported.len());
+            for ext in &unsupported {
+                assert!(!batch.files.iter().any(|source| source.raw().ends_with(&format!(".{ext}"))));
+            }
+        }
+        let (mut restored, _, rx) = broker_with_sink();
+        restored.handle_command(Command::RestoreState { last_folder: Some(dir.to_string_lossy().into_owned()),
+            last_track: Some(dir.join("track.aiff").to_string_lossy().into_owned()), last_playlist_index: None });
+        assert_eq!(restored.local_queue.len(), supported.len());
+        assert_eq!(restored.queue_index, Some(0));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::File(path), _)) if is_media_path(Path::new(&path))));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

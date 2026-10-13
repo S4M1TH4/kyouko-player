@@ -42,9 +42,9 @@ cpal = "0.18.2" # WASAPI failed-worker cleanup and default-device recovery fixes
 # Decoding. Defaults off — we ship exactly the codecs we play, nothing else.
 # `isomp4`+`aac` covers yt-dlp's format 140 (m4a); `mkv` covers webm/matroska
 # video pulled in as audio. Video containers decode audio-only by design.
-# Note: Opus arrives with symphonia 0.6 (0.5 has no opus feature); until then
-# the YouTube fallback path is AAC (140) / Vorbis, which is what we want for
-# audio anyway. `opt-simd` enables symphonia's SSE/AVX decode paths.
+# Opus is not enabled; network sources select AAC. The local extension filter
+# in broker.rs must match these enabled container readers.
+# `opt-simd` enables symphonia's SSE/AVX decode paths.
 symphonia = { version = "0.5", default-features = false, features = [
     "mp3",
     "aac",
