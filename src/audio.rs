@@ -10,16 +10,15 @@
 //!         → pooled AudioChunk (4096 frames, generation-stamped) → bounded PCM ring
 //!
 //!   cpal/WASAPI callback (event-driven, OS-scheduled):
-//!         try_recv chunk → copy/convert → recycle block; never allocates or blocks
+//!         one-attempt PCM claim → copy/convert → recycle; atomic drain/wake
 //! ```
 //!
 //! Zero-poll contract of the decoder thread:
-//! * idle → parks in `cmds.recv()`
+//! * idle → registers command interest and parks in an atomic address wait
 //! * playing → one blocking source read per packet (~40/s of real work), a
-//!   `try_recv` command check per packet, and — only when the chunk channel
-//!   is full — parks in `select!` between the chunk channel and the command
-//!   channel. It never spins, sleeps, or busy-waits.
-//! * end of track → parks in `select!` waiting for the output callback to
+//!   `try_recv` command check per packet. A full pool registers capacity and
+//!   command interest, rechecks both predicates, then parks without spinning.
+//! * end of track → parks on drain/command interest waiting for the callback to
 //!   drain the buffered tail, so `Finished` never chops audio off the end.
 //!
 //! Orphan-proof yt-dlp lifecycle: the child lives in a shared slot that the
@@ -28,19 +27,27 @@
 //! the one case the decoder can't handle itself: a network-stalled pipe read
 //! that would otherwise defer the next command indefinitely.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::process::Stdio;
 use crate::process::SourceChild as Child;
 #[cfg(test)]
 use std::process::Command;
-use std::sync::{Arc, Mutex, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, select, Receiver, Sender, TryRecvError, TrySendError};
+use crossbeam_channel::{Sender, TryRecvError};
+#[cfg(test)]
+use crossbeam_channel::{bounded, Receiver};
+use crate::decoder_wake::{CommandReceiver, DecoderWake, COMMAND, CAPACITY, DRAIN};
+#[cfg(test)]
+use crate::decoder_wake::command_channel;
+#[cfg(test)]
+use crossbeam_channel::select;
+use crate::pcm_queue::{PcmQueue, PopError};
 
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder};
@@ -59,6 +66,10 @@ use crate::broker::{
 use crate::log_error;
 use crate::stream_buffer::StreamBuffer;
 use crate::{log_info, log_warn, log_debug};
+
+#[cfg(test)]
+#[path = "audio_performance.rs"]
+mod performance;
 
 /// One decoded, EQ'd, volume-applied, resampled block of interleaved f32
 /// samples at the DEVICE rate. Allocated once in the pool, then recycled.
@@ -87,38 +98,53 @@ struct BufferState {
     eof_generation: AtomicU64,
     underrun_frames: AtomicU64,
     rendered_frames: AtomicU64,
+    sinks: AtomicUsize,
+    rendering: AtomicBool,
+    wake: OnceLock<Arc<DecoderWake>>,
+    #[cfg(test)]
+    timing: performance::CallbackRecords,
 }
 
-/// A fixed pool travels through two bounded rings. Only the decoder fills
-/// blocks; the callback returns them to the free ring instead of freeing them.
+/// A fixed pool travels through two bounded rings and a decoder spare list.
+/// Only the decoder publishes; only the renderer writes the recycling ring.
 struct ChunkSender {
-    ready: Sender<AudioChunk>,
-    discard: Receiver<AudioChunk>,
-    free: Receiver<AudioChunk>,
-    recycle: Sender<AudioChunk>,
-    sink_gone: Receiver<()>,
+    ready: Arc<PcmQueue<AudioChunk>>,
+    free: Arc<PcmQueue<AudioChunk>>,
+    // Only the decoder touches this preallocated spare list. It owns stale
+    // and interrupted blocks directly; it never writes the recycle ring.
+    reserve: RefCell<Vec<AudioChunk>>,
     state: Arc<BufferState>,
     prefill_samples: usize,
     priming: Cell<(u64, usize)>,
 }
 
-#[derive(Clone)]
 pub struct ChunkReceiver {
-    queue: Receiver<AudioChunk>,
-    recycle: Sender<AudioChunk>,
-    // Keep recycling connected until the callback itself is destroyed, even
-    // after decoder shutdown. No buffer can be dropped by a failed try_send.
-    _free_guard: Receiver<AudioChunk>,
-    _alive: Sender<()>,
+    queue: Arc<PcmQueue<AudioChunk>>,
+    recycle: Arc<PcmQueue<AudioChunk>>,
     state: Arc<BufferState>,
 }
 
+impl Clone for ChunkReceiver {
+    fn clone(&self) -> Self {
+        self.state.sinks.fetch_add(1, Ordering::Relaxed);
+        Self { queue: self.queue.clone(), recycle: self.recycle.clone(), state: self.state.clone() }
+    }
+}
+
+impl Drop for ChunkReceiver {
+    fn drop(&mut self) {
+        if self.state.sinks.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(wake) = self.state.wake.get() {
+                wake.notify(COMMAND | CAPACITY | DRAIN);
+            }
+    }
+}
+
 fn chunk_channel(rate: u32, channels: usize, depth: usize) -> (ChunkSender, ChunkReceiver) {
-    let (ready, queue) = bounded(depth);
-    let (recycle, free) = bounded(depth + 1);
-    let (alive, sink_gone) = bounded(0);
+    let ready = Arc::new(PcmQueue::new(depth));
+    let free = Arc::new(PcmQueue::new(depth + 1));
     for _ in 0..=depth {
-        recycle.send(AudioChunk {
+        free.try_send(AudioChunk {
             data: vec![0.0; CHUNK_FRAMES * channels].into_boxed_slice(),
             len: 0, generation: u64::MAX,
         }).unwrap_or_else(|_| unreachable!("pool initialization"));
@@ -128,14 +154,17 @@ fn chunk_channel(rate: u32, channels: usize, depth: usize) -> (ChunkSender, Chun
         eof_generation: AtomicU64::new(u64::MAX),
         underrun_frames: AtomicU64::new(0),
         rendered_frames: AtomicU64::new(0),
+        sinks: AtomicUsize::new(1), rendering: AtomicBool::new(false), wake: OnceLock::new(),
+        #[cfg(test)]
+        timing: performance::CallbackRecords::new(),
     });
     (ChunkSender {
-        ready, discard: queue.clone(), free: free.clone(), recycle: recycle.clone(), sink_gone,
+        ready: ready.clone(), free: free.clone(), reserve: RefCell::new(Vec::with_capacity(depth + 1)),
         state: state.clone(),
         prefill_samples: (rate as usize * PREFILL_MILLIS / 1000 * channels)
             .min(depth * CHUNK_FRAMES * channels),
         priming: Cell::new((u64::MAX, 0)),
-    }, ChunkReceiver { queue, recycle, _free_guard: free, _alive: alive, state })
+    }, ChunkReceiver { queue: ready, recycle: free, state })
 }
 
 impl ChunkSender {
@@ -145,7 +174,15 @@ impl ChunkSender {
         self.priming.set((generation, 0));
         // The single producer calls this before publishing a new generation.
         // Reclaim old queued audio here, including when WASAPI is paused.
-        while let Ok(chunk) = self.discard.try_recv() { recycle(&self.recycle, chunk); }
+        // Bounded competing consumption, never clear/reset a live ring. A
+        // callback that already claimed an old block owns it until recycling.
+        for _ in 0..self.ready.capacity() {
+            match self.ready.try_recv() {
+                Ok(chunk) => self.reserve.borrow_mut().push(chunk),
+                Err(PopError::Contended) => continue,
+                Err(PopError::Empty) => break,
+            }
+        }
     }
 
     fn published(&self, generation: u64, samples: usize) {
@@ -162,13 +199,52 @@ impl ChunkSender {
         // Short tracks must start even when they cannot fill the watermark.
         self.state.ready_generation.store(generation, Ordering::Release);
     }
+
+    fn bind(&self, wake: &Arc<DecoderWake>) {
+        let installed = self.state.wake.get_or_init(|| wake.clone());
+        assert!(Arc::ptr_eq(installed, wake), "each pool belongs to exactly one decoder");
+    }
+    fn take_free(&self) -> Option<AudioChunk> {
+        self.reserve.borrow_mut().pop().or_else(|| self.free.try_recv().ok())
+    }
+    fn keep(&self, chunk: AudioChunk) { self.reserve.borrow_mut().push(chunk); }
+    fn sink_gone(&self) -> bool { self.state.sinks.load(Ordering::Acquire) == 0 }
+    #[cfg(test)]
+    fn free_count(&self) -> usize { self.free.len() + self.reserve.borrow().len() }
 }
 
-fn recycle(sender: &Sender<AudioChunk>, chunk: AudioChunk) {
-    // There are exactly depth+1 buffers and depth+1 free slots. Owning this
-    // buffer proves at least one slot is free. A receiver guard prevents
-    // disconnection. This path neither allocates nor deallocates.
+fn recycle(sender: &PcmQueue<AudioChunk>, chunk: AudioChunk) {
+    // Exactly depth+1 blocks and recycle slots; owning a block proves there
+    // is a slot. The sole rendering owner is the sole recycle writer. Its Arc
+    // keeps the queue connected after decoder shutdown. No allocation/free.
     sender.try_send(chunk).unwrap_or_else(|_| unreachable!("PCM pool invariant"));
+}
+
+/// EOF is a generation-qualified atomic mailbox, with no channel waiter lock.
+#[derive(Clone)]
+pub struct DrainSignal {
+    generation: Arc<AtomicU64>,
+    wake: Arc<DecoderWake>,
+}
+
+fn drain_channel(wake: &Arc<DecoderWake>) -> (DrainSignal, DrainSignal) {
+    let signal = DrainSignal { generation: Arc::new(AtomicU64::new(u64::MAX)), wake: wake.clone() };
+    (signal.clone(), signal)
+}
+
+impl DrainSignal {
+    #[cfg(test)]
+    fn send(&self, generation: u64) -> Result<(), ()> { self.try_send(generation) }
+    #[cfg(test)]
+    fn try_send(&self, generation: u64) -> Result<(), ()> {
+        self.generation.store(generation, Ordering::Release);
+        self.wake.notify(DRAIN);
+        Ok(())
+    }
+    fn try_recv(&self) -> Result<u64, ()> {
+        let generation = self.generation.swap(u64::MAX, Ordering::AcqRel);
+        if generation == u64::MAX { Err(()) } else { Ok(generation) }
+    }
 }
 
 /// Kill switch for external source processes. Clonable handle handed to the
@@ -240,20 +316,20 @@ pub struct AudioHandles {
     pub chunk_rx: ChunkReceiver,
     /// Signals (per generation) when the output callback has drained all
     /// buffered audio — used at end-of-track so the tail plays out fully.
-    pub drained_tx: Sender<u64>,
+    pub drained_tx: DrainSignal,
     pub decoder: JoinHandle<()>,
     pub controls: AudioControls,
 }
 
 pub fn spawn(
     shared: Arc<SharedState>,
-    cmds: Receiver<DecoderCmd>,
+    cmds: CommandReceiver,
     status_tx: Sender<Status>,
 ) -> AudioHandles {
     let rate = match shared.sample_rate() { 0 => 48_000, n => n };
     let channels = match shared.device_channels() { 0 => 2, n => n as usize };
     let (chunk_tx, chunk_rx) = chunk_channel(rate, channels, buffer_depth(rate));
-    let (drained_tx, drained_rx) = bounded::<u64>(4);
+    let (drained_tx, drained_rx) = drain_channel(&cmds.wake);
     let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let buffer_slot: BufferSlot = Arc::new(Mutex::new(None));
     let output_slot: OutputSlot = Arc::new(Mutex::new(None));
@@ -280,7 +356,7 @@ pub struct AudioOut {
     playing: bool,
     signals: Arc<OutputSignals>,
     receiver: Option<ChunkReceiver>,
-    drained: Option<Sender<u64>>,
+    drained: Option<DrainSignal>,
     shared: Option<Arc<SharedState>>,
     controls: Option<AudioControls>,
     key: Option<OutputKey>,
@@ -297,21 +373,18 @@ pub(crate) struct OutputSignals {
     changed: AtomicBool,
     endpoint_changed: AtomicBool,
     endpoint_hash: AtomicU64,
-    wake: Sender<()>,
-    events: Receiver<()>,
+    pending: AtomicBool,
 }
 
 impl OutputSignals {
     pub(crate) fn new() -> Arc<Self> {
-        let (wake, events) = bounded(1);
         Arc::new(Self { stream_state: AtomicU64::new(2), consumed_failure: AtomicU64::new(0),
             changed: AtomicBool::new(false), endpoint_changed: AtomicBool::new(false),
-            endpoint_hash: AtomicU64::new(0), wake, events })
+            endpoint_hash: AtomicU64::new(0), pending: AtomicBool::new(false) })
     }
 
     fn notify(&self) {
-        let _ = self.wake.try_send(());
-        crate::ui::wake_output();
+        if !self.pending.swap(true, Ordering::AcqRel) { crate::ui::wake_output(); }
     }
 
     pub(crate) fn device_changed(&self) {
@@ -339,7 +412,6 @@ impl OutputSignals {
             _ => {}
         }
         if self.stream_state.compare_exchange(epoch, epoch | 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            log_warn!("AUDIO", "output stream invalidated: {error}");
             self.notify();
         }
     }
@@ -351,7 +423,7 @@ impl OutputSignals {
     }
 
     pub(crate) fn take(&self) -> (bool, bool, bool) {
-        while self.events.try_recv().is_ok() {}
+        self.pending.store(false, Ordering::Release);
         let changed = self.changed.swap(false, Ordering::AcqRel);
         let state = self.stream_state.load(Ordering::Acquire);
         let failed = state & 1 != 0 && self.consumed_failure.swap(state & !1, Ordering::AcqRel) != state & !1;
@@ -391,7 +463,7 @@ impl AudioOut {
     }
 
     pub fn managed(device: Result<(cpal::Device, cpal::SupportedStreamConfig), String>,
-        receiver: ChunkReceiver, drained: Sender<u64>, shared: Arc<SharedState>, controls: AudioControls) -> Self {
+        receiver: ChunkReceiver, drained: DrainSignal, shared: Arc<SharedState>, controls: AudioControls) -> Self {
         let mut output = Self::new(None);
         let epoch = output.signals.stream_state.load(Ordering::Relaxed);
         let stream = device.and_then(|(device, config)| {
@@ -413,9 +485,6 @@ impl AudioOut {
         output
     }
 
-    #[cfg(any(not(windows), debug_assertions))]
-    pub fn event_receiver(&self) -> Receiver<()> { self.signals.events.clone() }
-
     pub fn start_notifications(&mut self) {
         if self.controls.is_none() { return; }
         #[cfg(windows)]
@@ -431,6 +500,7 @@ impl AudioOut {
     pub fn handle_device_events(&mut self, broker: &mut Broker) {
         let (changed, failed, endpoint_changed) = self.signals.take();
         if (!changed && !failed) || self.controls.is_none() { return; }
+        if failed { log_warn!("AUDIO", "output stream invalidated; recovering on owner thread"); }
         if changed { self.error_recovery_used = false; }
         // A replacement that has rendered at least half a second is healthy.
         // Another later disconnect gets a fresh retry; an immediately failing
@@ -554,7 +624,7 @@ pub fn open_output_stream(
     device: cpal::Device,
     supported: cpal::SupportedStreamConfig,
     chunk_rx: ChunkReceiver,
-    drained_tx: Sender<u64>,
+    drained_tx: DrainSignal,
     shared: Arc<SharedState>,
 ) -> Result<cpal::Stream, String> {
     let signals = OutputSignals::new();
@@ -562,7 +632,7 @@ pub fn open_output_stream(
 }
 
 fn build_output_stream(device: cpal::Device, supported: cpal::SupportedStreamConfig,
-    chunk_rx: ChunkReceiver, drained_tx: Sender<u64>, shared: Arc<SharedState>,
+    chunk_rx: ChunkReceiver, drained_tx: DrainSignal, shared: Arc<SharedState>,
     signals: Arc<OutputSignals>, epoch: u64) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
     let device_channels = supported.channels().max(1);
@@ -625,28 +695,43 @@ struct PcmOutput {
     current: Option<AudioChunk>,
     pos: usize,
     started: u64,
+    notified_eof: u64,
 }
 
 impl PcmOutput {
     fn new(chunks: ChunkReceiver) -> Self {
-        Self { chunks, current: None, pos: 0, started: u64::MAX }
+        assert!(chunks.state.rendering.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok(),
+            "a PCM pool has exactly one rendering/recycling owner");
+        Self { chunks, current: None, pos: 0, started: u64::MAX, notified_eof: u64::MAX }
     }
 
+    #[cfg(test)]
     fn render<T: OutputSample>(&mut self, data: &mut [T], shared: &SharedState, channels: usize) {
+        let events = self.render_inner(data, shared, channels);
+        if let Some(wake) = self.chunks.state.wake.get() { wake.notify(events); }
+    }
+
+    fn render_inner<T: OutputSample>(&mut self, data: &mut [T], shared: &SharedState, channels: usize) -> u32 {
         let generation = shared.generation();
         let mut written = 0;
-        while written < data.len() {
+        let mut events = 0;
+        // At most the output sample count plus the fixed ring depth can make
+        // progress, even if a producer continuously changes generations.
+        let mut claims = 0;
+        let claim_limit = data.len().saturating_add(self.chunks.queue.capacity());
+        while written < data.len() && claims < claim_limit {
             // A load/seek may race this callback. Leave freshly queued audio
             // for the next invocation instead of discarding its new generation
             // using this invocation's older snapshot.
             if shared.generation() != generation { break; }
             if self.current.as_ref().is_some_and(|chunk| chunk.generation != generation || self.pos >= chunk.len) {
                 recycle(&self.chunks.recycle, self.current.take().unwrap());
+                events |= CAPACITY;
                 self.pos = 0;
             }
             if self.current.is_none() {
                 match self.chunks.queue.try_recv() {
-                    Ok(chunk) => { self.current = Some(chunk); continue; }
+                    Ok(chunk) => { self.current = Some(chunk); claims += 1; events |= CAPACITY; continue; }
                     Err(_) => break,
                 }
             }
@@ -663,7 +748,7 @@ impl PcmOutput {
             written += n;
         }
         data[written..].fill(T::from_pcm(0.0));
-        if shared.generation() != generation { return; }
+        if shared.generation() != generation { return events; }
         // Silence while priming or starved must not move the track playhead.
         shared.add_frames_played((written / channels) as u64);
         self.chunks.state.rendered_frames.fetch_add((written / channels) as u64, Ordering::Relaxed);
@@ -671,6 +756,7 @@ impl PcmOutput {
         if written < data.len() && self.started == generation && !eof {
             self.chunks.state.underrun_frames.fetch_add(((data.len() - written) / channels) as u64, Ordering::Relaxed);
         }
+        events
     }
 
     fn drained(&self, generation: u64) -> bool {
@@ -686,19 +772,32 @@ impl PcmOutput {
 impl Drop for PcmOutput {
     fn drop(&mut self) {
         if let Some(chunk) = self.current.take() { recycle(&self.chunks.recycle, chunk); }
+        if let Some(wake) = self.chunks.state.wake.get() { wake.notify(CAPACITY); }
+        self.chunks.state.rendering.store(false, Ordering::Release);
     }
 }
 
 fn popper<T: OutputSample>(
     chunk_rx: ChunkReceiver,
-    drained_tx: Sender<u64>,
+    drained_tx: DrainSignal,
     shared: Arc<SharedState>,
     channels: u16,
 ) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut output = PcmOutput::new(chunk_rx);
     move |data, _info| {
-        output.render(data, &shared, channels as usize);
-        if output.drained(shared.generation()) { let _ = drained_tx.try_send(shared.generation()); }
+        #[cfg(test)]
+        let timing = output.chunks.state.timing.start(_info, data.len() / channels as usize);
+        let mut events = output.render_inner(data, &shared, channels as usize);
+        let generation = shared.generation();
+        if output.notified_eof != generation && output.drained(generation) {
+            drained_tx.generation.store(generation, Ordering::Release);
+            output.notified_eof = generation;
+            events |= DRAIN;
+        }
+        // One notification per callback, and no OS wake while decoder runs.
+        drained_tx.wake.notify(events);
+        #[cfg(test)]
+        output.chunks.state.timing.end(timing);
     }
 }
 
@@ -739,10 +838,10 @@ fn install_output(controls: &AudioControls, chunk_tx: &mut ChunkSender, status_t
 
 fn run_decoder(
     shared: Arc<SharedState>,
-    cmds: Receiver<DecoderCmd>,
+    cmds: CommandReceiver,
     status_tx: Sender<Status>,
     chunk_tx: ChunkSender,
-    drained_rx: Receiver<u64>,
+    drained_rx: DrainSignal,
     controls: AudioControls,
 ) {
     run_decoder_with_output(shared, cmds, status_tx, chunk_tx, drained_rx, (controls, None));
@@ -750,17 +849,20 @@ fn run_decoder(
 
 fn run_decoder_with_output(
     shared: Arc<SharedState>,
-    cmds: Receiver<DecoderCmd>,
+    cmds: CommandReceiver,
     status_tx: Sender<Status>,
     mut chunk_tx: ChunkSender,
-    drained_rx: Receiver<u64>,
+    drained_rx: DrainSignal,
     retained: (AudioControls, Option<SuspendedTrack>),
 ) {
     let (controls, mut suspended) = retained;
     log_info!("DECODER", "online — parked on command channel (zero CPU)");
     let mut cache: Option<StreamCache> = None;
     while let Ok(cmd) = cmds.recv() {
-        if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown) { cache = None; suspended = None; }
+        if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown) {
+            cache = None; suspended = None;
+            chunk_tx.begin(shared.generation());
+        }
         install_output(&controls, &mut chunk_tx, &status_tx);
         log_debug!("DECODER", "recv {cmd:?}");
         let first = match cmd {
@@ -781,6 +883,7 @@ fn run_decoder_with_output(
                 chunk_tx: &chunk_tx, drained_rx: &drained_rx,
                 child_slot: &controls.child_slot, buffer_slot: &controls.buffer_slot,
             }, &mut cache, &mut suspended, source, load_id, recovering);
+            if !matches!(exit, PlayExit::Eof) { chunk_tx.begin(shared.generation()); }
             if matches!(exit, PlayExit::Stopped | PlayExit::Failed) { cache = None; suspended = None; }
             // RefreshOutput can be consumed while parked on the old PCM pool.
             // Acknowledge here too; otherwise the broker would wait forever.
@@ -803,6 +906,7 @@ fn run_decoder_with_output(
             }
         }
     }
+    chunk_tx.begin(shared.generation());
     log_info!("DECODER", "offline");
     drop(status_tx);
     crate::ui::wake_status();
@@ -1194,53 +1298,57 @@ enum SendOutcome {
     SinkGone,
 }
 
-/// Copy into a free block and publish with backpressure. Parks in `select!`
-/// for a free block/ready slot OR a command, so pause never burns idle CPU.
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_INTERRUPT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Copy into a free block and publish with backpressure. Register, recheck
+/// commands/capacity/disconnection, then park on the shared atomic address.
 fn send_chunk(
     chunk_tx: &ChunkSender,
-    cmds: &Receiver<DecoderCmd>,
+    cmds: &CommandReceiver,
     samples: &[f32],
     generation: u64,
 ) -> SendOutcome {
-    if matches!(chunk_tx.sink_gone.try_recv(), Err(TryRecvError::Disconnected)) {
-        return SendOutcome::SinkGone;
-    }
-    // All allocation is done when the pool is created. While every block is
-    // owned by the output, park on free space OR a decoder command.
-    let mut chunk = select! {
-        recv(chunk_tx.free) -> block => match block {
-            Ok(block) => block,
-            Err(_) => return SendOutcome::SinkGone,
-        },
-        recv(chunk_tx.sink_gone) -> _ => return SendOutcome::SinkGone,
-        recv(cmds) -> msg => return send_command(msg),
-    };
-    chunk.data[..samples.len()].copy_from_slice(samples);
-    chunk.len = samples.len();
-    chunk.generation = generation;
-    match chunk_tx.ready.try_send(chunk) {
-        Ok(()) => {
-            chunk_tx.published(generation, samples.len());
-            SendOutcome::Sent
+    chunk_tx.bind(&cmds.wake);
+    let interest = COMMAND | CAPACITY;
+    loop {
+        // Register first, then recheck ALL predicates. Commands have priority
+        // over capacity, even when output is paused or has been disconnected.
+        cmds.wake.register(interest);
+        match cmds.try_recv() {
+            Ok(command) => { cmds.wake.cancel(); return send_command(Ok(command)); }
+            Err(TryRecvError::Disconnected) => { cmds.wake.cancel(); return SendOutcome::Shutdown; }
+            Err(TryRecvError::Empty) => {}
         }
-        Err(TrySendError::Full(c)) => {
-            chunk = c;
-            select! {
-                send(chunk_tx.ready, chunk) -> res => match res {
-                    Ok(()) => {
-                        chunk_tx.published(generation, samples.len());
-                        SendOutcome::Sent
-                    }
-                    Err(_send_err) => SendOutcome::SinkGone,
-                },
-                recv(cmds) -> msg => {
-                    recycle(&chunk_tx.recycle, chunk);
-                    send_command(msg)
-                },
-                recv(chunk_tx.sink_gone) -> _ => SendOutcome::SinkGone,
+        if chunk_tx.sink_gone() { cmds.wake.cancel(); return SendOutcome::SinkGone; }
+        if chunk_tx.ready.has_capacity() && let Some(mut chunk) = chunk_tx.take_free() {
+            cmds.wake.cancel();
+            chunk.data[..samples.len()].copy_from_slice(samples);
+            chunk.len = samples.len();
+            chunk.generation = generation;
+            #[cfg(test)]
+            if let Some(interrupt) = PUBLICATION_INTERRUPT.with(|hook| hook.borrow_mut().take()) { interrupt(); }
+            // An interruption during the copy retains the unpublished block
+            // on the decoder. It must never become a second recycle writer.
+            match cmds.try_recv() {
+                Ok(command) => { chunk_tx.keep(chunk); return send_command(Ok(command)); }
+                Err(TryRecvError::Disconnected) => { chunk_tx.keep(chunk); return SendOutcome::Shutdown; }
+                Err(TryRecvError::Empty) => {}
+            }
+            // The only ready writer owns this free slot. Consumers can only
+            // increase capacity. Stale PCM is fenced by its generation even
+            // when a command races publication after the check above.
+            match chunk_tx.ready.try_send(chunk) {
+                Ok(()) => { chunk_tx.published(generation, samples.len()); return SendOutcome::Sent; }
+                Err(chunk) => {
+                    chunk_tx.keep(chunk);
+                    unreachable!("single PCM writer retains the capacity it observed");
+                }
             }
         }
-        Err(TrySendError::Disconnected(_)) => SendOutcome::SinkGone,
+        cmds.wake.wait(interest);
     }
 }
 
@@ -1414,10 +1522,10 @@ fn seek_relative(
 
 struct PlaybackContext<'a> {
     shared: &'a Arc<SharedState>,
-    cmds: &'a Receiver<DecoderCmd>,
+    cmds: &'a CommandReceiver,
     status_tx: &'a Sender<Status>,
     chunk_tx: &'a ChunkSender,
-    drained_rx: &'a Receiver<u64>,
+    drained_rx: &'a DrainSignal,
     child_slot: &'a Arc<Mutex<Option<Child>>>,
     buffer_slot: &'a BufferSlot,
 }
@@ -1850,9 +1958,14 @@ fn play_source_with_output(
                 while drained_rx.try_recv().is_ok() {}
                 chunk_tx.finish(generation);
                 loop {
-                    select! {
-                        recv(drained_rx) -> g => match g {
+                    let interest = COMMAND | DRAIN;
+                    cmds.wake.register(interest);
+                    let command = cmds.try_recv();
+                    if matches!(command, Err(TryRecvError::Empty)) {
+                        if chunk_tx.sink_gone() { cmds.wake.cancel(); return PlayExit::SinkGone; }
+                        match drained_rx.try_recv() {
                             Ok(g) if g == generation => {
+                                cmds.wake.cancel();
                                 if load_id != shared.load_id() {
                                     return retain_track(suspended, source, track, replay_title, PlayExit::Suspended);
                                 }
@@ -1879,9 +1992,12 @@ fn play_source_with_output(
                                 crate::ui::wake_status();
                                 return PlayExit::Eof;
                             }
-                            _ => continue,
-                        },
-                        recv(cmds) -> msg => match msg {
+                            Ok(_) => { cmds.wake.cancel(); continue; }
+                            Err(_) => { cmds.wake.wait(interest); continue; }
+                        }
+                    }
+                    cmds.wake.cancel();
+                    match command {
                             Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
                             Ok(DecoderCmd::SuspendOutput | DecoderCmd::RefreshOutput) =>
                                 return retain_track(suspended, source, track, replay_title, PlayExit::Suspended),
@@ -1898,7 +2014,6 @@ fn play_source_with_output(
                                 }
                             }
                             Err(_) => return PlayExit::Shutdown,
-                        },
                     }
                 }
             }
@@ -2090,6 +2205,120 @@ impl LinearResampler {
 mod tests {
     use super::*;
 
+    fn callback_info() -> cpal::OutputCallbackInfo {
+        let timestamp = cpal::StreamInstant::new(1, 0);
+        cpal::OutputCallbackInfo::new(cpal::OutputStreamTimestamp { callback: timestamp, playback: timestamp })
+    }
+
+    #[test]
+    fn complete_callback_coalesces_capacity_and_eof_without_allocating_or_freeing() {
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (_tx, commands) = command_channel(2);
+        let (drain, drained) = drain_channel(&commands.wake);
+        let mut callback = popper::<i16>(receiver, drain, shared.clone(), 1);
+        let info = callback_info();
+        let mut data = [1i16; 128];
+        for generation in 0..3 {
+            sender.begin(generation);
+            for _ in 0..2 { push_pcm(&sender, &commands, &[0.5; 16], generation); }
+            sender.finish(generation); // 32-sample short track releases priming
+            commands.wake.register(COMMAND | CAPACITY | DRAIN);
+            let before = commands.wake.wake_count();
+            ALLOC_TRACKING.with(|tracking| tracking.set(true));
+            callback(&mut data, &info);
+            ALLOC_TRACKING.with(|tracking| tracking.set(false));
+            assert_eq!(commands.wake.wake_count() - before, 1);
+            assert_eq!(drained.try_recv(), Ok(generation));
+            assert!(data[..32].iter().all(|&sample| sample == 16383));
+            assert!(data[32..].iter().all(|&sample| sample == 0));
+            commands.wake.register(COMMAND | DRAIN);
+            ALLOC_TRACKING.with(|tracking| tracking.set(true));
+            callback(&mut data, &info); // empty silence cannot repeat EOF wake
+            ALLOC_TRACKING.with(|tracking| tracking.set(false));
+            assert!(data.iter().all(|&sample| sample == 0));
+            assert!(drained.try_recv().is_err());
+            assert_eq!(commands.wake.wake_count() - before, 1);
+            commands.wake.cancel();
+            shared.bump_generation();
+        }
+        assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+        assert_eq!(DEALLOCATIONS.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn callback_survives_decoder_disconnection_and_error_callbacks_do_not_allocate() {
+        let shared = SharedState::new();
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (_tx, commands) = command_channel(2);
+        push_pcm(&sender, &commands, &[0.5; 32], 0);
+        sender.finish(0);
+        let (drain, _) = drain_channel(&commands.wake);
+        let mut callback = popper::<u16>(receiver, drain, shared.clone(), 1);
+        let info = callback_info();
+        let signals = OutputSignals::new();
+        let error = cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable);
+        drop(sender);
+        let mut data = [0u16; 128];
+        ALLOC_TRACKING.with(|tracking| tracking.set(true));
+        callback(&mut data, &info);
+        callback(&mut data, &info);
+        signals.stream_error(2, &error);
+        signals.endpoint_changed();
+        ALLOC_TRACKING.with(|tracking| tracking.set(false));
+        assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+        assert_eq!(DEALLOCATIONS.with(Cell::get), 0);
+        assert!(data.iter().all(|&sample| sample == 32768));
+        assert_eq!(signals.take(), (true, true, true));
+    }
+
+    #[test]
+    fn full_buffer_wait_is_interrupted_by_commands_disconnection_and_output_loss() {
+        for case in 0..6 {
+            let (sender, receiver) = chunk_channel(48_000, 1, 2);
+            let (tx, commands) = command_channel(2);
+            for _ in 0..2 { push_pcm(&sender, &commands, &[0.5; CHUNK_FRAMES], 0); }
+            let waiting = commands.wake.watch_wait();
+            let (done, completed) = bounded(1);
+            let worker = thread::spawn(move || {
+                let outcome = send_chunk(&sender, &commands, &[0.25; CHUNK_FRAMES], 0);
+                done.send(()).unwrap();
+                (sender, outcome)
+            });
+            assert_eq!(waiting.recv_timeout(Duration::from_secs(2)).unwrap(), COMMAND | CAPACITY);
+            let mut sink = Some(receiver);
+            match case {
+                0 => tx.send(DecoderCmd::SeekRelative(5.0)).unwrap(),
+                1 => tx.send(DecoderCmd::Load(Source::File("new.wav".into()), 1)).unwrap(),
+                2 => tx.send(DecoderCmd::Stop).unwrap(),
+                3 => tx.send(DecoderCmd::Shutdown).unwrap(),
+                4 => drop(tx),
+                _ => drop(sink.take()),
+            }
+            completed.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (sender, outcome) = worker.join().unwrap();
+            assert!(matches!((case, outcome),
+                (0, SendOutcome::Seek(_)) | (1, SendOutcome::NewSource(_, 1)) |
+                (2, SendOutcome::Stopped) | (3 | 4, SendOutcome::Shutdown) | (5, SendOutcome::SinkGone)));
+            assert_eq!(sender.free_count(), 1);
+            sender.begin(1); // no callback ran; paused stale audio is reclaimed
+            assert_eq!(sender.free_count(), 3);
+            assert!(sender.ready.is_empty());
+        }
+    }
+
+    #[test]
+    fn interrupted_publication_keeps_the_block_on_the_decoder() {
+        let (sender, receiver) = chunk_channel(48_000, 1, 2);
+        let (tx, commands) = command_channel(2);
+        PUBLICATION_INTERRUPT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || { tx.send(DecoderCmd::Stop).unwrap(); })));
+        assert!(matches!(send_chunk(&sender, &commands, &[0.5; 32], 0), SendOutcome::Stopped));
+        assert_eq!(sender.reserve.borrow().len(), 1);
+        assert_eq!(sender.free_count(), 3);
+        assert!(receiver.queue.is_empty());
+    }
+
     #[test]
     fn output_errors_are_coalesced_and_retired_stream_callbacks_are_ignored() {
         let signals = OutputSignals::new();
@@ -2098,7 +2327,7 @@ mod tests {
             signals.stream_error(2, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
             signals.device_changed();
         }
-        assert_eq!(signals.events.len(), 1);
+        assert!(signals.pending.load(Ordering::Acquire));
         assert_eq!(signals.take(), (true, true, false));
         assert_eq!(signals.take(), (false, false, false));
         let epoch = signals.next_epoch();
@@ -2121,16 +2350,16 @@ mod tests {
     fn pcm_output_drop_recycles_its_partial_block_for_device_rebuild() {
         let shared = SharedState::new();
         let (sender, receiver) = chunk_channel(48_000, 1, 2);
-        let (_command_tx, commands) = bounded(1);
+        let (_command_tx, commands) = command_channel(1);
         sender.begin(shared.generation());
         push_pcm(&sender, &commands, &[0.5; 64], shared.generation());
         sender.finish(shared.generation());
         let mut output = PcmOutput::new(receiver);
         output.render(&mut [0.0f32; 1], &shared, 1);
         assert!(output.current.is_some());
-        assert_eq!(sender.free.len(), 2);
+        assert_eq!(sender.free_count(), 2);
         drop(output);
-        assert_eq!(sender.free.len(), 3, "retirement must not gradually exhaust the fixed pool");
+        assert_eq!(sender.free_count(), 3, "retirement must not gradually exhaust the fixed pool");
     }
 
     #[test]
@@ -2146,7 +2375,7 @@ mod tests {
         controls.replace_output(OutputReplacement { sender: latest, retired: first_receiver, epoch: 6 });
         assert!(intermediate.upgrade().is_none(), "superseded pending pool must be freed");
         assert!(oldest.upgrade().is_some());
-        assert!(!matches!(original.sink_gone.try_recv(), Err(TryRecvError::Disconnected)));
+        assert!(!original.sink_gone());
         let replacement = controls.output_slot.lock().unwrap().take().unwrap();
         assert_eq!(replacement.epoch, 6);
         assert!(Arc::ptr_eq(&replacement.retired.state, &original.state));
@@ -2163,7 +2392,7 @@ mod tests {
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
         shared.set_device_channels(2);
-        let (command_tx, command_rx) = bounded(8);
+        let (command_tx, command_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
         let mut receiver = audio.chunk_rx;
@@ -2193,6 +2422,7 @@ mod tests {
                         assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                         frames += chunk.len / channels;
                         recycle(&receiver.recycle, chunk);
+                        if let Some(wake) = receiver.state.wake.get() { wake.notify(CAPACITY); }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         if receiver.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
@@ -2239,10 +2469,10 @@ mod tests {
             shared.set_device_channels(2);
             shared.set_loop_enabled(looping);
             let source = Source::Youtube { url: "ram-test://device-recovery".into(), format: "140".into(), playlist_index: None };
-            let (command_tx, command_rx) = bounded(8);
+            let (command_tx, command_rx) = command_channel(8);
             let (status_tx, status_rx) = bounded(16);
             let (sender, mut receiver) = chunk_channel(48_000, 2, buffer_depth(48_000));
-            let (_drained_tx, drained_rx) = bounded(4);
+            let (_drained_tx, drained_rx) = drain_channel(&command_rx.wake);
             let controls = AudioControls { child_slot: Arc::new(Mutex::new(None)),
                 buffer_slot: Arc::new(Mutex::new(None)), output_slot: Arc::new(Mutex::new(None)) };
             let kills = Arc::new(AtomicU64::new(0));
@@ -2328,9 +2558,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     #[ignore = "requires a saved track or diagnostic URL and an actual output device"]
     fn saved_track_device_hotswap_cycles_recover_on_wasapi() {
         use crate::broker::{Command as PlayerCommand, DecoderLink, Flow, Phase};
+        fn pump(output: &mut AudioOut, broker: &mut Broker, statuses: &Receiver<Status>, remaining: Duration) {
+            crate::ui::wait_headless_timeout(remaining);
+            for status in statuses.try_iter() { broker.handle_status(status); }
+            broker.poll_background();
+            output.handle_device_events(broker);
+            output.set_playing(broker.shared().phase() == Phase::Playing);
+        }
+        let _wake = crate::ui::HeadlessWakeGuard::new();
         let mut saved = crate::config::load();
         if let Ok(file) = std::env::var("KYOUKO_HOTSWAP_TEST_FILE") {
             assert!(std::path::Path::new(&file).is_file(), "diagnostic override must be an existing local file");
@@ -2351,7 +2590,7 @@ mod tests {
         restore_test_controls(&shared, &saved);
         shared.set_loop_enabled(saved.loop_enabled);
         let device = output_device(&shared).unwrap();
-        let (command_tx, command_rx) = bounded(8);
+        let (command_tx, command_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
         let thread_id = audio.decoder.thread().id();
@@ -2361,7 +2600,6 @@ mod tests {
         // writing state.cfg or injecting any window/keyboard/mouse input.
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(command_tx, command_rx.clone(), audio.controls.clone().hook())
             .with_suspend(audio.controls.clone().suspend_hook())).with_playlist_fetching();
-        let background_events = broker.background_events();
         // Always shut down and join the decoder, even when a live assertion or
         // deadline fails. Otherwise a diagnostic could retain its child process.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2372,17 +2610,11 @@ mod tests {
         while shared.phase() != Phase::Paused {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!remaining.is_zero(), "initial load stalled");
-            select! {
-                recv(status_rx) -> status => broker.handle_status(status.unwrap()),
-                recv(background_events) -> _ => broker.poll_background(),
-                default(remaining) => panic!("initial load timed out"),
-            }
-            output.handle_device_events(&mut broker);
+            pump(&mut output, &mut broker, &status_rx, remaining);
         }
         println!("initial stream loaded in {:.2}s", started.elapsed().as_secs_f64());
         broker.handle_command(PlayerCommand::TogglePause);
         output.set_playing(true);
-        let output_events = output.signals.events.clone();
         for cycle in 0..4 {
             // Playing is announced before the producer's 500 ms PCM watermark
             // fills. Give startup priming its own interval rather than counting
@@ -2391,14 +2623,7 @@ mod tests {
             loop {
                 let remaining = prime_until.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() { break; }
-                select! {
-                    recv(status_rx) -> status => broker.handle_status(status.unwrap()),
-                    recv(output_events) -> _ => output.handle_device_events(&mut broker),
-                    recv(background_events) -> _ => broker.poll_background(),
-                    default(remaining) => break,
-                }
-                output.handle_device_events(&mut broker);
-                output.set_playing(shared.phase() == Phase::Playing);
+                pump(&mut output, &mut broker, &status_rx, remaining);
             }
             let counters = output.receiver.as_ref().unwrap().state.clone();
             assert_eq!(counters.ready_generation.load(Ordering::Acquire), shared.generation(), "PCM must be primed before measuring steady playback");
@@ -2410,14 +2635,7 @@ mod tests {
             loop {
                 let remaining = observe_until.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() { break; }
-                select! {
-                    recv(status_rx) -> status => broker.handle_status(status.unwrap()),
-                    recv(output_events) -> _ => output.handle_device_events(&mut broker),
-                    recv(background_events) -> _ => broker.poll_background(),
-                    default(remaining) => break,
-                }
-                output.handle_device_events(&mut broker);
-                output.set_playing(shared.phase() == Phase::Playing);
+                pump(&mut output, &mut broker, &status_rx, remaining);
             }
             let position = shared.position().as_secs_f64();
             assert!(position - start_position > 1.7, "healthy playback must continue between device cycles: {}s advanced", position - start_position);
@@ -2440,14 +2658,7 @@ mod tests {
             while shared.phase() != Phase::Playing {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 assert!(!remaining.is_zero(), "device recovery stalled");
-                select! {
-                    recv(status_rx) -> status => broker.handle_status(status.unwrap()),
-                    recv(output_events) -> _ => output.handle_device_events(&mut broker),
-                    recv(background_events) -> _ => broker.poll_background(),
-                    default(remaining) => panic!("device recovery timed out"),
-                }
-                output.handle_device_events(&mut broker);
-                output.set_playing(shared.phase() == Phase::Playing);
+                pump(&mut output, &mut broker, &status_rx, remaining);
             }
             assert!((shared.position().as_secs_f64() - position).abs() < 0.15, "recovery retains playhead");
             assert!(old_pool.upgrade().is_none(), "retired PCM allocation must be freed");
@@ -2473,7 +2684,7 @@ mod tests {
         if let Err(error) = result { std::panic::resume_unwind(error); }
     }
 
-    fn push_pcm(sender: &ChunkSender, cmds: &Receiver<DecoderCmd>, samples: &[f32], generation: u64) {
+    fn push_pcm(sender: &ChunkSender, cmds: &CommandReceiver, samples: &[f32], generation: u64) {
         assert!(matches!(send_chunk(sender, cmds, samples, generation), SendOutcome::Sent));
     }
 
@@ -2486,7 +2697,7 @@ mod tests {
             assert!(depth * CHUNK_FRAMES >= rate as usize * BUFFER_MILLIS / 1000);
             let (sender, receiver) = chunk_channel(rate, 2, depth);
             sender.begin(shared.generation());
-            let (_cmd_tx, cmd_rx) = bounded(1);
+            let (_cmd_tx, cmd_rx) = command_channel(1);
             let mut output = PcmOutput::new(receiver);
             let samples = vec![0.25; CHUNK_FRAMES * 2];
             let mut device = vec![1.0; rate as usize / 100 * 2]; // 10 ms
@@ -2512,8 +2723,8 @@ mod tests {
         let (sender, receiver) = chunk_channel(48_000, 2, 2);
         let pointers: Vec<_> = sender.free.try_iter().collect();
         let addresses: Vec<_> = pointers.iter().map(|chunk| chunk.data.as_ptr() as usize).collect();
-        for chunk in pointers { recycle(&sender.recycle, chunk); }
-        let (_cmd_tx, cmd_rx) = bounded(1);
+        for chunk in pointers { sender.keep(chunk); }
+        let (_cmd_tx, cmd_rx) = command_channel(1);
         let mut output = PcmOutput::new(receiver);
         let samples = vec![0.5; CHUNK_FRAMES * 2];
         for _ in 0..20 {
@@ -2541,8 +2752,8 @@ mod tests {
             output.render(&mut large, &shared, 2); // return the consumed tail
             shared.bump_generation();
         }
-        assert_eq!(sender.free.len(), 3);
-        for chunk in sender.free.try_iter() {
+        assert_eq!(sender.free_count(), 3);
+        for chunk in sender.reserve.borrow().iter().chain(sender.free.try_iter().collect::<Vec<_>>().iter()) {
             assert!(addresses.contains(&(chunk.data.as_ptr() as usize)), "all allocations are reused");
         }
     }
@@ -2552,7 +2763,7 @@ mod tests {
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
         let (sender, receiver) = chunk_channel(48_000, 1, 2);
-        let (_cmd_tx, cmd_rx) = bounded(1);
+        let (_cmd_tx, cmd_rx) = command_channel(1);
         let mut output = PcmOutput::new(receiver);
         // Fill the watermark and consume everything while producer is held.
         for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0); }
@@ -2588,7 +2799,7 @@ mod tests {
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
         let (sender, receiver) = chunk_channel(48_000, 1, 2);
-        let (_cmd_tx, cmd_rx) = bounded(1);
+        let (_cmd_tx, cmd_rx) = command_channel(1);
         push_pcm(&sender, &cmd_rx, &[0.5; 16], 0);
         sender.finish(0);
         let mut output = PcmOutput::new(receiver);
@@ -2613,14 +2824,14 @@ mod tests {
     #[test]
     fn full_pcm_ring_remains_interruptible_and_reclaims_stale_paused_audio() {
         let (sender, receiver) = chunk_channel(48_000, 1, 2);
-        let (cmd_tx, cmd_rx) = bounded(1);
+        let (cmd_tx, cmd_rx) = command_channel(1);
         for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0); }
         cmd_tx.send(DecoderCmd::SeekRelative(5.0)).unwrap();
         assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0), SendOutcome::Seek(DecoderSeek::Relative(5.0))));
-        assert_eq!(sender.free.len(), 1, "the unsent block must return to its pool");
+        assert_eq!(sender.free_count(), 1, "the unsent block must return to its pool");
         sender.begin(1); // paused output never needs to run to free stale blocks
         assert!(receiver.queue.is_empty());
-        assert_eq!(sender.free.len(), 3);
+        assert_eq!(sender.free_count(), 3);
         drop(receiver);
         assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.0; 100], 1), SendOutcome::SinkGone));
     }
@@ -2654,7 +2865,7 @@ mod tests {
     fn pcm_callback_does_not_allocate_or_free_on_first_call_seek_or_integer_output() {
         let shared = SharedState::new();
         let (sender, receiver) = chunk_channel(48_000, 1, 2);
-        let (_cmd_tx, cmd_rx) = bounded(1);
+        let (_cmd_tx, cmd_rx) = command_channel(1);
         let mut output = PcmOutput::new(receiver);
         let mut data = [0i16; CHUNK_FRAMES * 2];
         for _ in 0..3 {
@@ -2703,7 +2914,7 @@ mod tests {
         shared.set_sample_rate(48_000);
         shared.set_device_channels(2);
         restore_test_controls(&shared, &saved);
-        let (cmd_tx, cmd_rx) = bounded(8);
+        let (cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         for file in files {
@@ -2757,6 +2968,7 @@ mod tests {
                         assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                         frames += chunk.len / 2;
                         recycle(&audio.chunk_rx.recycle, chunk);
+                        if let Some(wake) = audio.chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
@@ -2789,7 +3001,7 @@ mod tests {
         let shared = SharedState::new();
         restore_test_controls(&shared, &saved);
         let (device, config) = output_device(&shared).unwrap();
-        let (cmd_tx, cmd_rx) = bounded(8);
+        let (cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         let counters = audio.chunk_rx.state.clone();
@@ -2983,10 +3195,10 @@ mod tests {
         buffer.append(&pcm_wav(&vec![8192; 4096], 48_000)).unwrap();
         buffer.finish(Ok(()));
         let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
-        let (cmd_tx, cmd_rx) = bounded(8);
+        let (cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
-        let (_drained_tx, drained_rx) = bounded(4);
+        let (_drained_tx, drained_rx) = drain_channel(&cmd_rx.wake);
         let decoder_shared = shared.clone();
         let decoder = thread::spawn(move || play_source(&PlaybackContext {
             shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
@@ -3022,10 +3234,10 @@ mod tests {
         buffer.finish(Ok(()));
         let weak = Arc::downgrade(&buffer);
         let mut cache = Some(StreamCache { source: source.clone(), buffer, title: Some("RAM title".into()) });
-        let (_cmd_tx, cmd_rx) = bounded(8);
+        let (_cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
-        let (drained_tx, drained_rx) = bounded(4);
+        let (drained_tx, drained_rx) = drain_channel(&cmd_rx.wake);
         let child_slot = Arc::new(Mutex::new(None));
         let buffer_slot: BufferSlot = Arc::new(Mutex::new(None));
         let done = Arc::new(AtomicBool::new(false));
@@ -3040,6 +3252,7 @@ mod tests {
                     Ok(chunk) => {
                         rounds.push(chunk.samples().to_vec());
                         recycle(&chunk_rx.recycle, chunk);
+                        if let Some(wake) = chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         let _ = drained_tx.try_send(consumer_shared.generation());
@@ -3240,10 +3453,10 @@ mod tests {
             let packet = probe.format.next_packet().unwrap();
             assert_eq!(probe.decoder.decode(&packet).unwrap().spec().rate, 48_000);
             drop(probe);
-            let (_cmd_tx, cmd_rx) = bounded(8);
+            let (_cmd_tx, cmd_rx) = command_channel(8);
             let (status_tx, status_rx) = bounded(16);
             let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
-            let (drained_tx, drained_rx) = bounded(4);
+            let (drained_tx, drained_rx) = drain_channel(&cmd_rx.wake);
             let decoder_shared = shared.clone();
             let decoder = thread::spawn(move || play_source(&PlaybackContext {
                 shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
@@ -3259,7 +3472,8 @@ mod tests {
             loop {
                 assert!(std::time::Instant::now() < deadline, "AAC regression decoder stalled");
                 match chunk_rx.queue.recv_timeout(Duration::from_millis(5)) {
-                    Ok(chunk) => { pcm.extend_from_slice(chunk.samples()); recycle(&chunk_rx.recycle, chunk); }
+                    Ok(chunk) => { pcm.extend_from_slice(chunk.samples()); recycle(&chunk_rx.recycle, chunk);
+                        if let Some(wake) = chunk_rx.state.wake.get() { wake.notify(CAPACITY); } }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         if chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
                             drained_tx.send(shared.generation()).unwrap();
@@ -3374,7 +3588,7 @@ mod tests {
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
         shared.set_device_channels(2);
-        let (cmd_tx, cmd_rx) = bounded(8);
+        let (cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
@@ -3417,6 +3631,7 @@ mod tests {
                         assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                     }
                     recycle(&audio.chunk_rx.recycle, chunk);
+                        if let Some(wake) = audio.chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
                     if !current { continue; }
                     break;
                 }
@@ -3457,7 +3672,7 @@ mod tests {
         shared.set_sample_rate(48_000);
         shared.set_device_channels(2);
         shared.set_loop_enabled(true);
-        let (command_tx, command_rx) = bounded(8);
+        let (command_tx, command_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
@@ -3501,9 +3716,7 @@ mod tests {
                 loop {
                     let remaining = until.saturating_duration_since(std::time::Instant::now());
                     assert!(!remaining.is_zero(), "stream decode/repeat timed out");
-                    select! {
-                        recv(audio.chunk_rx.queue) -> chunk => {
-                            let chunk = chunk.unwrap();
+                    if let Ok(chunk) = audio.chunk_rx.queue.recv_timeout(remaining.min(Duration::from_millis(10))) {
                             if chunk.generation == shared.generation() {
                                 assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                                 if first_samples.is_empty() { first_samples.extend_from_slice(&chunk.samples()[..chunk.samples().len().min(256)]); }
@@ -3511,9 +3724,9 @@ mod tests {
                                 shared.add_frames_played((chunk.samples().len() / 2) as u64);
                             }
                             recycle(&audio.chunk_rx.recycle, chunk);
-                        },
-                        recv(status_rx) -> status => {
-                            let status = status.unwrap();
+                        if let Some(wake) = audio.chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
+                    }
+                    if let Ok(status) = status_rx.try_recv() {
                             match status {
                                 Status::Finished { .. } => {
                                     println!("round {}: decoded {frames} frames ({:.2}s)", round + 1, frames as f64 / 48_000.0);
@@ -3523,8 +3736,6 @@ mod tests {
                                 Status::Failed { .. } => panic!("stream decode failed: {status:?}"),
                                 status => broker.handle_status(status),
                             }
-                        },
-                        default(remaining.min(Duration::from_millis(10))) => {},
                     }
                     if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation()
                         && audio.chunk_rx.queue.is_empty() {
@@ -3575,10 +3786,10 @@ mod tests {
         std::fs::write(dir.join("empty.wav"), wav).unwrap();
 
         let shared = SharedState::new();
-        let (cmd_tx, cmd_rx) = bounded(8);
+        let (cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let (chunk_tx, _chunk_rx) = chunk_channel(48_000, 2, 16);
-        let (_drained_tx, drained_rx) = bounded(2);
+        let (_drained_tx, drained_rx) = drain_channel(&cmd_rx.wake);
         let child_slot = Arc::new(Mutex::new(None));
         let decoder_shared = shared.clone();
         let broker_cmd_rx = cmd_rx.clone();

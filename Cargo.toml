@@ -59,10 +59,10 @@ symphonia = { version = "0.5", default-features = false, features = [
     "opt-simd",
 ] }
 
-# Channels. Chosen over std::sync::mpsc for exactly two capabilities the whole
-# architecture rests on: `select!` over multiple blocking receives (no polling)
-# and bounded queues (backpressure is our only scheduling mechanism).
+# Bounded control/status/metadata channels, outside the sample and error
+# callbacks. PCM and EOF use atomic queues/mailboxes, with address-based wakes.
 crossbeam-channel = "0.5"
+atomic-wait = "1.1" # WaitOnAddress/WakeByAddressSingle; no spinning or callback waiter mutex
 serde_json = "1" # decode escaped playlist titles without splitting songs at newlines
 windows-core = "0.62"
 

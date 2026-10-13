@@ -309,7 +309,7 @@ mod tests {
             if snapshot.volume == 0.0 { started_tx.send(()).unwrap(); release_rx.recv().unwrap(); }
             save_atomic(&target, &snapshot).unwrap();
         }).unwrap();
-        let (tx, rx) = bounded(8);
+        let (tx, rx) = crate::decoder_wake::command_channel(8);
         let mut broker = Broker::new(SharedState::new(), DecoderLink::with_interrupt(tx, rx, Arc::new(|| {})))
             .with_saver(writer.saver()).with_flush(writer.flusher());
         broker.handle_command(Command::SetVolume(0.0));

@@ -17,11 +17,27 @@ native messages and dispatches commands. A dedicated decoder thread performs
 file and stream reads, Symphonia decoding, equalization, resampling, and volume
 processing before handing prepared samples to CPAL/WASAPI.
 
-The real-time sample callback uses preallocated PCM blocks and nonblocking
-operations on bounded rings. It performs no heap allocation or deallocation,
-file I/O, logging, or application mutex acquisition. Playback controls and
-counters use lock-free atomics. The PCM pool holds at least 1.5 seconds of audio
-and primes 500 ms before playback; the device uses its native rate and layout.
+The sample callback uses preallocated PCM blocks and bounded atomic rings.
+Each queue claim makes one attempt and returns on contention. It performs no
+heap allocation/deallocation, file I/O, decoding, logging, mutex acquisition,
+blocking channel operation or contention retry. The decoder alone publishes
+PCM; the callback alone recycles it. The decoder retains reclaimed stale and
+interrupted blocks in a preallocated spare list, including during paused seeks.
+EOF/drain and output-error notifications use atomic mailboxes, with no Crossbeam
+operations in the sample or output notification paths.
+
+The decoder registers its wait interests, rechecks commands, capacity and drain,
+then parks using `atomic-wait` (`WaitOnAddress` on Windows). Notifications change
+the compared atomic before waking it, preventing lost wake-ups. A callback
+coalesces released capacity and EOF into one notification; it issues at most one
+OS wake, only for an interested decoder. Commands also interrupt paused/full
+capacity waits and output loss. No polling, spin loop or additional worker exists.
+
+The ready queue still holds at least 1.5 seconds of audio, plus the existing
+extra block for rendering/production, and primes 500 ms. Short tracks start at
+EOF. Device buffers remain native/default. Windows scheduling and address wakes
+provide no hard real-time guarantee; callback delays can occur without decoder
+starvation. See [PCM performance measurements](PCM_PERFORMANCE.md).
 
 Each load carries an identity separate from PCM seek generations. Late decoder
 events cannot resume a stopped track or alter a newer selection. Native input
@@ -166,10 +182,10 @@ two-attempt recovery policy. Completed RAM playback has no deadline worker.
 ## Verification
 
 ```text
-cargo check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release
+cargo check --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked --release
 ```
 
 `.github/workflows/windows.yml` runs these checks on a fresh Windows 2025
@@ -213,6 +229,9 @@ seek/repeat diagnostic; it does not change application settings.
 | `src/main.rs` | Startup and lifecycle orchestration |
 | `src/broker.rs` | Commands, queues, playback state, and persistence policy |
 | `src/audio.rs` | Decoding, DSP, PCM pool, and output stream ownership |
+| `src/pcm_queue.rs` | Preallocated atomic PCM queues with bounded claim attempts |
+| `src/decoder_wake.rs` | Decoder command delivery and race-safe address wait/wake |
+| `src/audio_performance.rs` | Opt-in release CPU and callback timing diagnostics |
 | `src/audio_device.rs` | Windows audio endpoint notifications |
 | `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |
 | `src/config.rs` | State configuration and atomic saves |

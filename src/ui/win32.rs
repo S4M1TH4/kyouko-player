@@ -1295,7 +1295,7 @@ mod tests {
             unsafe { wndproc(hwnd, msg, wp, lp) }
         }
         let shared = SharedState::new();
-        let (decoder_tx, decoder_rx) = crossbeam_channel::bounded(8);
+        let (decoder_tx, decoder_rx) = crate::decoder_wake::command_channel(8);
         let (_command_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
         let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})));
@@ -1431,7 +1431,7 @@ mod tests {
     fn hidden_window_keeps_hotkeys_through_visibility_toggles_and_quit() {
         use crate::broker::DecoderLink;
         let shared = SharedState::new();
-        let (decoder_tx, decoder_rx) = crossbeam_channel::bounded(8);
+        let (decoder_tx, decoder_rx) = crate::decoder_wake::command_channel(8);
         let (command_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
         let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})));

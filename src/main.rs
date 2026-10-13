@@ -7,26 +7,27 @@
 //! ```text
 //!                    Command (bounded 32)              DecoderCmd (bounded 8)
 //!   [window / hotkeys] ────────────────────▶ [MAIN / broker] ───────────────▶ [decoder thread]
-//!    native Win32 messages                   blocked in GetMessageW*          parked in recv()/select!
+//!    native Win32 messages                   blocked in GetMessageW*          parked in address wait
 //!                                             owns: window, Stream
 //!                                                    ▲                              │ pooled AudioChunk (bounded)
 //!                                                    │ Status (bounded 16)          ▼
-//!                                                    └──────────────────── [WASAPI callback thread]
-//!                                                step 2: PostMessageW wake     try_recv pop → memcpy out
+//!                                                    └──────────────────── [decoder sends status]
+//!                                                                         [WASAPI callback thread]
+//!                                                                            PCM claim → copy/convert
 //! ```
 //!
-//! (*step 1 runs the same broker on a blocking `select!` loop so the message
+//! (*headless diagnostics run the same broker on an atomic wake mailbox so the
 //! broker is testable headlessly before any Win32 exists.)
 //!
 //! # Sleep semantics — there is no polling anywhere
 //!
 //! | state   | main/broker            | decoder thread                  | WASAPI callback      |
 //! |---------|------------------------|---------------------------------|----------------------|
-//! | stopped | parked in msg loop     | parked in `recv()`              | not running          |
+//! | stopped | parked in msg loop     | parked in address wait          | not running          |
 //! | playing | parked + 1 Hz WM_TIMER | awake: decode → EQ → push       | ~10 ms event-driven  |
-//! | paused  | parked, NO timer       | parked (chunk channel is full)  | stopped via pause()  |
+//! | paused  | parked, NO timer       | parked (PCM capacity is full)   | stopped via pause()  |
 //!
-//! Every arrow above is a channel send or a Windows message. Zero spinning.
+//! PCM uses bounded atomic rings; commands publish before an address wake.
 //!
 //! # Ownership
 //!
@@ -42,6 +43,8 @@
 //! Release builds are GUI overlay processes with no console or stdin reader.
 
 mod audio;
+mod decoder_wake;
+mod pcm_queue;
 #[cfg(windows)]
 mod audio_device;
 mod broker;
@@ -133,7 +136,7 @@ fn main() {
     // Core cross-thread arteries are bounded. UI-native input is staged on
     // its owner thread; decoder dispatch coalesces under saturation.
     let (cmd_tx, cmd_rx) = bounded::<Command>(32); // window, hotkeys, and startup
-    let (decoder_tx, decoder_rx) = bounded::<DecoderCmd>(8); // broker → decoder
+    let (decoder_tx, decoder_rx) = decoder_wake::command_channel(8); // broker → decoder
     let (status_tx, status_rx) = bounded::<Status>(16); // decoder → broker
     CMD_TX.set(cmd_tx.clone()).ok();
 

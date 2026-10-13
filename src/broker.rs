@@ -398,7 +398,7 @@ pub enum DecoderCmd {
     /// interactive seek, this may wait for the new stream download on the decoder.
     RestorePosition(f64),
     /// Drop the current source and go back to park. Wakes the decoder even
-    /// when it is parked waiting for chunk-channel space (select! on both).
+    /// when it is parked waiting for PCM capacity (atomic address wake).
     Stop,
     /// Same as Stop, then exit the thread. Kills any yt-dlp child first.
     Shutdown,
@@ -636,15 +636,15 @@ pub enum Flow {
 /// module installs the closure, the broker just calls it.
 #[derive(Clone)]
 pub struct DecoderLink {
-    tx: Sender<DecoderCmd>,
-    queued: Receiver<DecoderCmd>,
+    tx: crate::decoder_wake::CommandSender,
+    queued: crate::decoder_wake::CommandReceiver,
     shutdown: Arc<Mutex<bool>>,
     interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
     suspend: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DecoderLink {
-    pub fn with_interrupt(tx: Sender<DecoderCmd>, queued: Receiver<DecoderCmd>, interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
+    pub fn with_interrupt(tx: crate::decoder_wake::CommandSender, queued: crate::decoder_wake::CommandReceiver, interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
         assert!(tx.capacity().is_some_and(|capacity| capacity >= 2));
         Self { tx, queued, shutdown: Arc::new(Mutex::new(false)), interrupt: Some(interrupt), suspend: None }
     }
@@ -811,7 +811,7 @@ impl Broker {
 
     pub fn with_playlist_fetching(mut self) -> Self { self.metadata_enabled = cfg!(windows); self }
 
-    #[cfg(any(not(windows), debug_assertions, test))]
+    #[cfg(test)]
     pub fn background_events(&self) -> Receiver<()> { self.background_rx.clone() }
 
     pub fn poll_background(&mut self) {
@@ -1831,10 +1831,10 @@ mod tests {
     fn broker_with_sink() -> (
         Broker,
         Arc<Mutex<Vec<PersistedState>>>,
-        crossbeam_channel::Receiver<DecoderCmd>,
+        crate::decoder_wake::CommandReceiver,
     ) {
         let shared = SharedState::new();
-        let (tx, rx) = crossbeam_channel::bounded::<DecoderCmd>(8);
+        let (tx, rx) = crate::decoder_wake::command_channel(8);
         let sink: Arc<Mutex<Vec<PersistedState>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_for_saver = Arc::clone(&sink);
         let broker = Broker::new(shared, DecoderLink::with_interrupt(
@@ -1918,7 +1918,7 @@ mod tests {
 
     #[test]
     fn output_commands_do_not_kill_sources_and_refresh_cannot_replace_a_stop() {
-        let (tx, rx) = crossbeam_channel::bounded(2);
+        let (tx, rx) = crate::decoder_wake::command_channel(2);
         let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = kills.clone();
         let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(move || { counter.fetch_add(1, Ordering::Relaxed); }));
@@ -1941,7 +1941,7 @@ mod tests {
 
     #[test]
     fn full_decoder_pipe_coalesces_latest_load_and_seeks_and_keeps_shutdown_final() {
-        let (tx, rx) = crossbeam_channel::bounded(2);
+        let (tx, rx) = crate::decoder_wake::command_channel(2);
         let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
         link.send(DecoderCmd::Load(Source::File("a.wav".into()), 1));
         link.send(DecoderCmd::SeekRelative(10.0));
@@ -1960,7 +1960,7 @@ mod tests {
 
     #[test]
     fn full_decoder_pipe_preserves_absolute_recovery_seek_and_later_adjustments() {
-        let (tx, rx) = crossbeam_channel::bounded(2);
+        let (tx, rx) = crate::decoder_wake::command_channel(2);
         let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
         link.send(DecoderCmd::Load(Source::File("recovery.wav".into()), 1));
         link.send(DecoderCmd::SeekRelative(9.0));
@@ -1981,7 +1981,7 @@ mod tests {
 
     #[test]
     fn saturated_status_and_command_channels_do_not_block_ui_shutdown() {
-        let (tx, rx) = crossbeam_channel::bounded(2);
+        let (tx, rx) = crate::decoder_wake::command_channel(2);
         let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
         let (status_tx, status_rx) = crossbeam_channel::bounded(1);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
@@ -2041,7 +2041,7 @@ mod tests {
         assert!(saves.lock().unwrap().is_empty());
     }
 
-    fn device_test_broker(playing: bool) -> (Broker, crossbeam_channel::Receiver<DecoderCmd>, Source) {
+    fn device_test_broker(playing: bool) -> (Broker, crate::decoder_wake::CommandReceiver, Source) {
         let (mut broker, _, receiver) = broker_with_sink();
         let source = Source::File("C:\\media\\second.mp4".into());
         broker.shared.set_sample_rate(48_000);
@@ -2252,7 +2252,7 @@ mod tests {
         });
     }
 
-    fn assert_load(rx: &crossbeam_channel::Receiver<DecoderCmd>, expected: &Source) {
+    fn assert_load(rx: &crate::decoder_wake::CommandReceiver, expected: &Source) {
         assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(source, _)) if source == *expected));
     }
 

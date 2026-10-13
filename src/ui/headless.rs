@@ -2,7 +2,7 @@
 //! a usable GUI; a failed window initialization shuts down gracefully.
 
 #[cfg(any(not(windows), debug_assertions))]
-use crossbeam_channel::{select, Receiver};
+use crossbeam_channel::{TryRecvError, Receiver};
 #[cfg(all(windows, not(debug_assertions)))]
 use crossbeam_channel::Receiver;
 
@@ -38,37 +38,39 @@ fn run_debug(
     mut audio_out: AudioOut,
 ) {
     let shared = broker.shared();
+    let _wake = super::HeadlessWakeGuard::new();
     audio_out.start_notifications();
-    let output_events = audio_out.event_receiver();
-    let background_events = broker.background_events();
     let mut last_phase = shared.phase();
     log_info!("UI", "headless mode — panel follows on every state change");
-    loop {
+    'pump: loop {
         // Blocks until a command or a status arrives. Thread parks in the
         // kernel between events — this loop *is* the zero-CPU idle state.
-        select! {
-            recv(cmd_rx) -> msg => match msg {
+        loop {
+            match cmd_rx.try_recv() {
                 Ok(cmd) => {
                     if broker.handle_command(cmd) == Flow::Exit {
-                        break;
+                        break 'pump;
                     }
                 }
-                Err(_) => {
+                Err(TryRecvError::Disconnected) => {
                     // All command producers gone: treat as shutdown.
                     log_warn!("UI", "command channel closed — exiting");
-                    break;
+                    break 'pump;
                 }
-            },
-            recv(status_rx) -> msg => match msg {
-                Ok(status) => broker.handle_status(status),
-                Err(_) => {
-                    log_warn!("UI", "status channel closed (decoder died) — exiting");
-                    break;
-                }
-            },
-            recv(output_events) -> _ => audio_out.handle_device_events(&mut broker),
-            recv(background_events) -> _ => broker.poll_background(),
+                Err(TryRecvError::Empty) => break,
+            }
         }
+        loop {
+            match status_rx.try_recv() {
+                Ok(status) => broker.handle_status(status),
+                Err(TryRecvError::Disconnected) => {
+                    log_warn!("UI", "status channel closed (decoder died) — exiting");
+                    break 'pump;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+        broker.poll_background();
         if super::take_quit_request() {
             broker.handle_command(Command::Quit);
             break;
@@ -84,5 +86,9 @@ fn run_debug(
         if let Some(panel) = broker.take_refresh() {
             println!("\n{panel}\n");
         }
+        // All producers publish before posting a wake. A wake before this
+        // call remains latched; one between checking and waiting changes the
+        // compared atomic. No channel polling interval or extra thread exists.
+        super::wait_headless();
     }
 }

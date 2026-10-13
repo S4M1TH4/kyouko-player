@@ -28,6 +28,8 @@ mod win32;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, not(windows), debug_assertions))]
+use std::sync::atomic::AtomicU32;
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -148,8 +150,59 @@ pub fn wake_output() {
     post(WM_APP_OUTPUT);
 }
 
+// The diagnostic pump consumes the same posted wakes as the native owner.
+// Its one-bit mailbox replaces callback-side Crossbeam notification too.
+#[cfg(any(test, not(windows), debug_assertions))]
+static HEADLESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(any(test, not(windows), debug_assertions))]
+static HEADLESS_WAKE: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(any(test, not(windows), debug_assertions))]
+pub(crate) struct HeadlessWakeGuard;
+#[cfg(any(test, not(windows), debug_assertions))]
+impl HeadlessWakeGuard {
+    pub(crate) fn new() -> Self {
+        HEADLESS_ACTIVE.store(true, Ordering::Release);
+        Self
+    }
+}
+#[cfg(any(test, not(windows), debug_assertions))]
+impl Drop for HeadlessWakeGuard {
+    fn drop(&mut self) { HEADLESS_ACTIVE.store(false, Ordering::Release); }
+}
+
+#[cfg(any(test, not(windows), debug_assertions))]
+fn wake_headless() {
+    if HEADLESS_ACTIVE.load(Ordering::Acquire) && HEADLESS_WAKE.swap(1, Ordering::Release) == 0 {
+        atomic_wait::wake_one(&HEADLESS_WAKE);
+    }
+}
+
+#[cfg(any(not(windows), debug_assertions))]
+pub(crate) fn wait_headless() {
+    if HEADLESS_WAKE.swap(0, Ordering::Acquire) == 0 {
+        atomic_wait::wait(&HEADLESS_WAKE, 0);
+        HEADLESS_WAKE.swap(0, Ordering::Acquire);
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn wait_headless_timeout(timeout: std::time::Duration) {
+    if HEADLESS_WAKE.swap(0, Ordering::Acquire) == 0 {
+        let expected = 0u32;
+        unsafe {
+            let _ = windows::Win32::System::Threading::WaitOnAddress(
+                (&HEADLESS_WAKE as *const AtomicU32).cast(), (&expected as *const u32).cast(), size_of::<u32>(),
+                Some(timeout.as_millis().clamp(1, u32::MAX as u128 - 1) as u32));
+        }
+        HEADLESS_WAKE.swap(0, Ordering::Acquire);
+    }
+}
+
 #[cfg(windows)]
 fn post(msg: u32) {
+    #[cfg(any(test, debug_assertions))]
+    wake_headless();
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
     if let Some(&h) = PUMP_HWND.get() {
@@ -162,7 +215,7 @@ fn post(msg: u32) {
 }
 
 #[cfg(not(windows))]
-fn post(_msg: u32) {}
+fn post(_msg: u32) { wake_headless(); }
 
 pub fn run(
     broker: Broker,

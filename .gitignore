@@ -1,7 +1,6 @@
 /target
 /tests
 /txt
-ARCHITECTURE.md
 /state.cfg
 /state.cfg.*.tmp
 /instance.lock
