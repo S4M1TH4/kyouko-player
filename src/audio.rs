@@ -31,7 +31,8 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
+use crate::process::SourceChild as Child;
 #[cfg(test)]
 use std::process::Command;
 use std::sync::{Arc, Mutex, Weak};
@@ -786,9 +787,26 @@ struct DownloadWorker {
 }
 
 impl DownloadWorker {
-    fn start(mut input: impl Read + Send + 'static, slot: &BufferSlot) -> Result<Self, String> {
+    #[cfg(test)]
+    fn start(input: impl Read + Send + 'static, slot: &BufferSlot) -> Result<Self, String> {
+        Self::start_inner(input, slot, None)
+    }
+
+    fn start_source(input: impl Read + Send + 'static, slot: &BufferSlot,
+        child_slot: &Arc<Mutex<Option<Child>>>, pid: u32) -> Result<Self, String> {
+        Self::start_inner(input, slot, Some((child_slot.clone(), pid)))
+    }
+
+    fn start_inner(mut input: impl Read + Send + 'static, slot: &BufferSlot,
+        source: Option<(Arc<Mutex<Option<Child>>>, u32)>) -> Result<Self, String> {
         let buffer = StreamBuffer::new();
         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&buffer));
+        let deadline = source.map(|(child_slot, pid)| source_deadline(&child_slot, pid,
+            Some(buffer.clone()), Duration::from_secs(60), "stream download stalled"))
+            .transpose().map_err(|error| {
+                *slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                error.to_string()
+            })?;
         let producer = buffer.clone();
         let worker = thread::Builder::new().name("kyouko-buffer".into()).spawn(move || {
             let result = (|| {
@@ -797,12 +815,33 @@ impl DownloadWorker {
                     let count = input.read(&mut chunk)?;
                     if count == 0 { return Ok(()); }
                     producer.append(&chunk[..count])?;
+                    if let Some(deadline) = &deadline { deadline.progress(Duration::from_secs(30)); }
                 }
             })();
             producer.finish(result);
-        }).map_err(|e| format!("cannot start stream buffer: {e}"))?;
+            drop(deadline); // a fully downloaded/paused track has no watchdog
+        }).map_err(|e| {
+            *slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+            format!("cannot start stream buffer: {e}")
+        })?;
         Ok(Self { buffer, worker: Some(worker), slot: slot.clone() })
     }
+}
+
+fn source_deadline(slot: &Arc<Mutex<Option<Child>>>, pid: u32,
+    buffer: Option<Arc<StreamBuffer>>, timeout: Duration, reason: &'static str) -> std::io::Result<crate::deadline::Deadline> {
+    let slot = slot.clone();
+    crate::deadline::Deadline::start(timeout, move || {
+        if let Some(buffer) = &buffer {
+            if buffer.complete() { return; }
+            buffer.finish(Err(std::io::Error::new(ErrorKind::TimedOut, reason)));
+        }
+        {
+            let mut source = slot.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(child) = source.as_mut().filter(|child| child.id() == pid) { let _ = child.kill(); }
+        }
+        log_warn!("DECODER", "{reason}; source process terminated");
+    })
 }
 
 impl Drop for DownloadWorker {
@@ -890,6 +929,7 @@ impl Drop for ChildGuard {
 fn yt_dlp_args(format: &str, playlist_index: Option<usize>, url: &str) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
     let mut a: Vec<OsString> = Vec::new();
+    a.extend(["--socket-timeout", "15", "--retries", "1", "--fragment-retries", "1", "--no-progress", "--encoding", "utf-8"].map(OsString::from));
     match playlist_index {
         // Advancing playlist entry n: the list is the source of truth.
         Some(n) => {
@@ -969,13 +1009,15 @@ fn open_track_inner(
                 "spawning yt-dlp -f {format} (playlist entry {:?})",
                 playlist_index
             );
-            let mut child = crate::process::command("yt-dlp")
+            let mut child = Child::track(crate::process::command("yt-dlp")
                 .args(yt_dlp_args(format, *playlist_index, url))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|e| format!("yt-dlp spawn failed ({e}) — is yt-dlp in PATH?"))?;
+                .map_err(|e| format!("yt-dlp spawn failed ({e}) — is yt-dlp in PATH?"))?)
+                .map_err(|e| format!("source process tracking: {e}"))?;
+            let pid = child.id();
             let stdout = child.stdout.take().expect("yt-dlp stdout piped");
             let stderr = child.stderr.take().expect("yt-dlp stderr piped");
             // Drain stderr on a transient thread; keep the tail for the
@@ -1003,7 +1045,7 @@ fn open_track_inner(
             let guard = ChildGuard { slot: Arc::clone(child_slot) };
             *child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
             *err_tail_out = Some(err_tail);
-            let producer = DownloadWorker::start(stdout, buffer_slot)?;
+            let producer = DownloadWorker::start_source(stdout, buffer_slot, child_slot, pid)?;
             let mss = MediaSourceStream::new(Box::new(producer.buffer.reader()), Default::default());
             stream_buffer = Some(producer.buffer.clone());
             download = Some(producer);
@@ -1041,7 +1083,7 @@ fn open_track_inner(
         .map(|(n, tb)| {
             let t = tb.calc_time(n);
             Duration::from_secs_f64(t.seconds as f64 + t.frac)
-        });
+        }).filter(|duration| !duration.is_zero());
     let decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &Default::default())
         .map_err(|e| format!("decoder: {e}"))?;
@@ -1192,7 +1234,9 @@ fn fetch_title_blocking(
     // use keeps the metadata pass honest about playability (the request
     // never downloads; it only prints).
     let mut args: Vec<std::ffi::OsString> =
-        vec!["--print".into(), "title".into(), "-f".into(), format.into()];
+        vec!["--socket-timeout".into(), "15".into(), "--retries".into(), "1".into(),
+            "--encoding".into(), "utf-8".into(),
+            "--print".into(), "title".into(), "-f".into(), format.into()];
     match playlist_index {
         Some(n) => {
             args.push("--playlist-items".into());
@@ -1201,20 +1245,30 @@ fn fetch_title_blocking(
         None => args.push("--no-playlist".into()),
     }
     args.push(url.into());
-    let mut child = crate::process::command("yt-dlp")
+    let mut child = Child::track(crate::process::command("yt-dlp")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+        .ok()?).ok()?;
+    let pid = child.id();
     let stdout = child.stdout.take()?;
     if let Ok(mut slot) = child_slot.lock() {
         *slot = Some(child);
     }
+    let deadline = match source_deadline(child_slot, pid, None, Duration::from_secs(45), "title extraction deadline exceeded") {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            log_warn!("DECODER", "cannot arm extraction deadline: {error}");
+            drop(ChildGuard { slot: child_slot.clone() });
+            return None;
+        }
+    };
     log_info!("DECODER", "resolving title (single-shot, tracked)");
     let mut raw = String::new();
-    let read_ok = std::io::BufReader::new(stdout).read_to_string(&mut raw).is_ok();
+    let read_ok = std::io::BufReader::new(stdout).take(32 * 1024).read_to_string(&mut raw).is_ok();
+    drop(deadline);
     // Reap regardless of how the read ended (natural exit or kill).
     let child = child_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(mut c) = child {
@@ -3051,6 +3105,113 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires yt-dlp and a live streaming source"]
+    fn live_stream_seeks_and_repeats_from_the_same_ram_buffer() {
+        use crate::broker::{Command as PlayerCommand, DecoderLink, Phase};
+        let url = std::env::var("KYOUKO_TEST_URL").expect("set KYOUKO_TEST_URL to a single streaming video");
+        let mut source = Source::from_raw(&url);
+        if let Ok(selected) = std::env::var("KYOUKO_TEST_FORMAT")
+            && let Source::Youtube { format, .. } = &mut source { *format = selected; }
+        let shared = SharedState::new();
+        shared.set_sample_rate(48_000);
+        shared.set_device_channels(2);
+        shared.set_loop_enabled(true);
+        let (command_tx, command_rx) = bounded(8);
+        let (status_tx, status_rx) = bounded(16);
+        let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
+        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
+            command_tx, command_rx, audio.controls.clone().hook()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            broker.handle_command(PlayerCommand::Load { source, paused: false });
+            let until = std::time::Instant::now() + Duration::from_secs(120);
+            while shared.phase() == Phase::Loading {
+                broker.handle_status(status_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).unwrap());
+            }
+            assert_eq!(shared.phase(), Phase::Playing);
+            let original = audio.controls.buffer_slot.lock().unwrap().as_ref().unwrap().clone();
+            original.upgrade().unwrap().wait_complete(until.saturating_duration_since(std::time::Instant::now())).unwrap();
+            println!("stream fully cached; seeking +5s and back to zero using downloaded bytes");
+            for delta in [5.0, -5.0] {
+                broker.handle_command(PlayerCommand::SeekRelative(delta));
+                loop {
+                    let status = status_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).unwrap();
+                    match status {
+                        Status::Seeked { .. } => { broker.handle_status(status); break; }
+                        Status::SeekFailed { .. } | Status::Failed { .. } => panic!("stream seek failed: {status:?}"),
+                        status => broker.handle_status(status),
+                    }
+                }
+                if delta > 0.0 { assert!((shared.position().as_secs_f64() - 5.0).abs() < 0.15); }
+                else { assert_eq!(shared.position(), Duration::ZERO); }
+            }
+            let mut rounds = Vec::new();
+            for round in 0..2 {
+                if round == 1 {
+                    while shared.phase() == Phase::Loading {
+                        broker.handle_status(status_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).unwrap());
+                    }
+                    assert_eq!(shared.phase(), Phase::Playing);
+                    assert!(audio.controls.child_slot.lock().unwrap().is_none(), "repeat must not spawn yt-dlp");
+                    assert!(audio.controls.buffer_slot.lock().unwrap().is_none(), "repeat must not spawn a download worker");
+                    assert!(original.upgrade().is_some(), "repeat retains the original allocation");
+                }
+                let mut frames = 0usize;
+                let mut first_samples = Vec::new();
+                loop {
+                    let remaining = until.saturating_duration_since(std::time::Instant::now());
+                    assert!(!remaining.is_zero(), "stream decode/repeat timed out");
+                    select! {
+                        recv(audio.chunk_rx.queue) -> chunk => {
+                            let chunk = chunk.unwrap();
+                            if chunk.generation == shared.generation() {
+                                assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
+                                if first_samples.is_empty() { first_samples.extend_from_slice(&chunk.samples()[..chunk.samples().len().min(256)]); }
+                                frames += chunk.samples().len() / 2;
+                                shared.add_frames_played((chunk.samples().len() / 2) as u64);
+                            }
+                            recycle(&audio.chunk_rx.recycle, chunk);
+                        },
+                        recv(status_rx) -> status => {
+                            let status = status.unwrap();
+                            match status {
+                                Status::Finished { .. } => {
+                                    println!("round {}: decoded {frames} frames ({:.2}s)", round + 1, frames as f64 / 48_000.0);
+                                    if round == 0 { broker.handle_status(status); }
+                                    break;
+                                }
+                                Status::Failed { .. } => panic!("stream decode failed: {status:?}"),
+                                status => broker.handle_status(status),
+                            }
+                        },
+                        default(remaining.min(Duration::from_millis(10))) => {},
+                    }
+                    if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation()
+                        && audio.chunk_rx.queue.is_empty() {
+                        let _ = audio.drained_tx.try_send(shared.generation());
+                    }
+                }
+                assert!(frames > 48_000 * 5);
+                rounds.push((frames, first_samples));
+            }
+            assert_eq!(rounds[0], rounds[1], "RAM replay must reproduce the full track frame count and opening PCM");
+            broker.handle_command(PlayerCommand::Stop);
+            // Releasing cached compressed bytes occurs on the decoder thread.
+            broker.handle_command(PlayerCommand::Quit);
+            original
+        }));
+        broker.handle_command(PlayerCommand::Quit);
+        audio.controls.interrupt();
+        drop(audio.chunk_rx);
+        audio.decoder.join().unwrap();
+        match result {
+            Ok(original) => assert!(original.upgrade().is_none(), "Stop/Quit must free the cached track"),
+            Err(error) => std::panic::resume_unwind(error),
+        }
+        assert!(audio.controls.child_slot.lock().unwrap().is_none());
+        assert!(audio.controls.buffer_slot.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn real_decoder_failures_retry_twice_per_track_then_exhaust_queue() {
         use crate::broker::{Broker, Command as PlayerCommand, DecoderLink, Phase};
         let dir = std::env::temp_dir().join(format!("kyouko-retry-{}-decoder", std::process::id()));
@@ -3118,14 +3279,36 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn stalled_source_deadline_terminates_process_and_preserves_error_at_pipe_eof() {
+        let child = Child::track(crate::process::command("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "[Threading.Thread]::Sleep(30000)"])
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()).unwrap();
+        let pid = child.id();
+        let slot = Arc::new(Mutex::new(Some(child)));
+        let buffer = StreamBuffer::new();
+        let deadline = source_deadline(&slot, pid, Some(buffer.clone()), Duration::from_millis(50), "test source timed out").unwrap();
+        let error = buffer.reader().read(&mut [0]).unwrap_err();
+        assert!(error.to_string().contains("test source timed out"));
+        drop(deadline);
+        buffer.finish(Ok(())); // killed-pipe EOF must not erase the timeout
+        assert!(!buffer.complete());
+        assert!(buffer.reader().read(&mut [0]).unwrap_err().to_string().contains("timed out"));
+        assert!(!slot.lock().unwrap().as_mut().unwrap().wait().unwrap().success());
+        drop(ChildGuard { slot: slot.clone() });
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
     fn child_guard_detects_unsuccessful_stream_exit() {
         for code in [0, 7] {
             #[cfg(windows)]
-            let mut child = Command::new("cmd.exe").args(["/C", &format!("exit {code}")])
+            let child = Command::new("cmd.exe").args(["/C", &format!("exit {code}")])
                 .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
             #[cfg(not(windows))]
-            let mut child = Command::new("sh").args(["-c", &format!("exit {code}")])
+            let child = Command::new("sh").args(["-c", &format!("exit {code}")])
                 .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let mut child = Child::track(child).unwrap();
             child.wait().unwrap();
             let slot = Arc::new(Mutex::new(Some(child)));
             let guard = ChildGuard { slot: slot.clone() };

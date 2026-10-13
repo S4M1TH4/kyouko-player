@@ -46,6 +46,7 @@ mod audio;
 mod audio_device;
 mod broker;
 mod config;
+mod deadline;
 mod logging;
 mod process;
 #[cfg(windows)]
@@ -67,7 +68,7 @@ use crate::config::PersistedState;
 use crate::ui::CMD_TX;
 
 fn main() {
-    logging::init();
+    let _logging = logging::init();
     log_info!(
         "MAIN",
         "kyouko-player {} — the mountain echo; only heard, never seen",

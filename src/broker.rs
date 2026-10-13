@@ -181,13 +181,14 @@ fn is_stream_url(url: &str) -> bool {
 /// yt-dlp format id a site's audio streams under. YouTube's default `140`
 /// (m4a 128k) does not exist on Bilibili — requesting it there yields an
 /// empty stream that fails symphonia's format probe — so Bilibili links
-/// select Bilibili's own DASH audio stream `30232` instead. Niconico
-/// likewise only resolves under its named format `audio-aac-128kbps`.
+/// select Bilibili's own DASH audio stream `30232` instead. Niconico's AAC
+/// format IDs vary by video (64/128/192 kbps), so select its best available
+/// AAC audio-only rendition rather than requiring one bitrate.
 fn default_format_for(url: &str) -> &'static str {
     if is_bilibili_url(url) {
         "30232"
     } else if is_niconico_url(url) {
-        "audio-aac-128kbps"
+        "bestaudio[format_id^=audio-aac-]"
     } else {
         "140"
     }
@@ -3324,10 +3325,12 @@ mod tests {
 
     #[test]
     fn niconico_links_select_their_own_format() {
-        // Watch URL and nico.ms shortlink both carry the Niconico named
-        // audio format; YouTube keeps its m4a default.
+        // Watch URLs and shortlinks use the same bitrate-independent AAC
+        // selector, including the 192 kbps video that has no 128 kbps rendition.
         for url in [
             "https://www.nicovideo.jp/watch/sm46878644",
+            "https://www.nicovideo.jp/watch/sm18355305",
+            "https://www.nicovideo.jp/watch/sm2071321",
             "https://nico.ms/sm46878644",
             "http://www.nicovideo.jp/watch/sm9",
         ] {
@@ -3335,9 +3338,9 @@ mod tests {
                 matches!(
                     Source::from_raw(url),
                     Source::Youtube { format, playlist_index: None, .. }
-                        if format == "audio-aac-128kbps"
+                        if format == "bestaudio[format_id^=audio-aac-]"
                 ),
-                "niconico link must carry audio-aac-128kbps: {url}"
+                "niconico link must select available AAC audio: {url}"
             );
         }
         assert!(matches!(
@@ -3365,7 +3368,7 @@ mod tests {
         broker.handle_command(Command::LoadDropped(vec![shortcut.to_string_lossy().into_owned()]));
         match rx.try_recv() {
             Ok(DecoderCmd::Load(Source::Youtube { format, playlist_index, .. }, _)) => {
-                assert_eq!(format, "audio-aac-128kbps", "niconico drop must not use fmt 140");
+                assert_eq!(format, "bestaudio[format_id^=audio-aac-]", "niconico drop must select available AAC audio");
                 assert_eq!(playlist_index, None);
             }
             other => panic!("expected niconico stream load, got {other:?}"),

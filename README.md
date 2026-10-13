@@ -51,6 +51,8 @@ logging. The application has no terminal command reader or system tray icon.
 - Tracklist popup with the current selection highlighted and direct track jumps.
 - Local audio and audio tracks from supported video containers; YouTube,
   Bilibili, and Niconico streams through `yt-dlp`.
+  Niconico selects the best available AAC audio rendition, accommodating
+  videos that offer 192 kbps rather than 128 kbps.
 - Local folder queues sorted newest first. The last folder and selected track
   are restored at startup, staged paused until playback is requested.
 - One automatic retry per failed track, then playlist advancement when a next
@@ -132,6 +134,17 @@ cargo run
 ```
 
 Set `KYOUKO_LOG` to `error`, `warn`, `info`, or `debug` to select log verbosity.
+Debug builds log to the console. Windows release builds write
+`%LOCALAPPDATA%\kyouko-player\player.log` and rotate to
+`player.previous.log`, keeping at most 1 MiB in each file. Log producers use a
+bounded queue; a full queue drops records and reports the count when space
+returns. The writer sleeps between records and drains on graceful shutdown.
+
+Streaming title extraction has a 45-second deadline. A download allows 60
+seconds for its first bytes, then fails after 30 seconds without progress.
+yt-dlp socket requests time out after 15 seconds with one internal retry.
+Timeouts terminate the source process tree and enter the player's existing
+two-attempt recovery policy. Completed RAM playback has no deadline worker.
 
 ## Verification
 
@@ -160,6 +173,16 @@ and clean up source processes on completion or failure. The playlist diagnostic
 loads its titles and advances to entry 2. The recovery diagnostic reopens real
 WASAPI streams after four injected output faults; it does not unplug hardware.
 
+For a single video from any supported platform, run
+`cargo test live_stream_seeks_and_repeats_from_the_same_ram_buffer -- --ignored --nocapture`
+with `KYOUKO_TEST_URL` set to its URL. This diagnostic allows 120 seconds for
+download, seeks forward and back in RAM, decodes the entire track and repeat,
+and verifies matching PCM, no repeat source process, and cache deallocation.
+It consumes PCM without real-time output; the WASAPI diagnostic separately
+checks playback timing and recovery on the actual audio device.
+`KYOUKO_TEST_FORMAT` optionally forces an exact yt-dlp format for this
+seek/repeat diagnostic; it does not change application settings.
+
 ## Source map
 
 | Path | Responsibility |
@@ -171,6 +194,7 @@ WASAPI streams after four injected output faults; it does not unplug hardware.
 | `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |
 | `src/config.rs` | State configuration and atomic saves |
 | `src/process.rs` | External process launch policy |
+| `src/deadline.rs` | Owned, cancellable source deadlines |
 | `src/playlist.rs` | Owned Windows playlist metadata jobs and deadlines |
 | `src/logging.rs` | Diagnostic logging |
 | `src/ui/` | Win32 overlay, tracklist, rendering, and hotkeys |

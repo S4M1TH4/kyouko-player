@@ -70,6 +70,9 @@ impl StreamBuffer {
 
     pub fn finish(&self, result: io::Result<()>) {
         let mut bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
+        // Timeout/cancellation and pipe EOF can race. Preserve the first
+        // terminal result so EOF cannot turn a timed-out download into success.
+        if bytes.done { return; }
         bytes.done = true;
         bytes.error = result.err().map(|error| error.to_string());
         self.ready.notify_all();
@@ -86,6 +89,17 @@ impl StreamBuffer {
     pub fn complete(&self) -> bool {
         let bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
         bytes.done && !bytes.cancelled && bytes.error.is_none()
+    }
+
+    #[cfg(test)]
+    pub fn wait_complete(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        let bytes = self.bytes.lock().unwrap_or_else(|error| error.into_inner());
+        let (bytes, _) = self.ready.wait_timeout_while(bytes, timeout, |bytes| !bytes.done && !bytes.cancelled)
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = &bytes.error { return Err(io::Error::other(error.clone())); }
+        if bytes.cancelled { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stream cancelled")); }
+        if !bytes.done { return Err(io::Error::new(io::ErrorKind::TimedOut, "download completion timed out")); }
+        Ok(())
     }
 
     pub fn downloaded_seek(&self) -> DownloadedSeek<'_> {
