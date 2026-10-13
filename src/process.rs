@@ -79,38 +79,112 @@ pub fn command(program: &str) -> Command {
 mod tests {
     use super::*;
 
+    const HELPER_READY: &str = "KYOUKO_HELPER_READY ";
+
+    fn helper_pid(stdout: impl std::io::Read) -> std::io::Result<u32> {
+        use std::io::{BufRead, BufReader};
+        for line in BufReader::new(stdout).lines() {
+            if let Some((_, pid)) = line?.split_once(HELPER_READY) {
+                return pid.trim().parse().map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+            }
+        }
+        Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "fixture exited before helper readiness"))
+    }
+
+    fn fixture_command(role: &str) -> Command {
+        use std::os::windows::process::CommandExt;
+        let mut fixture = Command::new(std::env::current_exe().unwrap());
+        fixture.args(["--exact", "process::tests::source_tree_fixture", "--ignored", "--nocapture"])
+            .env("KYOUKO_PROCESS_FIXTURE_ROLE", role).creation_flags(0x0800_0000)
+            .stdin(Stdio::null());
+        fixture
+    }
+
+    #[test]
+    #[ignore = "native process-only fixture launched by the source-tree test"]
+    fn source_tree_fixture() {
+        use std::io::{Read, Write};
+        let Ok(role) = std::env::var("KYOUKO_PROCESS_FIXTURE_ROLE") else { return; };
+        let pid = match role.as_str() {
+            "parent" => {
+                // The test sends this permit only after assigning us to its
+                // job. A fast helper therefore cannot escape job inheritance.
+                let mut permit = [0];
+                std::io::stdin().read_exact(&mut permit).unwrap();
+                assert_eq!(permit, [b'G']);
+                let mut helper = fixture_command("helper").stdout(Stdio::piped())
+                    .stderr(Stdio::null()).spawn().unwrap();
+                // Use a separate pipe so killing this parent always releases
+                // the test's stdout reader, even if helper cleanup regresses.
+                let pid = helper_pid(helper.stdout.take().unwrap()).unwrap();
+                assert_eq!(pid, helper.id());
+                println!("{HELPER_READY}{pid}");
+                std::io::stdout().flush().unwrap();
+                let status = helper.wait().unwrap();
+                panic!("helper exited before tree cleanup: {status}");
+            }
+            "helper" => std::process::id(),
+            _ => panic!("unknown fixture role"),
+        };
+        println!("{HELPER_READY}{pid}");
+        std::io::stdout().flush().unwrap();
+        loop { std::thread::park(); }
+    }
+
     #[test]
     fn source_tree_cleanup_terminates_an_inherited_helper() {
-        use std::io::{BufRead, BufReader};
+        use std::io::{Read, Write};
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+        use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject};
         // Process-only fixture: no keyboard, mouse or desktop input is injected.
-        let script = r#"$helper=Start-Process cmd.exe -ArgumentList '/D','/C','ping -n 30 127.0.0.1 > nul' -WindowStyle Hidden -PassThru; [Console]::Out.WriteLine($helper.Id); [Console]::Out.Flush(); [Threading.Thread]::Sleep(30000)"#;
-        let mut child = SourceChild::track(command("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap()).unwrap();
+        let mut child = SourceChild::track(fixture_command("parent").stdin(Stdio::piped())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()).unwrap();
+        child.stdin.take().unwrap().write_all(b"G").unwrap();
         let stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let errors = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        });
         let (tx, rx) = crossbeam_channel::bounded(1);
         let reader = std::thread::spawn(move || {
-            let mut line = String::new();
-            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-            let _ = tx.send(result);
+            let _ = tx.send(helper_pid(stdout));
         });
-        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let result = rx.recv_timeout(std::time::Duration::from_secs(30));
         // Retain a helper handle before killing the tree so PID reuse cannot
         // confuse verification. Always clean up before an assertion can panic.
         let helper = result.as_ref().ok().and_then(|result| result.as_ref().ok())
-            .and_then(|line| line.trim().parse().ok()).and_then(|pid| unsafe {
-                OpenProcess(PROCESS_SYNCHRONIZE, false, pid).ok()
+            .and_then(|pid| unsafe {
+                OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, *pid).ok()
                     .map(|handle| OwnedHandle::from_raw_handle(handle.0))
             });
+        let helper_before_cleanup = helper.as_ref().map(|helper| unsafe {
+            WaitForSingleObject(HANDLE(helper.as_raw_handle()), 0)
+        });
         let _ = child.kill();
-        child.wait().unwrap();
-        reader.join().unwrap();
-        assert!(result.is_ok(), "helper fixture must signal readiness");
+        let waited = child.wait();
+        let read_joined = reader.join();
+        let stderr = errors.join().unwrap();
+        let helper_status = helper.as_ref().map(|helper| unsafe {
+            let handle = HANDLE(helper.as_raw_handle());
+            let status = WaitForSingleObject(handle, 5000);
+            if status != WAIT_OBJECT_0 {
+                // Report a real job-cleanup failure after explicitly reaping
+                // the helper, rather than leaking a parked process on failure.
+                let _ = TerminateProcess(handle, 1);
+                let _ = WaitForSingleObject(handle, 5000);
+            }
+            status
+        });
+        waited.unwrap();
+        read_joined.unwrap();
+        assert!(matches!(result, Ok(Ok(_))), "helper fixture must signal readiness: {result:?}; stderr: {stderr}");
         let helper = helper.expect("helper must be running before cleanup");
-        assert_eq!(unsafe { WaitForSingleObject(HANDLE(helper.as_raw_handle()), 1000) }, WAIT_OBJECT_0);
+        assert_eq!(helper_before_cleanup, Some(WAIT_TIMEOUT), "helper must still be alive before job cleanup");
+        assert_eq!(helper_status, Some(WAIT_OBJECT_0), "the inherited helper must terminate with its job");
+        drop(helper);
     }
 
     #[test]
