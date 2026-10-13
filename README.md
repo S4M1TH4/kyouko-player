@@ -106,13 +106,23 @@ window. Click X to quit; the full click is consumed before shutdown.
 
 Settings are stored in `%LOCALAPPDATA%\kyouko-player\state.cfg`, falling back to
 `state.cfg` in the working directory when `LOCALAPPDATA` is unavailable.
+Only one player can own a state directory. A second launch exits before
+opening audio, logging, or windows. The OS releases the `instance.lock` file
+lock after exit or a crash; the empty lock file is deliberately retained.
+
+State changes enter a single pending snapshot slot. A parked worker coalesces
+updates, writes a unique temporary file, flushes it, and atomically replaces
+`state.cfg`. Quit and Windows session shutdown wait for the final snapshot.
+A forced termination can lose pending changes; an interrupted temporary write
+leaves the last committed configuration intact.
 
 ## Build
 
 Requirements:
 
 - Windows 10 or 11.
-- Rust and Cargo with edition 2024 support; tested with Rust 1.99.0.
+- Rust 1.99.0 and Cargo, the toolchain used by Windows CI. OS file locking
+  requires Rust 1.89 or newer.
 - For the MSVC target, Visual Studio C++ Build Tools and the Windows SDK,
   including the Resource Compiler (`rc.exe`).
 - `yt-dlp` on `PATH` for network playback. Local playback has no external
@@ -154,6 +164,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ```
+
+`.github/workflows/windows.yml` runs these checks on a fresh Windows 2025
+runner using Rust 1.99.0. It also checks the embedded executable icon, release
+logging, and duplicate-launch protection. It builds for verification and does
+not upload executables or publish packages. AAC fixtures in `tests/fixtures/`
+are repository inputs, so tests do not depend on ignored local files.
 
 The default tests run without network access or an audio device. Diagnostics
 that require saved local media, WASAPI output, or live streaming are opt-in

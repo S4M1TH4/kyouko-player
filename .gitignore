@@ -1,4 +1,13 @@
 /target
-/tests
+/tests/*
+!/tests/fixtures/
+/tests/fixtures/*
+!/tests/fixtures/README.md
+!/tests/fixtures/silence.m4a
 /txt
 ARCHITECTURE.md
+/state.cfg
+/state.cfg.*.tmp
+/instance.lock
+/player.log
+/player.previous.log

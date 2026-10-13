@@ -740,6 +740,7 @@ pub struct Broker {
     /// Installed by main; writes PersistedState to disk. A closure keeps the
     /// broker I/O-free (and testable).
     saver: Option<Arc<dyn Fn(PersistedState) + Send + Sync>>,
+    flush_saves: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Broker {
@@ -773,6 +774,7 @@ impl Broker {
             yt_queue_url: None,
             yt_queue_loading: false,
             saver: None,
+            flush_saves: None,
         };
         broker.refresh();
         broker
@@ -782,6 +784,11 @@ impl Broker {
     /// EQ gains, folder ingestion, opened track, Quit.
     pub fn with_saver(mut self, saver: Arc<dyn Fn(PersistedState) + Send + Sync>) -> Self {
         self.saver = Some(saver);
+        self
+    }
+
+    pub fn with_flush(mut self, flush: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.flush_saves = Some(flush);
         self
     }
 
@@ -1527,8 +1534,11 @@ impl Broker {
                 self.seek_after_open = None;
                 self.resume_after_seek = None;
                 log_info!("BROKER", "quit — shutting decoder down (kills yt-dlp child)");
-                self.persist(); // final flush; X, Alt+Q and debug Ctrl+C land here
+                self.persist();
                 self.send_decoder(DecoderCmd::Shutdown);
+                // X, Alt+Q, Ctrl+C and WM_ENDSESSION all wait for this final
+                // snapshot before returning the shutdown acknowledgement.
+                if let Some(flush) = &self.flush_saves { flush(); }
                 self.pending_source = None;
                 self.track = None;
                 self.set_phase(Phase::Stopped, "quit");

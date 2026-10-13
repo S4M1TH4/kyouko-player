@@ -64,10 +64,20 @@ use std::sync::Arc;
 
 use crate::audio::AudioOut;
 use crate::broker::{Broker, Command, DecoderCmd, DecoderLink, SharedState, Source, Status};
-use crate::config::PersistedState;
 use crate::ui::CMD_TX;
 
 fn main() {
+    // Claim the state directory before logging, restoration or device setup.
+    // A duplicate launch must not touch another instance's settings/logs/hotkeys.
+    let _instance = match config::InstanceGuard::acquire(&config::path()) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => { eprintln!("kyouko-player is already running"); return; }
+        Err(error) => {
+            let _logging = logging::init();
+            log_error!("MAIN", "cannot acquire instance lock: {error}");
+            return;
+        }
+    };
     let _logging = logging::init();
     log_info!(
         "MAIN",
@@ -157,12 +167,15 @@ fn main() {
     let link = DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), controls.hook());
     let shutdown_link = link.clone();
 
-    // Persistence sink: the broker calls it on every save trigger
-    // (volume / EQ gains / folder ingestion / opened track / Quit). Writes on
-    // the broker thread — no locks, no background flusher thread.
-    let saver: Arc<dyn Fn(PersistedState) + Send + Sync> =
-        Arc::new(|state| config::store(&state));
-    let broker = Broker::new(shared, link).with_saver(saver).with_playlist_fetching();
+    // Coalesce snapshots outside the UI. The writer parks when nothing changes
+    // and its guard drains the latest snapshot before releasing the instance lock.
+    let persistence = config::SaveWriter::start(config::path()).ok();
+    let saver = if let Some(writer) = &persistence { writer.saver() } else {
+        log_warn!("CFG", "cannot start state writer; saving synchronously");
+        Arc::new(|state| config::store(&state))
+    };
+    let mut broker = Broker::new(shared, link).with_saver(saver).with_playlist_fetching();
+    if let Some(writer) = &persistence { broker = broker.with_flush(writer.flusher()); }
     log_info!("MAIN", "broker online — entering sleep-on-idle event loop");
     ui::run(broker, cmd_rx, status_rx, audio_out);
 
@@ -174,6 +187,7 @@ fn main() {
     }
     audio.controls.interrupt();
     let _ = audio.decoder.join();
+    drop(persistence);
     log_info!("MAIN", "shutdown complete — echo faded");
 }
 
