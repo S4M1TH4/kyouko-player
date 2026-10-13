@@ -40,6 +40,7 @@ fn run_debug(
     let shared = broker.shared();
     audio_out.start_notifications();
     let output_events = audio_out.event_receiver();
+    let background_events = broker.background_events();
     let mut last_phase = shared.phase();
     log_info!("UI", "headless mode — panel follows on every state change");
     loop {
@@ -66,6 +67,11 @@ fn run_debug(
                 }
             },
             recv(output_events) -> _ => audio_out.handle_device_events(&mut broker),
+            recv(background_events) -> _ => broker.poll_background(),
+        }
+        if super::take_quit_request() {
+            broker.handle_command(Command::Quit);
+            break;
         }
         audio_out.handle_device_events(&mut broker);
         // Mirror the phase onto the output stream (WASAPI play/pause).

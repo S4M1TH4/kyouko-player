@@ -48,6 +48,8 @@ mod broker;
 mod config;
 mod logging;
 mod process;
+#[cfg(windows)]
+mod playlist;
 mod stream_buffer;
 mod ui;
 
@@ -117,8 +119,8 @@ fn main() {
         restored.last_folder.as_deref().unwrap_or("<none>")
     );
 
-    // Core message arteries. Bounded everywhere: a full queue is the
-    // scheduler — senders block (park), nobody ever spins.
+    // Core cross-thread arteries are bounded. UI-native input is staged on
+    // its owner thread; decoder dispatch coalesces under saturation.
     let (cmd_tx, cmd_rx) = bounded::<Command>(32); // window, hotkeys, and startup
     let (decoder_tx, decoder_rx) = bounded::<DecoderCmd>(8); // broker → decoder
     let (status_tx, status_rx) = bounded::<Status>(16); // decoder → broker
@@ -145,13 +147,13 @@ fn main() {
         shared.set_sample_rate(48_000);
         shared.set_device_channels(2);
     }
-    let audio = audio::spawn(shared.clone(), decoder_rx, status_tx);
+    let audio = audio::spawn(shared.clone(), decoder_rx.clone(), status_tx);
     let audio_out = AudioOut::managed(device, audio.chunk_rx, audio.drained_tx, shared.clone(), audio.controls.clone());
 
     // The kill switch rides along with every Stop/Load/Shutdown so a stalled
     // yt-dlp pipe read can never defer a command or hang shutdown.
     let controls = audio.controls.clone();
-    let link = DecoderLink::with_interrupt(decoder_tx, controls.hook());
+    let link = DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), controls.hook());
     let shutdown_link = link.clone();
 
     // Persistence sink: the broker calls it on every save trigger
@@ -159,7 +161,7 @@ fn main() {
     // the broker thread — no locks, no background flusher thread.
     let saver: Arc<dyn Fn(PersistedState) + Send + Sync> =
         Arc::new(|state| config::store(&state));
-    let broker = Broker::new(shared, link).with_saver(saver);
+    let broker = Broker::new(shared, link).with_saver(saver).with_playlist_fetching();
     log_info!("MAIN", "broker online — entering sleep-on-idle event loop");
     ui::run(broker, cmd_rx, status_rx, audio_out);
 
@@ -182,10 +184,7 @@ unsafe extern "system" fn on_console_ctrl(ctrl: u32) -> windows::core::BOOL {
     use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT};
     if matches!(ctrl, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
         log_warn!("MAIN", "console control event {ctrl} — requesting graceful quit");
-        if let Some(tx) = CMD_TX.get() {
-            let _ = tx.try_send(Command::Quit);
-        }
-        crate::ui::wake_broker();
+        crate::ui::request_quit();
         true.into()
     } else {
         false.into()

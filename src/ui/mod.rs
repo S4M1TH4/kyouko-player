@@ -27,6 +27,7 @@ mod render;
 mod win32;
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -37,6 +38,85 @@ use crate::broker::{Broker, Command, Status};
 /// and the console control handler (both outside the normal producer path)
 /// can inject commands. `main` fills it before spawning any threads.
 pub static CMD_TX: OnceLock<Sender<Command>> = OnceLock::new();
+
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(windows, debug_assertions))]
+pub fn request_quit() {
+    QUIT_REQUESTED.store(true, Ordering::Release);
+    if let Some(tx) = CMD_TX.get() { let _ = tx.try_send(Command::Quit); }
+    wake_broker();
+}
+
+pub fn take_quit_request() -> bool { QUIT_REQUESTED.swap(false, Ordering::AcqRel) }
+
+#[cfg(windows)]
+#[derive(Default)]
+struct LocalInbox {
+    commands: std::collections::VecDeque<Command>,
+    quit: bool,
+}
+
+#[cfg(windows)]
+thread_local! {
+    // Native input already runs on the owner thread. Stage it until the
+    // message handler returns, rather than competing for a full worker pipe.
+    static LOCAL_INBOX: std::cell::RefCell<LocalInbox> = std::cell::RefCell::new(LocalInbox::default());
+}
+
+#[cfg(windows)]
+pub fn queue_local(command: Command) {
+    LOCAL_INBOX.with_borrow_mut(|inbox| {
+        if matches!(command, Command::Quit) { inbox.quit = true; }
+        else if !inbox.quit { inbox.commands.push_back(command); }
+    });
+    wake_broker();
+}
+
+#[cfg(windows)]
+pub fn take_local() -> Option<Command> {
+    LOCAL_INBOX.with_borrow_mut(|inbox| {
+        if std::mem::take(&mut inbox.quit) {
+            inbox.commands.clear();
+            Some(Command::Quit)
+        } else { inbox.commands.pop_front() }
+    })
+}
+
+#[cfg(windows)]
+pub fn has_local() -> bool {
+    LOCAL_INBOX.with_borrow(|inbox| inbox.quit || !inbox.commands.is_empty())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_controls_keep_fifo_order_without_using_the_worker_channel() {
+        queue_local(Command::SeekRelative(-5.0));
+        queue_local(Command::ToggleLoop);
+        queue_local(Command::VolumeStep(10));
+        assert!(matches!(take_local(), Some(Command::SeekRelative(-5.0))));
+        assert!(matches!(take_local(), Some(Command::ToggleLoop)));
+        assert!(matches!(take_local(), Some(Command::VolumeStep(10))));
+        assert!(take_local().is_none());
+    }
+
+    #[test]
+    fn quit_has_priority_over_staged_native_commands_even_with_a_full_worker_pipe() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        tx.send(Command::ToggleLoop).unwrap();
+        tx.send(Command::ToggleEq).unwrap();
+        queue_local(Command::SeekRelative(5.0));
+        queue_local(Command::Quit);
+        queue_local(Command::VolumeStep(10));
+        assert!(rx.is_full());
+        assert!(matches!(take_local(), Some(Command::Quit)));
+        assert!(take_local().is_none());
+        assert_eq!(rx.len(), 2);
+    }
+}
 
 // WM_APP + 1..3. Kept as literals so the constants exist on every target;
 // win32.rs uses them as channel wake-up messages.

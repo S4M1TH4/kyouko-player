@@ -703,7 +703,7 @@ enum PlayExit {
     /// User stop; no status (the broker set the phase itself).
     Stopped,
     /// A Load arrived mid-play: the new source must be opened immediately.
-    NewSource(Source),
+    NewSource(Source, u64),
     Shutdown,
     /// The chunk channel's consumer is gone (output stream failed to open).
     SinkGone,
@@ -729,22 +729,23 @@ fn run_decoder(
         }
         log_debug!("DECODER", "recv {cmd:?}");
         let first = match cmd {
-            DecoderCmd::Load(s) => s,
+            DecoderCmd::Load(s, load_id) => (s, load_id),
             // Nothing is open — a seek has nothing to move.
             DecoderCmd::SeekRelative(_) => continue,
             DecoderCmd::Stop => { cache = None; continue; }
             DecoderCmd::Shutdown => break,
         };
         let mut next = Some(first);
-        'tracks: while let Some(source) = next.take() {
+        'tracks: while let Some((source, load_id)) = next.take() {
+            if load_id != shared.load_id() { break 'tracks; }
             select_stream_cache(&mut cache, &source, shared.loop_enabled());
             let exit = play_source(&PlaybackContext {
                 shared: &shared, cmds: &cmds, status_tx: &status_tx,
                 chunk_tx: &chunk_tx, drained_rx: &drained_rx,
                 child_slot: &controls.child_slot, buffer_slot: &controls.buffer_slot,
-            }, &mut cache, source);
+            }, &mut cache, source, load_id);
             match exit {
-                PlayExit::NewSource(s) => next = Some(s),
+                PlayExit::NewSource(s, load_id) => next = Some((s, load_id)),
                 PlayExit::Eof => {
                     if !shared.loop_enabled() { cache = None; }
                     break 'tracks;
@@ -752,12 +753,16 @@ fn run_decoder(
                 PlayExit::Stopped | PlayExit::Failed => { cache = None; break 'tracks; }
                 PlayExit::Shutdown | PlayExit::SinkGone => {
                     log_info!("DECODER", "offline");
+                    drop(status_tx);
+                    crate::ui::wake_status();
                     return;
                 }
             }
         }
     }
     log_info!("DECODER", "offline");
+    drop(status_tx);
+    crate::ui::wake_status();
 }
 
 struct StreamCache {
@@ -833,12 +838,13 @@ struct ActiveTrack {
     seek_packet: Option<Packet>,
     next_ts: u64,
     seek_status: Option<Sender<Status>>,
+    load_id: u64,
 }
 
 impl ActiveTrack {
     fn seek_failed(&self) -> bool {
         if let Some(status) = &self.seek_status {
-            let _ = status.send(Status::SeekFailed);
+            let _ = status.send(Status::SeekFailed { load_id: self.load_id });
             crate::ui::wake_status();
         }
         false
@@ -1068,14 +1074,14 @@ fn open_track_inner(
         stream_buffer,
         seek_packet: None,
         next_ts: 0,
-        seek_status: None,
+        seek_status: None, load_id: 0,
     })
 }
 
 enum SendOutcome {
     Sent,
     Stopped,
-    NewSource(Source),
+    NewSource(Source, u64),
     /// A seek arrived while parked waiting for chunk space.
     SeekRelative(f64),
     Shutdown,
@@ -1136,7 +1142,7 @@ fn send_command(msg: Result<DecoderCmd, crossbeam_channel::RecvError>) -> SendOu
     match msg {
         Ok(DecoderCmd::Stop) => SendOutcome::Stopped,
         Ok(DecoderCmd::Shutdown) | Err(_) => SendOutcome::Shutdown,
-        Ok(DecoderCmd::Load(source)) => SendOutcome::NewSource(source),
+        Ok(DecoderCmd::Load(source, id)) => SendOutcome::NewSource(source, id),
         Ok(DecoderCmd::SeekRelative(delta)) => SendOutcome::SeekRelative(delta),
     }
 }
@@ -1217,6 +1223,7 @@ fn seek_relative(
     resampler: &mut Option<LinearResampler>,
     generation: &mut u64,
 ) -> bool {
+    if track.seek_status.is_some() && track.load_id != shared.load_id() { return false; }
     if !track.seekable {
         log_info!("DECODER", "container does not support seeking");
         return track.seek_failed();
@@ -1246,6 +1253,7 @@ fn seek_relative(
     }
     match seek_result {
         Ok((seeked, packet)) => {
+            if track.seek_status.is_some() && track.load_id != shared.load_id() { return false; }
             track.next_ts = packet.ts().saturating_add(packet.dur());
             track.seek_packet = Some(packet);
             let actual = track.time_base.map(|base| {
@@ -1287,8 +1295,10 @@ fn play_source(
     context: &PlaybackContext<'_>,
     cache: &mut Option<StreamCache>,
     source: Source,
+    load_id: u64,
 ) -> PlayExit {
     let &PlaybackContext { shared, cmds, status_tx, chunk_tx, drained_rx, child_slot, buffer_slot } = context;
+    if load_id != shared.load_id() { return PlayExit::Stopped; }
     let mut generation = shared.generation();
     chunk_tx.begin(generation);
     let cached = cache
@@ -1317,7 +1327,7 @@ fn play_source(
     match cmds.try_recv() {
         Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
         Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
-        Ok(DecoderCmd::Load(s)) => return PlayExit::NewSource(s),
+        Ok(DecoderCmd::Load(s, load_id)) => return PlayExit::NewSource(s, load_id),
         Ok(DecoderCmd::SeekRelative(_)) | Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => return PlayExit::Shutdown,
     }
@@ -1336,6 +1346,7 @@ fn play_source(
     };
     let replay_title = track.title.clone().or_else(|| resolved_title.clone());
     track.seek_status = Some(status_tx.clone());
+    track.load_id = load_id;
     log_info!(
         "DECODER",
         "probed container: {} Hz, {} ch{}, title {:?}",
@@ -1371,6 +1382,7 @@ fn play_source(
         let mut failure_reason = None;
 
         'play: loop {
+            if load_id != shared.load_id() { exit = PlayExit::Stopped; break 'play; }
             // Command check between packets: the loop only runs while doing real
             // work, so this is work-time checking, not idle polling.
             match cmds.try_recv() {
@@ -1382,11 +1394,12 @@ fn play_source(
                     exit = PlayExit::Shutdown;
                     break 'play;
                 }
-                Ok(DecoderCmd::Load(s)) => {
-                    exit = PlayExit::NewSource(s);
+                Ok(DecoderCmd::Load(s, load_id)) => {
+                    exit = PlayExit::NewSource(s, load_id);
                     break 'play;
                 }
                 Ok(DecoderCmd::SeekRelative(delta)) => {
+                    if load_id != shared.load_id() { continue; }
                     if seek_relative(
                         &mut track,
                         shared,
@@ -1397,7 +1410,7 @@ fn play_source(
                         &mut generation,
                     ) {
                         chunk_tx.begin(generation);
-                        let _ = status_tx.send(Status::Seeked);
+                        let _ = status_tx.send(Status::Seeked { load_id });
                         crate::ui::wake_status();
                     }
                     continue;
@@ -1489,7 +1502,7 @@ fn play_source(
                 // Container tags win (local files); the prefetched YouTube
                 // title fills the gap.
                 let _ = status_tx.send(Status::Opened {
-                    source: source.clone(),
+                    load_id, source: source.clone(),
                     sample_rate: track.sample_rate,
                     channels: track.channels as u16,
                     title: track.title.take().or_else(|| resolved_title.take()),
@@ -1567,14 +1580,14 @@ fn play_source(
                             &mut generation,
                         ) {
                             chunk_tx.begin(generation);
-                            let _ = status_tx.send(Status::Seeked);
+                            let _ = status_tx.send(Status::Seeked { load_id });
                             crate::ui::wake_status();
                             continue 'play;
                         }
                         // A refused seek leaves pending samples intact.
                     }
-                    SendOutcome::NewSource(s) => {
-                        exit = PlayExit::NewSource(s);
+                    SendOutcome::NewSource(s, load_id) => {
+                        exit = PlayExit::NewSource(s, load_id);
                         break 'play;
                     }
                     SendOutcome::Shutdown => {
@@ -1624,13 +1637,13 @@ fn play_source(
                             &mut generation,
                         ) {
                             chunk_tx.begin(generation);
-                            let _ = status_tx.send(Status::Seeked);
+                            let _ = status_tx.send(Status::Seeked { load_id });
                             crate::ui::wake_status();
                             continue 'decode;
                         }
                     }
-                    SendOutcome::NewSource(s) => {
-                        exit = PlayExit::NewSource(s);
+                    SendOutcome::NewSource(s, load_id) => {
+                        exit = PlayExit::NewSource(s, load_id);
                         break;
                     }
                     SendOutcome::Shutdown => {
@@ -1673,7 +1686,7 @@ fn play_source(
                                             source: source.clone(), buffer: buffer.clone(), title: replay_title.clone(),
                                         });
                                     }
-                                let _ = status_tx.send(Status::Finished);
+                                let _ = status_tx.send(Status::Finished { load_id });
                                 crate::ui::wake_status();
                                 return PlayExit::Eof;
                             }
@@ -1682,11 +1695,11 @@ fn play_source(
                         recv(cmds) -> msg => match msg {
                             Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
                             Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
-                            Ok(DecoderCmd::Load(s)) => return PlayExit::NewSource(s),
+                            Ok(DecoderCmd::Load(s, load_id)) => return PlayExit::NewSource(s, load_id),
                             Ok(DecoderCmd::SeekRelative(delta)) => {
                                 if seek_relative(&mut track, shared, delta, &mut pending, &mut eq, &mut resampler, &mut generation) {
                                     chunk_tx.begin(generation);
-                                    let _ = status_tx.send(Status::Seeked);
+                                    let _ = status_tx.send(Status::Seeked { load_id });
                                     crate::ui::wake_status();
                                     continue 'decode;
                                 }
@@ -1959,7 +1972,7 @@ mod tests {
         shared.set_device_channels(2);
         let (command_tx, command_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let audio = spawn(shared.clone(), command_rx, status_tx);
+        let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
         let mut receiver = audio.chunk_rx;
         let thread_id = audio.decoder.thread().id();
         let source = Source::File(path.to_string_lossy().into_owned());
@@ -1975,7 +1988,7 @@ mod tests {
             assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::OutputReady { epoch: ready } if ready == epoch));
             assert!(old_state.upgrade().is_none(), "acknowledgement releases the old pool");
             shared.bump_generation();
-            command_tx.send(DecoderCmd::Load(source.clone())).unwrap();
+            command_tx.send(DecoderCmd::Load(source.clone(), shared.load_id())).unwrap();
             assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { sample_rate: 48_000, channels: 1, .. }));
             let mut frames = 0;
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1991,7 +2004,7 @@ mod tests {
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         if receiver.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
                             audio.drained_tx.send(shared.generation()).unwrap();
-                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
                             break;
                         }
                     }
@@ -2010,20 +2023,26 @@ mod tests {
     #[ignore = "requires the saved local track/folder and an actual output device"]
     fn saved_track_device_hotswap_cycles_recover_on_wasapi() {
         use crate::broker::{Command as PlayerCommand, DecoderLink, Flow, Phase};
-        let saved = crate::config::load();
+        let mut saved = crate::config::load();
+        if let Ok(file) = std::env::var("KYOUKO_HOTSWAP_TEST_FILE") {
+            assert!(std::path::Path::new(&file).is_file(), "diagnostic override must be an existing local file");
+            saved.last_track = Some(file);
+            saved.last_folder = None;
+            saved.last_playlist_index = None;
+        }
         let shared = SharedState::new();
         restore_test_controls(&shared, &saved);
         shared.set_loop_enabled(saved.loop_enabled);
         let device = output_device(&shared).unwrap();
         let (command_tx, command_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let audio = spawn(shared.clone(), command_rx, status_tx);
+        let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
         let thread_id = audio.decoder.thread().id();
         let mut output = AudioOut::managed(Ok(device), audio.chunk_rx, audio.drained_tx, shared.clone(), audio.controls.clone());
         output.start_notifications();
         // No saver is installed: use the real saved selection/controls without
         // writing state.cfg or injecting any window/keyboard/mouse input.
-        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(command_tx, audio.controls.clone().hook()));
+        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(command_tx, command_rx.clone(), audio.controls.clone().hook()));
         broker.handle_command(PlayerCommand::RestoreState { last_folder: saved.last_folder,
             last_track: saved.last_track, last_playlist_index: saved.last_playlist_index });
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -2329,7 +2348,7 @@ mod tests {
         restore_test_controls(&shared, &saved);
         let (cmd_tx, cmd_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let audio = spawn(shared.clone(), cmd_rx, status_tx);
+        let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         for file in files {
             let source = Source::File(file.to_string_lossy().into_owned());
             let mut probe = open_track(&source, &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), None).unwrap();
@@ -2362,7 +2381,7 @@ mod tests {
             drop(probe);
             let started = std::time::Instant::now();
             shared.bump_generation();
-            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()))).unwrap();
+            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()), shared.load_id())).unwrap();
             let duration = match status_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                 Status::Opened { duration, sample_rate, channels, .. } => {
                     assert_eq!((sample_rate, channels as usize), first_spec.unwrap());
@@ -2385,7 +2404,7 @@ mod tests {
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
                             audio.drained_tx.send(shared.generation()).unwrap();
-                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
                             break;
                         }
                         assert!(started.elapsed() < Duration::from_secs(30), "local decoder stalled");
@@ -2415,13 +2434,13 @@ mod tests {
         let (device, config) = output_device(&shared).unwrap();
         let (cmd_tx, cmd_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let audio = spawn(shared.clone(), cmd_rx, status_tx);
+        let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         let counters = audio.chunk_rx.state.clone();
         let stream = open_output_stream(device, config, audio.chunk_rx, audio.drained_tx, shared.clone()).unwrap();
         for file in files {
             shared.bump_generation();
             shared.reset_playhead();
-            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()))).unwrap();
+            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()), shared.load_id())).unwrap();
             let duration = match status_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                 Status::Opened { duration, .. } => duration,
                 other => panic!("local source failed: {other:?}"),
@@ -2433,7 +2452,7 @@ mod tests {
             // hardware observation. Neither path injects UI input or saves config.
             let full_track = duration.filter(|duration| *duration <= Duration::from_secs(30));
             if let Some(duration) = full_track {
-                assert!(matches!(status_rx.recv_timeout(duration + Duration::from_secs(5)).unwrap(), Status::Finished));
+                assert!(matches!(status_rx.recv_timeout(duration + Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
             } else {
                 thread::sleep(Duration::from_secs(10));
             }
@@ -2525,7 +2544,7 @@ mod tests {
             shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
             chunk_tx: &chunk_tx, drained_rx: &drained_rx,
             child_slot: &Arc::new(Mutex::new(None)), buffer_slot: &Arc::new(Mutex::new(None)),
-        }, &mut cache, source));
+        }, &mut cache, source, decoder_shared.load_id()));
         assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { .. }));
         let first = chunk_rx.queue.recv_timeout(Duration::from_secs(5)).unwrap();
         // No drain notification is sent. The complete short WAV reaches the
@@ -2533,7 +2552,7 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
         shared.set_playhead_frames(2400);
         cmd_tx.send(DecoderCmd::SeekRelative(-0.05)).unwrap();
-        assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Seeked));
+        assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Seeked { .. }));
         let replayed = chunk_rx.queue.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(first.samples(), replayed.samples());
         assert_ne!(first.generation, replayed.generation);
@@ -2589,7 +2608,7 @@ mod tests {
                     shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
                     chunk_tx: &chunk_tx, drained_rx: &drained_rx,
                     child_slot: &child_slot, buffer_slot: &buffer_slot,
-                }, &mut cache, source.clone()), PlayExit::Eof));
+                }, &mut cache, source.clone(), decoder_shared.load_id()), PlayExit::Eof));
                 assert!(child_slot.lock().unwrap().is_none(), "repeat must not spawn yt-dlp");
                 assert!(buffer_slot.lock().unwrap().is_none(), "repeat must not spawn a downloader");
             }
@@ -2598,7 +2617,7 @@ mod tests {
         for _ in 0..2 {
             assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
                 Status::Opened { title: Some(title), .. } if title == "RAM title"));
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
         }
         decoder.join().unwrap();
         done.store(true, Ordering::Release);
@@ -2720,7 +2739,7 @@ mod tests {
                 shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
                 chunk_tx: &chunk_tx, drained_rx: &drained_rx,
                 child_slot: &Arc::new(Mutex::new(None)), buffer_slot: &Arc::new(Mutex::new(None)),
-            }, &mut cache, source));
+            }, &mut cache, source, decoder_shared.load_id()));
             let duration = match status_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
                 Status::Opened { sample_rate: 48_000, channels: 1, duration, .. } => duration,
                 other => panic!("source must report its actual PCM format: {other:?}"),
@@ -2741,7 +2760,7 @@ mod tests {
                 }
             }
             assert!(matches!(decoder.join().unwrap(), PlayExit::Eof));
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished));
+            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
             rounds.push((duration, pcm));
         }
         assert_eq!(rounds[0], rounds[1], "sample-entry hints must not change frame count, samples or duration");
@@ -2847,9 +2866,9 @@ mod tests {
         shared.set_device_channels(2);
         let (cmd_tx, cmd_rx) = bounded(8);
         let (status_tx, status_rx) = bounded(16);
-        let audio = spawn(shared.clone(), cmd_rx, status_tx);
+        let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
-            cmd_tx.clone(), audio.controls.clone().hook(),
+            cmd_tx.clone(), cmd_rx.clone(), audio.controls.clone().hook(),
         ));
         let result = (|| -> Result<(), String> {
             // Changing a live, partially downloaded stream must unblock the
@@ -2915,13 +2934,14 @@ mod tests {
         let (_drained_tx, drained_rx) = bounded(2);
         let child_slot = Arc::new(Mutex::new(None));
         let decoder_shared = shared.clone();
+        let broker_cmd_rx = cmd_rx.clone();
         let decoder = thread::spawn(move || {
             run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, AudioControls {
                 child_slot, buffer_slot: Arc::new(Mutex::new(None)), output_slot: Arc::new(Mutex::new(None)),
             });
         });
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
-            cmd_tx.clone(), Arc::new(|| {}),
+            cmd_tx.clone(), broker_cmd_rx, Arc::new(|| {}),
         ));
         broker.handle_command(PlayerCommand::Load {
             source: Source::File(dir.to_string_lossy().into_owned()), paused: false,

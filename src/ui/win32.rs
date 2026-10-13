@@ -62,7 +62,7 @@ use crate::audio::AudioOut;
 
 use super::render::{Renderer,
     TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position};
-use super::{set_pump_hwnd, wake_broker, CMD_TX, WM_APP_BROKER, WM_APP_STATUS, WM_APP_OUTPUT};
+use super::{set_pump_hwnd, WM_APP_BROKER, WM_APP_STATUS, WM_APP_OUTPUT};
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status, TrackList};
 use crate::{log_debug, log_error, log_info, log_warn};
 
@@ -415,10 +415,8 @@ pub fn run(
         );
 
         // Drain anything that arrived during window creation, then sync.
-        if !drain_commands(&mut *state) {
-            drain_statuses(&mut *state);
-            sync(&mut *state);
-        }
+        if drain_commands(&mut *state) || drain_statuses(&mut *state) { destroy(&mut *state); }
+        else { sync(&mut *state); }
 
         // The pump. GetMessageW parks in the kernel; there is no idle path.
         let mut msg = MSG::default();
@@ -432,6 +430,12 @@ pub fn run(
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            // Drain native input at the outer message boundary: no recursive
+            // broker dispatch, queue-capacity loss, or unbounded input backlog.
+            if super::has_local() && IsWindow(Some(hwnd)).as_bool() {
+                if drain_commands(&mut *state) { destroy(&mut *state); }
+                else { sync(&mut *state); }
+            }
         }
 
         // Reclaim state: Renderer::drop frees the GDI resources.
@@ -715,8 +719,12 @@ fn sync(s: &mut UiState) {
 
 /// true = a Quit was processed → caller must destroy the window.
 fn drain_commands(s: &mut UiState) -> bool {
+    if super::take_quit_request() {
+        return s.broker.handle_command(Command::Quit) == Flow::Exit;
+    }
+    s.broker.poll_background();
     loop {
-        match s.cmd_rx.try_recv() {
+        match super::take_local().map(Ok).unwrap_or_else(|| s.cmd_rx.try_recv()) {
             Ok(Command::ToggleOverlay) => toggle_visible(s),
             Ok(cmd) => {
                 if s.broker.handle_command(cmd) == Flow::Exit {
@@ -732,11 +740,15 @@ fn drain_commands(s: &mut UiState) -> bool {
     }
 }
 
-fn drain_statuses(s: &mut UiState) {
+fn drain_statuses(s: &mut UiState) -> bool {
     loop {
         match s.status_rx.try_recv() {
             Ok(st) => s.broker.handle_status(st),
-            Err(_) => return,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => {
+                s.broker.handle_command(Command::Quit);
+                return true;
+            }
         }
     }
 }
@@ -774,10 +786,7 @@ fn toggle_visible(s: &mut UiState) {
 /// Window and hotkey interactions share the broker command channel. The
 /// broker stays the single decision point, with one wake per interaction.
 fn post_command(cmd: Command) {
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(cmd);
-    }
-    wake_broker();
+    super::queue_local(cmd);
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,8 +1084,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_STATUS => {
-                drain_statuses(s);
-                sync(s);
+                if drain_statuses(s) { destroy(s); } else { sync(s); }
                 LRESULT(0)
             }
             WM_APP_OUTPUT => {
@@ -1288,10 +1296,9 @@ mod tests {
         }
         let shared = SharedState::new();
         let (decoder_tx, decoder_rx) = crossbeam_channel::bounded(8);
-        let (command_tx, cmd_rx) = crossbeam_channel::bounded(32);
+        let (_command_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
-        CMD_TX.set(command_tx).unwrap();
-        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, Arc::new(|| {})));
+        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})));
         let renderer = Renderer::new(broker.view()).unwrap();
         let (width, height) = renderer.size();
         let mut state = Box::new(UiState {
@@ -1322,12 +1329,14 @@ mod tests {
             assert!(GetMessageW(&mut message, Some(hwnd), WM_QUIT_FINISH_CLICK, WM_QUIT_FINISH_CLICK).0 > 0);
             DispatchMessageW(&message);
             assert!(IsWindow(Some(hwnd)).as_bool(), "completion only queues graceful Quit");
-            assert_eq!(state.cmd_rx.len(), 1);
+            assert!(state.cmd_rx.is_empty());
+            assert!(matches!(super::super::take_local(), Some(Command::Quit)));
             // Duplicate completion messages cannot send another Quit.
             PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0)).unwrap();
             assert!(GetMessageW(&mut message, Some(hwnd), WM_QUIT_FINISH_CLICK, WM_QUIT_FINISH_CLICK).0 > 0);
             DispatchMessageW(&message);
-            assert_eq!(state.cmd_rx.len(), 1);
+            assert!(super::super::take_local().is_none());
+            super::super::queue_local(Command::Quit);
             assert!(drain_commands(&mut state));
             assert!(matches!(decoder_rx.try_recv(), Ok(crate::broker::DecoderCmd::Shutdown)));
             destroy(&mut state);
@@ -1425,7 +1434,7 @@ mod tests {
         let (decoder_tx, decoder_rx) = crossbeam_channel::bounded(8);
         let (command_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
-        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, Arc::new(|| {})));
+        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})));
         let renderer = Renderer::new(broker.view()).unwrap();
         let mut state = Box::new(UiState {
             hwnd: HWND::default(), broker, cmd_rx, status_rx, shared, renderer,

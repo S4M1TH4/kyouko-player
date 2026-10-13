@@ -14,14 +14,11 @@ use std::path::Path;
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering,
 };
-use crossbeam_channel::Sender;
-use std::process::Stdio;
-use std::sync::Arc;
-use std::thread::self;
+use crossbeam_channel::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::config::PersistedState;
-use crate::ui::CMD_TX;
 use crate::{log_debug, log_error, log_info, log_warn};
 
 // ── Audio/DSP constants ──────────────────────────────────────────────────────
@@ -110,7 +107,7 @@ pub fn playlist_index_of(url: &str) -> Option<usize> {
 
 /// Keep one title per actual playlist index, including multiline titles and
 /// unavailable entries. Plain line splitting can shift every subsequent jump.
-fn parse_playlist_titles(raw: &[u8]) -> Result<Vec<String>, String> {
+pub(crate) fn parse_playlist_titles(raw: &[u8]) -> Result<Vec<String>, String> {
     let text = std::str::from_utf8(raw).map_err(|e| e.to_string())?;
     let mut titles = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
@@ -357,9 +354,9 @@ pub enum Command {
     /// expands folders, filters to supported media, merges and sorts
     /// newest-first into the local queue.
     LoadDropped(Vec<String>),
-    /// A detached `--flat-playlist` fetch resolved a playlist's titles.
-    /// Carries the playlist URL so a stale fetch can be dropped.
-    YtQueueResolved { url: String, titles: Vec<String> },
+    /// An owned metadata job resolved titles. Request identity and URL fence
+    /// completion after cancellation and repeated loads of the same playlist.
+    YtQueueResolved { url: String, request_id: u64, titles: Vec<String> },
     /// Jump straight to a queue track. Carries the user's 1-BASED number —
     /// the broker converts and validates it against the queue bounds.
     JumpToTrack(usize),
@@ -386,7 +383,7 @@ pub enum Command {
 /// parked on this channel, not a service with a rich API.
 #[derive(Debug)]
 pub enum DecoderCmd {
-    Load(Source),
+    Load(Source, u64),
     /// Jump the playhead by a signed offset in seconds. Executed on the
     /// decoder thread; ignored while no track is open.
     SeekRelative(f64),
@@ -398,12 +395,13 @@ pub enum DecoderCmd {
 }
 
 /// Decoder → broker. Rare events; the bounded channel cannot deadlock because
-/// the broker selects on both inputs every iteration.
+/// UI decoder sends are nonblocking; status backpressure cannot block the pump.
 #[derive(Debug)]
 pub enum Status {
     /// The one decoder has installed the replacement device's PCM pool.
     OutputReady { epoch: u64 },
     Opened {
+        load_id: u64,
         source: Source,
         /// Actual decoded PCM rate; SharedState keeps the separate device rate.
         sample_rate: u32,
@@ -414,11 +412,11 @@ pub enum Status {
     },
     /// The playhead moved (seek); the presentation layer refreshes its view.
     /// The new position is already in SharedState.
-    Seeked,
+    Seeked { load_id: u64 },
     /// A recovery seek could not be honored; replay may resume at the start.
-    SeekFailed,
+    SeekFailed { load_id: u64 },
     /// Natural end of stream (not Stop).
-    Finished,
+    Finished { load_id: u64 },
     /// Generation identifies the failed attempt, so obsolete failures after
     /// Stop/Skip/retry cannot restart playback or consume the retry budget.
     Failed { source: Source, reason: String, generation: u64 },
@@ -478,6 +476,7 @@ pub struct SharedState {
     loop_enabled: AtomicBool,
     /// Bumped on every Load. Chunks from a dead generation are discarded.
     generation: AtomicU64,
+    load_id: AtomicU64,
     eq_enabled: AtomicBool,
     /// Set (Release) when a gain changes; decoder rebuilds biquad coefficients
     /// once (Acquire), then clears it. Coeff math only ever runs on change.
@@ -496,6 +495,7 @@ impl SharedState {
             device_channels: AtomicU32::new(0),
             loop_enabled: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            load_id: AtomicU64::new(0),
             eq_enabled: AtomicBool::new(true),
             eq_dirty: AtomicBool::new(true),
             eq_gains_cdb: std::array::from_fn(|_| AtomicI32::new(0)),
@@ -513,6 +513,7 @@ impl SharedState {
         f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
     }
     pub fn set_volume(&self, v: f32) {
+        if !v.is_finite() { return; }
         self.volume_bits
             .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
@@ -525,6 +526,7 @@ impl SharedState {
     }
     /// Returns the clamped value actually stored.
     pub fn set_eq_gain(&self, band: usize, gain_db: f32) -> f32 {
+        if !gain_db.is_finite() { return self.eq_gain_db(band); }
         let clamped = gain_db.clamp(-EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB);
         self.eq_gains_cdb[band]
             .store((clamped * 100.0).round() as i32, Ordering::Relaxed);
@@ -594,6 +596,9 @@ impl SharedState {
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
+
+    pub fn load_id(&self) -> u64 { self.load_id.load(Ordering::Acquire) }
+    fn invalidate_load(&self) { self.load_id.fetch_add(1, Ordering::AcqRel); }
 }
 
 // ── Broker ───────────────────────────────────────────────────────────────────
@@ -622,21 +627,47 @@ pub enum Flow {
 #[derive(Clone)]
 pub struct DecoderLink {
     tx: Sender<DecoderCmd>,
+    queued: Receiver<DecoderCmd>,
+    shutdown: Arc<Mutex<bool>>,
     interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DecoderLink {
-    pub fn with_interrupt(tx: Sender<DecoderCmd>, interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { tx, interrupt: Some(interrupt) }
+    pub fn with_interrupt(tx: Sender<DecoderCmd>, queued: Receiver<DecoderCmd>, interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
+        assert!(tx.capacity().is_some_and(|capacity| capacity >= 2));
+        Self { tx, queued, shutdown: Arc::new(Mutex::new(false)), interrupt: Some(interrupt) }
     }
 
     pub fn send(&self, cmd: DecoderCmd) {
-        if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown | DecoderCmd::Load(_))
+        if matches!(&cmd, DecoderCmd::SeekRelative(delta) if !delta.is_finite()) { return; }
+        if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown | DecoderCmd::Load(_, _))
             && let Some(f) = &self.interrupt {
                 f();
             }
-        if let Err(e) = self.tx.send(cmd) {
-            log_error!("BROKER", "decoder channel dead: {e}");
+        let mut shutdown = self.shutdown.lock().unwrap_or_else(|e| e.into_inner());
+        if *shutdown { return; }
+        *shutdown = matches!(cmd, DecoderCmd::Shutdown);
+        if *shutdown { for _ in self.queued.try_iter() {} }
+        if let Err(crossbeam_channel::TrySendError::Full(cmd)) = self.tx.try_send(cmd) {
+            // The broker is never allowed to wait on the decoder: it may be
+            // blocked reporting status to this same UI. Coalesce only when full.
+            let mut latest = None;
+            let mut seek = 0.0;
+            for command in self.queued.try_iter().chain(std::iter::once(cmd)) {
+                match command {
+                    DecoderCmd::SeekRelative(delta) => seek += delta,
+                    DecoderCmd::Shutdown => { latest = Some(DecoderCmd::Shutdown); seek = 0.0; break; }
+                    control => { latest = Some(control); seek = 0.0; }
+                }
+            }
+            if let Some(command) = latest {
+                let stopping = matches!(command, DecoderCmd::Stop | DecoderCmd::Shutdown);
+                self.tx.try_send(command).expect("single serialized decoder producer has room after coalescing");
+                if stopping { return; }
+            }
+            if seek != 0.0 && seek.is_finite() {
+                self.tx.try_send(DecoderCmd::SeekRelative(seek)).expect("coalesced decoder queue uses at most two slots");
+            }
         }
     }
 }
@@ -652,6 +683,12 @@ pub struct TrackList {
 
 /// The presentation layer calls this single-owner state machine.
 pub struct Broker {
+    background_tx: Sender<()>,
+    background_rx: Receiver<()>,
+    metadata_enabled: bool,
+    yt_request: u64,
+    #[cfg(windows)]
+    playlist_job: Option<crate::playlist::PlaylistJob>,
     shared: Arc<SharedState>,
     decoder: DecoderLink,
     track: Option<TrackMeta>,
@@ -686,7 +723,7 @@ pub struct Broker {
     local_queue: Vec<Source>,
     /// Zero-based position in the active local or streaming playlist.
     queue_index: Option<usize>,
-    /// YouTube playlist titles resolved by a detached `--flat-playlist`
+    /// YouTube playlist titles resolved by an owned `--flat-playlist`
     /// fetch, plus the playlist URL they belong to. `Some(url)` with an
     /// empty vec = the fetch is still in flight.
     yt_queue: Vec<String>,
@@ -700,7 +737,11 @@ pub struct Broker {
 
 impl Broker {
     pub fn new(shared: Arc<SharedState>, decoder: DecoderLink) -> Self {
+        let (background_tx, background_rx) = crossbeam_channel::bounded(1);
         let mut broker = Self {
+            background_tx, background_rx, metadata_enabled: false, yt_request: 0,
+            #[cfg(windows)]
+            playlist_job: None,
             shared,
             decoder,
             track: None,
@@ -735,6 +776,30 @@ impl Broker {
     pub fn with_saver(mut self, saver: Arc<dyn Fn(PersistedState) + Send + Sync>) -> Self {
         self.saver = Some(saver);
         self
+    }
+
+    pub fn with_playlist_fetching(mut self) -> Self { self.metadata_enabled = cfg!(windows); self }
+
+    #[cfg(any(not(windows), debug_assertions))]
+    pub fn background_events(&self) -> Receiver<()> { self.background_rx.clone() }
+
+    pub fn poll_background(&mut self) {
+        for _ in self.background_rx.try_iter() {}
+        #[cfg(windows)]
+        if let Some(result) = self.playlist_job.as_ref().and_then(|job| job.take_result()) {
+            self.playlist_job = None;
+            let titles = result.titles.unwrap_or_else(|error| {
+                log_warn!("TITLE", "{error}"); Vec::new()
+            });
+            self.handle_command(Command::YtQueueResolved { url: result.url, request_id: result.request_id, titles });
+        }
+    }
+
+    fn cancel_playlist(&mut self) {
+        self.yt_request = self.yt_request.wrapping_add(1);
+        #[cfg(windows)]
+        { self.playlist_job = None; }
+        self.yt_queue_loading = false;
     }
 
     /// Current persistent-worthy state.
@@ -785,7 +850,8 @@ impl Broker {
                 self.local_queue = batch.files;
                 self.queue_index = Some(index);
                 self.yt_queue.clear();
-                self.yt_queue_url = None;
+                self.cancel_playlist();
+                        self.yt_queue_url = None;
                 log_info!(
                     "BROKER",
                     "restored folder queue: {} tracks from {folder}, selected {}",
@@ -805,6 +871,9 @@ impl Broker {
     /// The common load tail - everything a Load does once queue management
     /// has settled which source to open.
     fn begin_load(&mut self, source: Source, paused: bool) {
+        if let Source::Youtube { url, playlist_index: Some(_), .. } = &source {
+            self.ensure_yt_queue_fetch(url);
+        }
         self.seek_after_open = None;
         self.resume_after_seek = None;
         if let Source::Youtube { playlist_index: Some(index), .. } = &source {
@@ -817,6 +886,7 @@ impl Broker {
     /// Retry uses the same load tail without resetting its per-track budget
     /// or re-running queue ingestion.
     fn start_attempt(&mut self, source: Source, paused: bool) {
+        self.shared.invalidate_load();
         log_info!(
             "BROKER",
             "load{}: {source}",
@@ -836,7 +906,7 @@ impl Broker {
             return;
         }
         self.set_phase(Phase::Loading, "load requested");
-        self.send_decoder(DecoderCmd::Load(source));
+        self.send_decoder(DecoderCmd::Load(source, self.shared.load_id()));
     }
 
     fn playback_failed(&mut self, source: Source, reason: String, generation: u64) {
@@ -939,50 +1009,20 @@ impl Broker {
     }
 
     /// Make sure a flat-playlist metadata fetch is in flight for `url`.
-    /// Spawns a detached, simulate-only yt-dlp (no stream resolution, so it
-    /// self-exits after printing the index — no crawler) that reports back
-    /// through `Command::YtQueueResolved`. Skipped when the fetch for this
-    /// exact playlist is already in flight or resolved.
+    /// Own a bounded metadata job, cancelling the previous request. Completion
+    /// uses a separate result mailbox and wake, with no blocking command send.
     fn ensure_yt_queue_fetch(&mut self, url: &str) {
-        if self.yt_queue_url.as_deref() == Some(url) {
-            return;
-        }
+        if self.yt_queue_url.as_deref() == Some(url) && (!self.yt_queue.is_empty() || self.yt_queue_loading) { return; }
+        self.cancel_playlist();
         self.yt_queue.clear();
         self.yt_queue_url = Some(url.to_string());
-        self.yt_queue_loading = true;
-        let Some(tx) = CMD_TX.get().cloned() else {
-            self.yt_queue_loading = false;
-            log_warn!("BROKER", "no command channel - playlist listing unavailable");
-            return;
-        };
-        let url = url.to_string();
-        let spawned = thread::Builder::new()
-            .name("kyouko-ytlist".into())
-            .spawn(move || {
-                let output = crate::process::command("yt-dlp")
-                    .args(["--flat-playlist", "--encoding", "utf-8", "--print",
-                        "%(playlist_index)s\t%(title|Unavailable track)j", &url])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .output();
-                let titles = match output {
-                    Ok(out) if out.status.success() => {
-                        match parse_playlist_titles(&out.stdout) {
-                            Ok(titles) => titles,
-                            Err(error) => { log_warn!("TITLE", "playlist titles could not be decoded: {error}"); Vec::new() }
-                        }
-                    }
-                    Ok(_) => { log_warn!("TITLE", "flat-playlist fetch exited nonzero"); Vec::new() }
-                    Err(e) => { log_warn!("TITLE", "flat-playlist fetch failed: {e}"); Vec::new() }
-                };
-                log_info!("TITLE", "playlist resolved: {} videos", titles.len());
-                let _ = tx.send(Command::YtQueueResolved { url, titles });
-                crate::ui::wake_broker();
-            });
-        if let Err(e) = spawned {
-            self.yt_queue_loading = false;
-            log_warn!("BROKER", "playlist fetch thread failed to spawn: {e}");
+        self.yt_queue_loading = self.metadata_enabled;
+        #[cfg(windows)]
+        if self.metadata_enabled {
+            match crate::playlist::PlaylistJob::start(url.to_string(), self.yt_request, self.background_tx.clone()) {
+                Ok(job) => self.playlist_job = Some(job),
+                Err(error) => { self.yt_queue_loading = false; log_warn!("TITLE", "{error}"); }
+            }
         }
     }
 
@@ -1090,6 +1130,7 @@ impl Broker {
     pub fn audio_output_lost(&mut self) {
         self.output_epoch = None;
         if self.output_unavailable { return; }
+        self.shared.invalidate_load();
         let phase = self.shared.phase();
         self.output_resume = phase == Phase::Playing || (phase == Phase::Loading && !self.stage_paused);
         self.output_reload = phase != Phase::Stopped;
@@ -1161,6 +1202,7 @@ impl Broker {
                         self.local_queue = batch.files;
                         self.queue_index = Some(0);
                         self.yt_queue.clear();
+                        self.cancel_playlist();
                         self.yt_queue_url = None;
                         self.persist();
                         let first = self.local_queue[0].clone();
@@ -1228,7 +1270,8 @@ impl Broker {
                                 self.queue_index = Some(0);
                                 // A folder load supersedes any YouTube listing.
                                 self.yt_queue.clear();
-                                self.yt_queue_url = None;
+                                self.cancel_playlist();
+                        self.yt_queue_url = None;
                                 self.persist();
                                 source = self.local_queue[0].clone();
                                 queue_managed = true;
@@ -1253,7 +1296,8 @@ impl Broker {
                             self.local_queue = vec![source.clone()];
                             self.queue_index = Some(0);
                             self.yt_queue.clear();
-                            self.yt_queue_url = None;
+                            self.cancel_playlist();
+                        self.yt_queue_url = None;
                         }
                         Source::Youtube { url, playlist_index: Some(_), .. } => {
                             self.local_queue.clear();
@@ -1266,7 +1310,8 @@ impl Broker {
                             self.local_queue.clear();
                             self.queue_index = None;
                             self.yt_queue.clear();
-                            self.yt_queue_url = None;
+                            self.cancel_playlist();
+                        self.yt_queue_url = None;
                         }
                     }
                 }
@@ -1291,7 +1336,8 @@ impl Broker {
             }
             Command::NextTrack => self.navigate(1),
             Command::PrevTrack => self.navigate(-1),
-            Command::YtQueueResolved { url, titles } => {
+            Command::YtQueueResolved { url, request_id, titles } => {
+                if request_id != self.yt_request { return Flow::Continue; }
                 // Only accept the fetch for the still-current playlist; a
                 // stale fetch (superseded by another load) is dropped.
                 if self.yt_queue_url.as_deref() == Some(url.as_str()) {
@@ -1394,6 +1440,8 @@ impl Broker {
                 p => log_warn!("BROKER", "toggle ignored while {p}"),
             },
             Command::Stop => {
+                self.shared.invalidate_load();
+                self.cancel_playlist();
                 self.output_reload = false;
                 self.output_resume = false;
                 self.output_position = 0.0;
@@ -1409,6 +1457,7 @@ impl Broker {
                 self.set_phase(Phase::Stopped, "stop");
             }
             Command::SetVolume(v) => {
+                if !v.is_finite() { return Flow::Continue; }
                 let v = v.clamp(0.0, 1.0);
                 self.shared.set_volume(v);
                 log_info!("BROKER", "volume: {:.0}%", v * 100.0);
@@ -1421,6 +1470,7 @@ impl Broker {
                 return self.handle_command(Command::SetVolume(self.shared.volume() + points as f32 / 100.0));
             }
             Command::EqGain { band, gain_db } => {
+                if !gain_db.is_finite() { return Flow::Continue; }
                 match band {
                     Some(b) if b < EQ_BANDS => {
                         let stored = self.shared.set_eq_gain(b, gain_db);
@@ -1461,6 +1511,8 @@ impl Broker {
                 log_debug!("BROKER", "window toggle is presentation-side");
             }
             Command::Quit => {
+                self.shared.invalidate_load();
+                self.cancel_playlist();
                 self.output_epoch = None;
                 self.output_reload = false;
                 self.output_resume = false;
@@ -1481,9 +1533,18 @@ impl Broker {
     }
 
     pub fn handle_status(&mut self, st: Status) {
+        let load_id = match &st {
+            Status::Opened { load_id, .. } | Status::Finished { load_id }
+                | Status::Seeked { load_id } | Status::SeekFailed { load_id } => Some(*load_id),
+            _ => None,
+        };
+        if load_id.is_some_and(|id| id != self.shared.load_id()) {
+            log_debug!("BROKER", "obsolete load status ignored: {st:?}");
+            return;
+        }
         log_debug!("BROKER", "status: {st:?}");
         match st {
-            Status::Opened { source, sample_rate, channels, title, duration } => {
+            Status::Opened { source, sample_rate, channels, title, duration, .. } => {
                 if self.output_unavailable { return; }
                 if self.pending_source.as_ref().is_some_and(|pending| *pending != source) {
                     log_debug!("BROKER", "obsolete Opened ignored after a different track was selected: {source}");
@@ -1546,7 +1607,7 @@ impl Broker {
                     }
                 }
             }
-            Status::Finished => {
+            Status::Finished { .. } => {
                 if self.output_unavailable { return; }
                 if self.track.is_none() {
                     log_debug!("BROKER", "obsolete Finished ignored while no selected track is open");
@@ -1595,7 +1656,7 @@ impl Broker {
                 // including a repeat-toggle race at the EOF boundary.
                 self.handle_command(Command::Stop);
             }
-            Status::Seeked | Status::SeekFailed => {
+            Status::Seeked { .. } | Status::SeekFailed { .. } => {
                 if self.output_unavailable { return; }
                 if let Some(resume) = self.resume_after_seek.take() {
                     self.set_phase(if resume { Phase::Playing } else { Phase::Paused }, "audio output restored");
@@ -1724,7 +1785,7 @@ mod tests {
         let sink: Arc<Mutex<Vec<PersistedState>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_for_saver = Arc::clone(&sink);
         let broker = Broker::new(shared, DecoderLink::with_interrupt(
-            tx,
+            tx, rx.clone(),
             Arc::new(|| {}),
         ))
         .with_saver(Arc::new(move |st| {
@@ -1734,7 +1795,7 @@ mod tests {
     }
 
     fn open_youtube(broker: &mut Broker) {
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::Youtube {
                 url: "https://youtu.be/x".into(),
                 format: "140".into(),
@@ -1747,13 +1808,149 @@ mod tests {
         });
     }
 
+    fn opened(source: Source, load_id: u64) -> Status {
+        Status::Opened { source, load_id, sample_rate: 48_000, channels: 2,
+            title: None, duration: Some(Duration::from_secs(60)) }
+    }
+
+    #[test]
+    fn stopped_and_reloaded_same_source_rejects_every_late_load_event() {
+        let (mut broker, _, receiver) = broker_with_sink();
+        let source = Source::File("same.wav".into());
+        broker.handle_command(Command::Load { source: source.clone(), paused: false });
+        let old = broker.shared.load_id();
+        broker.handle_command(Command::Stop);
+        broker.take_refresh();
+        for event in [opened(source.clone(), old), Status::Finished { load_id: old },
+            Status::Seeked { load_id: old }, Status::SeekFailed { load_id: old }] {
+            broker.handle_status(event);
+        }
+        assert_eq!(broker.shared.phase(), Phase::Stopped);
+        assert!(broker.track.is_none());
+        assert!(broker.take_refresh().is_none());
+        broker.handle_command(Command::Load { source: source.clone(), paused: false });
+        let latest = broker.shared.load_id();
+        broker.handle_status(opened(source.clone(), old));
+        assert_eq!(broker.shared.phase(), Phase::Loading);
+        broker.handle_status(opened(source, latest));
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        assert_eq!(receiver.len(), 3);
+    }
+
+    #[test]
+    fn old_eof_cannot_advance_a_new_playlist_selection_and_pcm_seek_keeps_load_identity() {
+        let (mut broker, _, receiver) = broker_with_sink();
+        let a = Source::File("a.wav".into());
+        let b = Source::File("b.wav".into());
+        broker.local_queue = vec![a.clone(), b.clone()];
+        broker.queue_index = Some(0);
+        broker.begin_load(a.clone(), false);
+        let old = broker.shared.load_id();
+        broker.handle_status(opened(a, old));
+        broker.handle_command(Command::JumpToTrack(2));
+        let current = broker.shared.load_id();
+        broker.handle_status(opened(b.clone(), current));
+        broker.handle_status(Status::Finished { load_id: old });
+        assert_eq!(broker.queue_index, Some(1));
+        assert_eq!(broker.track.as_ref().unwrap().source, b);
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        broker.shared.bump_generation();
+        broker.shared.set_phase(Phase::Paused);
+        broker.resume_after_seek = Some(true);
+        broker.handle_status(Status::Seeked { load_id: current });
+        assert_eq!(broker.shared.phase(), Phase::Playing);
+        assert_eq!(broker.shared.load_id(), current);
+        assert_eq!(receiver.len(), 2);
+    }
+
+    #[test]
+    fn full_decoder_pipe_coalesces_latest_load_and_seeks_and_keeps_shutdown_final() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
+        link.send(DecoderCmd::Load(Source::File("a.wav".into()), 1));
+        link.send(DecoderCmd::SeekRelative(10.0));
+        link.send(DecoderCmd::Load(Source::File("b.wav".into()), 2));
+        link.send(DecoderCmd::SeekRelative(2.0));
+        link.send(DecoderCmd::SeekRelative(3.0));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::File(path), 2)) if path == "b.wav"));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::SeekRelative(5.0))));
+        link.send(DecoderCmd::Stop);
+        link.send(DecoderCmd::Load(Source::File("c.wav".into()), 3));
+        link.send(DecoderCmd::Shutdown);
+        link.send(DecoderCmd::Load(Source::File("late.wav".into()), 4));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Shutdown)));
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn saturated_status_and_command_channels_do_not_block_ui_shutdown() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let consumer = std::thread::spawn(move || {
+            status_tx.send(Status::OutputReady { epoch: 1 }).unwrap();
+            ready_tx.send(()).unwrap();
+            status_tx.send(Status::OutputReady { epoch: 2 }).unwrap();
+            assert!(matches!(rx.recv().unwrap(), DecoderCmd::Shutdown));
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let producer = std::thread::spawn(move || {
+            for id in 0..2000 {
+                link.send(DecoderCmd::Load(Source::File("burst.wav".into()), id));
+                link.send(DecoderCmd::SeekRelative(5.0));
+            }
+            link.send(DecoderCmd::Shutdown);
+            done_tx.send(()).unwrap();
+        });
+        // Status remains full while all control commands, including Quit's
+        // Shutdown, are issued. A blocking sender deadlocks here.
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        status_rx.recv().unwrap();
+        producer.join().unwrap();
+        consumer.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_or_superseded_same_url_metadata_cannot_replace_the_active_titles() {
+        let (mut broker, _, _receiver) = broker_with_sink();
+        let url = "https://youtube.com/playlist?list=A";
+        broker.ensure_yt_queue_fetch(url);
+        let old = broker.yt_request;
+        broker.ensure_yt_queue_fetch("https://youtube.com/playlist?list=B");
+        broker.ensure_yt_queue_fetch(url);
+        let current = broker.yt_request;
+        broker.handle_command(Command::YtQueueResolved { url: url.into(), request_id: old, titles: vec!["Old".into()] });
+        assert!(broker.yt_queue.is_empty());
+        broker.handle_command(Command::YtQueueResolved { url: url.into(), request_id: current, titles: vec!["Current".into()] });
+        assert_eq!(broker.yt_queue, ["Current"]);
+        broker.handle_command(Command::Stop);
+        broker.handle_command(Command::YtQueueResolved { url: url.into(), request_id: current, titles: vec!["Late".into()] });
+        assert_eq!(broker.yt_queue, ["Current"]);
+    }
+
+    #[test]
+    fn nonfinite_controls_do_not_mutate_audio_state_or_persist_invalid_settings() {
+        let (mut broker, saves, _receiver) = broker_with_sink();
+        let original = broker.persist_snapshot();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            broker.handle_command(Command::SetVolume(value));
+            broker.handle_command(Command::EqGain { band: None, gain_db: value });
+            broker.shared.set_volume(value);
+            broker.shared.set_eq_gain(0, value);
+        }
+        assert_eq!(broker.persist_snapshot(), original);
+        assert!(saves.lock().unwrap().is_empty());
+    }
+
     fn device_test_broker(playing: bool) -> (Broker, crossbeam_channel::Receiver<DecoderCmd>, Source) {
         let (mut broker, _, receiver) = broker_with_sink();
         let source = Source::File("C:\\media\\second.mp4".into());
         broker.shared.set_sample_rate(48_000);
         broker.handle_command(Command::Load { source: source.clone(), paused: !playing });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
-        broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
             channels: 1, title: Some("Second".into()), duration: Some(Duration::from_secs(60)) });
         broker.local_queue = vec![Source::File("C:\\media\\first.mp4".into()), source.clone()];
         broker.queue_index = Some(1);
@@ -1774,8 +1971,8 @@ mod tests {
                 assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
                 broker.audio_output_lost();
                 assert!(receiver.try_recv().is_err(), "duplicate loss must not queue more stops");
-                broker.handle_status(Status::Finished);
-                broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+                broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
+                broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
                     channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
                 assert_eq!(broker.shared.phase(), Phase::Paused, "retired statuses cannot resume or advance");
                 let epoch = 2 + cycle * 2;
@@ -1786,13 +1983,13 @@ mod tests {
                 broker.handle_status(Status::OutputReady { epoch: epoch + 100 });
                 assert!(receiver.try_recv().is_err());
                 broker.handle_status(Status::OutputReady { epoch });
-                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded)) if loaded == source));
-                broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded, _)) if loaded == source));
+                broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
                     channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
                 assert_eq!(broker.shared.phase(), Phase::Paused, "seek completes before output resumes");
                 assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(delta)) if (delta - position).abs() < 1e-6));
                 broker.shared.set_playhead_frames((position * rate as f64) as u64);
-                broker.handle_status(Status::Seeked);
+                broker.handle_status(Status::Seeked { load_id: broker.shared.load_id() });
                 assert_eq!(broker.shared.phase(), if playing { Phase::Playing } else { Phase::Paused });
                 assert_eq!(broker.queue_index, Some(1));
                 assert_eq!(broker.persist_snapshot(), snapshot);
@@ -1810,8 +2007,8 @@ mod tests {
         broker.audio_output_prepared(4);
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
         broker.handle_status(Status::OutputReady { epoch: 4 });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
-        broker.handle_status(Status::Opened { source, sample_rate: 22_050, channels: 1, title: None, duration: None });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source, sample_rate: 22_050, channels: 1, title: None, duration: None });
         assert_eq!(broker.shared.phase(), Phase::Paused);
         broker.audio_output_lost();
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
@@ -1843,8 +2040,8 @@ mod tests {
         broker.audio_output_prepared(4);
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
         broker.handle_status(Status::OutputReady { epoch: 4 });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded)) if loaded == latest));
-        broker.handle_status(Status::Opened { source: latest.clone(), sample_rate: 48_000, channels: 2, title: None, duration: None });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded, _)) if loaded == latest));
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: latest.clone(), sample_rate: 48_000, channels: 2, title: None, duration: None });
         assert_eq!(broker.shared.phase(), Phase::Playing);
         broker.shared.set_playhead_frames(48_000 * 3);
         broker.audio_output_lost();
@@ -1852,10 +2049,10 @@ mod tests {
         broker.audio_output_prepared(6);
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
         broker.handle_status(Status::OutputReady { epoch: 6 });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
-        broker.handle_status(Status::Opened { source: latest, sample_rate: 48_000, channels: 2, title: None, duration: None });
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: latest, sample_rate: 48_000, channels: 2, title: None, duration: None });
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(3.0))));
-        broker.handle_status(Status::SeekFailed);
+        broker.handle_status(Status::SeekFailed { load_id: broker.shared.load_id() });
         assert_eq!(broker.shared.phase(), Phase::Playing, "unseekable sources restart instead of remaining paused");
     }
 
@@ -1869,14 +2066,14 @@ mod tests {
             broker.audio_output_prepared(epoch);
             assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
             broker.handle_status(Status::OutputReady { epoch });
-            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_))));
-            broker.handle_status(Status::Opened { source: source.clone(), sample_rate: 22_050,
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
+            broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
                 channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
             assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(5.0))));
             assert_eq!(broker.shared.phase(), Phase::Paused);
         }
         broker.handle_command(Command::TogglePause); // cancel resume while the seek is pending
-        broker.handle_status(Status::Seeked);
+        broker.handle_status(Status::Seeked { load_id: broker.shared.load_id() });
         assert_eq!(broker.shared.phase(), Phase::Paused);
     }
 
@@ -1885,7 +2082,7 @@ mod tests {
         let (mut broker, _, _) = broker_with_sink();
         broker.shared.set_sample_rate(48_000);
         let duration = Duration::from_secs(21);
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::File("he-aac.mp4".into()), sample_rate: 22_050,
             channels: 1, title: None, duration: Some(duration),
         });
@@ -1959,7 +2156,7 @@ mod tests {
     }
 
     fn assert_load(rx: &crossbeam_channel::Receiver<DecoderCmd>, expected: &Source) {
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(source)) if source == *expected));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(source, _)) if source == *expected));
     }
 
     #[test]
@@ -1975,7 +2172,7 @@ mod tests {
         assert_load(&rx, &first);
         assert!(broker.retry_used);
         assert_eq!(broker.queue_index, Some(0));
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: first.clone(), sample_rate: 48_000, channels: 2,
             title: None, duration: None,
         });
@@ -2056,7 +2253,7 @@ mod tests {
         fail(&mut broker, &first);
         assert_load(&rx, &first);
         assert!(broker.stage_paused);
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: first.clone(), sample_rate: 48_000, channels: 2,
             title: None, duration: None,
         });
@@ -2064,7 +2261,7 @@ mod tests {
         fail(&mut broker, &first);
         assert_load(&rx, &next);
         assert!(broker.stage_paused);
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: next, sample_rate: 48_000, channels: 2,
             title: None, duration: None,
         });
@@ -2152,7 +2349,7 @@ mod tests {
             source: Source::File("a.mp3".into()),
             paused: true,
         });
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::File("a.mp3".into()),
             sample_rate: 48_000,
             channels: 2,
@@ -2166,7 +2363,7 @@ mod tests {
             source: Source::File("b.mp3".into()),
             paused: false,
         });
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::File("b.mp3".into()),
             sample_rate: 48_000,
             channels: 2,
@@ -2181,7 +2378,7 @@ mod tests {
         let (mut broker, sink, _rx) = broker_with_sink();
         broker.handle_command(Command::SetVolume(0.25));
         broker.handle_command(Command::EqGain { band: Some(2), gain_db: 4.0 });
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::Youtube {
                 url: "https://youtu.be/x".into(),
                 format: "140".into(),
@@ -2209,11 +2406,11 @@ mod tests {
         assert!(broker.shared.loop_enabled());
         open_youtube(&mut broker);
         assert_eq!(broker.shared.phase(), Phase::Playing);
-        broker.handle_status(Status::Finished);
+        broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
         // Replayed: a fresh autoplay Load went to the decoder, phase is
         // LOADING (never dipped through Stopped), and the toggle itself
         // plus the Opened persist produced exactly two sink writes.
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { .. }))));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { .. }, _))));
         assert_eq!(broker.shared.phase(), Phase::Loading);
         assert_eq!(sink.lock().unwrap().len(), 2);
         assert!(sink.lock().unwrap().last().unwrap().loop_enabled);
@@ -2223,7 +2420,7 @@ mod tests {
     fn loop_off_stops_at_eof() {
         let (mut broker, sink, rx) = broker_with_sink();
         open_youtube(&mut broker);
-        broker.handle_status(Status::Finished);
+        broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
         assert_eq!(broker.shared.phase(), Phase::Stopped);
         assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
         assert!(rx.try_recv().is_err(), "no replay command without loop");
@@ -2234,7 +2431,7 @@ mod tests {
     fn loop_replay_prefers_custom_format_id() {
         let (mut broker, _, rx) = broker_with_sink();
         broker.handle_command(Command::ToggleLoop);
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::Youtube {
                 url: "https://youtu.be/x".into(),
                 format: "251".into(),
@@ -2245,9 +2442,9 @@ mod tests {
             title: None,
             duration: None,
         });
-        broker.handle_status(Status::Finished);
+        broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::Youtube { format, .. })) => {
+            Ok(DecoderCmd::Load(Source::Youtube { format, .. }, _)) => {
                 assert_eq!(format, "251", "replay must keep the track's format id");
             }
             other => panic!("expected replay load, got {other:?}"),
@@ -2261,7 +2458,7 @@ mod tests {
             source: Source::File("a.mp3".into()),
             paused: true,
         });
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::File("a.mp3".into()),
             sample_rate: 48_000,
             channels: 2,
@@ -2351,8 +2548,8 @@ mod tests {
             playlist_index: Some(n),
         };
         broker.handle_command(Command::Load { source: pl(1), paused: false });
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { .. }))));
-        broker.handle_status(Status::Opened {
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { .. }, _))));
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: pl(1),
             sample_rate: 44_100,
             channels: 2,
@@ -2360,11 +2557,11 @@ mod tests {
             duration: None,
         });
         assert_eq!(broker.shared.phase(), Phase::Playing);
-        broker.handle_status(Status::Finished);
+        broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
         // Advanced: a Load for entry 2 is issued and the phase is LOADING —
         // the playlist never dips through Stopped.
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::Youtube { url, playlist_index: Some(2), .. })) => {
+            Ok(DecoderCmd::Load(Source::Youtube { url, playlist_index: Some(2), .. }, _)) => {
                 assert_eq!(url, "https://youtube.com/playlist?list=PLtest");
             }
             other => panic!("expected playlist advance, got {other:?}"),
@@ -2384,7 +2581,7 @@ mod tests {
                 broker.queue_index = Some(index);
                 broker.last_folder = (count > 1).then(|| r"C:\album".to_string());
                 let selected = broker.local_queue[index].clone();
-                broker.handle_status(Status::Opened {
+                broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
                     source: selected.clone(), sample_rate: 48_000, channels: 2,
                     title: None, duration: Some(Duration::from_secs(10)),
                 });
@@ -2393,7 +2590,7 @@ mod tests {
                     broker.handle_command(Command::Stop);
                     assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
                 } else {
-                    broker.handle_status(Status::Finished);
+                    broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
                     assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
                 }
                 assert_eq!(broker.shared.phase(), Phase::Stopped);
@@ -2406,8 +2603,8 @@ mod tests {
                 assert_eq!(broker.local_queue.len(), count);
                 assert_eq!(broker.queue_index, Some(index));
                 assert_eq!(broker.persist_snapshot(), saved);
-                assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(source)) if source.raw() == selected.raw()));
-                broker.handle_status(Status::Opened {
+                assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(source, _)) if source.raw() == selected.raw()));
+                broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
                     source: selected, sample_rate: 48_000, channels: 2,
                     title: None, duration: Some(Duration::from_secs(10)),
                 });
@@ -2429,20 +2626,20 @@ mod tests {
                 url: "https://youtube.com/playlist?list=PLtest".into(),
                 format: "custom-format".into(), playlist_index,
             };
-            broker.handle_status(Status::Opened {
+            broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
                 source: source.clone(), sample_rate: 48_000, channels: 2,
                 title: None, duration: None,
             });
             if playlist_index.is_some() {
                 broker.yt_queue = vec!["one".into(), "two".into(), "three".into()];
             }
-            broker.handle_status(Status::Finished);
+            broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
             assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
             assert_eq!(broker.shared.phase(), Phase::Stopped);
             broker.handle_command(Command::TogglePause);
             assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube {
                 format, playlist_index: actual_index, ..
-            })) if format == "custom-format" && actual_index == playlist_index));
+            }, _)) if format == "custom-format" && actual_index == playlist_index));
             assert_eq!(broker.shared.phase(), Phase::Loading);
         }
     }
@@ -2454,7 +2651,7 @@ mod tests {
         assert_eq!(broker.shared.phase(), Phase::Stopped);
         assert!(rx.try_recv().is_err());
         broker.handle_command(Command::Load { source: Source::File("pending.mp3".into()), paused: false });
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
         broker.handle_command(Command::TogglePause);
         assert_eq!(broker.shared.phase(), Phase::Loading);
         assert!(rx.try_recv().is_err());
@@ -2493,7 +2690,7 @@ mod tests {
         assert_eq!(broker.queue_index, Some(0));
         assert!(broker.local_queue[0].display_name().contains("New"));
         assert!(broker.local_queue[1].display_name().contains("Old"));
-        let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
+        let Ok(DecoderCmd::Load(Source::File(p), _)) = rx.try_recv() else {
             panic!("expected first folder track load")
         };
         assert!(p.contains("02 - New"));
@@ -2502,19 +2699,19 @@ mod tests {
         broker.handle_command(Command::NextTrack);
         assert_eq!(broker.queue_index, Some(1));
         assert_eq!(broker.local_queue.len(), 2, "navigation must preserve the queue");
-        let Ok(DecoderCmd::Load(Source::File(p1))) = rx.try_recv() else {
+        let Ok(DecoderCmd::Load(Source::File(p1), _)) = rx.try_recv() else {
             panic!("expected queue advance to the oldest file")
         };
         assert!(p1.contains("01"));
 
         // Persist the selected track, then restart after adding a newer file.
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: Source::File(p1.clone()), sample_rate: 48_000, channels: 2,
             title: None, duration: None,
         });
         broker.shared.set_loop_enabled(true);
-        broker.handle_status(Status::Finished);
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
         assert_eq!(broker.local_queue.len(), 2, "repeat retains the folder queue");
         broker.handle_command(Command::Stop);
         assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
@@ -2532,8 +2729,8 @@ mod tests {
         assert_eq!(restarted.local_queue.len(), 3, "restart rescans current contents");
         assert_eq!(restarted.local_queue[0].raw(), latest.to_string_lossy());
         assert_eq!(restarted.queue_index, Some(2), "selection follows track path, not old index");
-        assert!(matches!(restarted_rx.try_recv(), Ok(DecoderCmd::Load(Source::File(p))) if p == p1));
-        restarted.handle_status(Status::Opened {
+        assert!(matches!(restarted_rx.try_recv(), Ok(DecoderCmd::Load(Source::File(p), _)) if p == p1));
+        restarted.handle_status(Status::Opened { load_id: restarted.shared.load_id(),
             source: Source::File(p1), sample_rate: 48_000, channels: 2,
             title: None, duration: None,
         });
@@ -2557,7 +2754,7 @@ mod tests {
         let saved = sink.lock().unwrap().last().unwrap().clone();
         assert_eq!(saved.last_folder.as_deref(), absolute.to_str());
         assert!(broker.yt_queue_url.is_none());
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
         // An unplayable batch must keep the existing folder and saved state.
         let saves = sink.lock().unwrap().len();
         broker.handle_command(Command::LoadDropped(vec!["missing.txt".into()]));
@@ -2572,7 +2769,7 @@ mod tests {
         });
         assert_eq!(restarted.queue_index, Some(0));
         assert!(restarted.stage_paused);
-        assert!(matches!(restart_rx.try_recv(), Ok(DecoderCmd::Load(Source::File(p))) if Path::new(&p) == file));
+        assert!(matches!(restart_rx.try_recv(), Ok(DecoderCmd::Load(Source::File(p), _)) if Path::new(&p) == file));
         // Explicit file input replaces the folder context, including a file
         // inside the same directory. Opened persists that replacement.
         restarted.handle_command(Command::Load { source: Source::File(file.to_string_lossy().into_owned()), paused: false });
@@ -2597,7 +2794,7 @@ mod tests {
             assert!(broker.last_folder.is_none());
             assert_eq!(broker.persist_snapshot().last_track.as_deref(), Some(raw));
             assert!(broker.stage_paused);
-            assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { format, .. })) if format == "30232"));
+            assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { format, .. }, _)) if format == "30232"));
         }
         let (mut broker, _, rx) = broker_with_sink();
         broker.handle_command(Command::RestoreState { last_folder: Some(empty.to_string_lossy().into_owned()), last_track: None, last_playlist_index: None });
@@ -2625,7 +2822,7 @@ mod tests {
         broker.queue_index = Some(0);
         broker.handle_command(Command::PrevTrack);
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::File(p))) => assert!(p.contains("only.mp3")),
+            Ok(DecoderCmd::Load(Source::File(p), _)) => assert!(p.contains("only.mp3")),
             other => panic!("expected restart of first file, got {other:?}"),
         }
         assert_eq!(broker.queue_index, Some(0));
@@ -2703,13 +2900,13 @@ mod tests {
         assert_eq!(broker.local_queue.len(), 2);
         assert_eq!(broker.queue_index, Some(0));
         // Newest first: b.mp3 leads the queue.
-        let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
+        let Ok(DecoderCmd::Load(Source::File(p), _)) = rx.try_recv() else {
             panic!("expected first dropped track to load")
         };
         assert!(p.contains("b.mp3"), "newest file plays first: {p}");
         // NextTrack walks the dropped queue to the older file.
         broker.handle_command(Command::NextTrack);
-        let Ok(DecoderCmd::Load(Source::File(p))) = rx.try_recv() else {
+        let Ok(DecoderCmd::Load(Source::File(p), _)) = rx.try_recv() else {
             panic!("expected queue walk")
         };
         assert!(p.contains("a.mp3"), "oldest file follows: {p}");
@@ -2808,7 +3005,7 @@ mod tests {
         // 1-based jump to track 2 -> 0-based index 1.
         broker.handle_command(Command::JumpToTrack(2));
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::File(p))) => assert!(p.contains("02")),
+            Ok(DecoderCmd::Load(Source::File(p), _)) => assert!(p.contains("02")),
             other => panic!("expected jump load, got {other:?}"),
         }
         assert_eq!(broker.queue_index, Some(1));
@@ -2846,9 +3043,9 @@ mod tests {
         let url = "https://youtube.com/playlist?list=PLw9JTHoDqqD8y2qG6cyud4_iMzJmKd_3B";
         let (mut broker, sink, rx) = broker_with_sink();
         broker.handle_command(Command::Load { source: Source::from_raw(url), paused: false });
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
-        broker.handle_command(Command::YtQueueResolved { url: url.into(), titles: titles.clone() });
-        broker.handle_status(Status::Opened { source: Source::from_raw(url), sample_rate: 48_000, channels: 2, title: None, duration: None });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        broker.handle_command(Command::YtQueueResolved { request_id: broker.yt_request, url: url.into(), titles: titles.clone() });
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: Source::from_raw(url), sample_rate: 48_000, channels: 2, title: None, duration: None });
         broker.handle_command(Command::Stop);
         assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
         assert_eq!(broker.track_list().current, Some(0));
@@ -2856,7 +3053,7 @@ mod tests {
         let number = titles.len();
         let saves = sink.lock().unwrap().len();
         broker.handle_command(Command::JumpToTrack(number));
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { url: target, format, playlist_index: Some(index) }))
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { url: target, format, playlist_index: Some(index) }, _))
             if target == url && format == "140" && index == number));
         assert_eq!(broker.queue_index, Some(number - 1));
         assert_eq!(broker.track_list().current, Some(number - 1));
@@ -2871,7 +3068,7 @@ mod tests {
         restarted.handle_command(Command::RestoreState {
             last_folder: None, last_track: Some(url.into()), last_playlist_index: Some(number),
         });
-        assert!(matches!(restarted_rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(index), .. })) if index == number));
+        assert!(matches!(restarted_rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(index), .. }, _)) if index == number));
         assert_eq!(restarted.queue_index, Some(number - 1));
         assert!(restarted.stage_paused);
     }
@@ -2881,11 +3078,11 @@ mod tests {
         let (mut broker, _, rx) = broker_with_sink();
         broker.local_queue = vec![Source::File("old.mp3".into()), Source::File("selected.mp3".into())];
         broker.load_queue_track(0);
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
         broker.handle_command(Command::JumpToTrack(2));
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
-        broker.handle_status(Status::Opened { source: Source::File("old.mp3".into()), sample_rate: 48_000, channels: 2, title: None, duration: None });
-        broker.handle_status(Status::Finished);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: Source::File("old.mp3".into()), sample_rate: 48_000, channels: 2, title: None, duration: None });
+        broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
         assert_eq!(broker.track_list().current, Some(1));
         assert_eq!(broker.persist_snapshot().last_track.as_deref(), Some("selected.mp3"));
         assert_eq!(broker.shared.phase(), Phase::Loading);
@@ -2896,10 +3093,10 @@ mod tests {
         let (mut broker, _, rx) = broker_with_sink();
         let url = "https://youtube.com/playlist?list=test";
         broker.handle_command(Command::Load { source: Source::from_raw(url), paused: false });
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
-        broker.handle_command(Command::YtQueueResolved { url: url.into(), titles: vec!["First".into(), "Selected\nSong".into()] });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        broker.handle_command(Command::YtQueueResolved { request_id: broker.yt_request, url: url.into(), titles: vec!["First".into(), "Selected\nSong".into()] });
         broker.handle_command(Command::JumpToTrack(2));
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_))));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
         assert_eq!(broker.shared.phase(), Phase::Loading);
         assert!(broker.view().contains("Selected Song"));
         assert_eq!(broker.view().lines().count(), 5, "multiline titles must not change floating-window geometry");
@@ -2939,13 +3136,13 @@ mod tests {
         });
         assert_eq!(broker.yt_queue_url.as_deref(), Some(url_a.as_str()));
         // The fetch for A resolves: titles accepted.
-        broker.handle_command(Command::YtQueueResolved {
+        broker.handle_command(Command::YtQueueResolved { request_id: broker.yt_request,
             url: url_a.clone(),
             titles: vec!["One".into(), "Two".into()],
         });
         assert_eq!(broker.yt_queue.len(), 2);
         // A stale fetch for a DIFFERENT playlist is dropped.
-        broker.handle_command(Command::YtQueueResolved {
+        broker.handle_command(Command::YtQueueResolved { request_id: broker.yt_request,
             url: "https://youtube.com/playlist?list=B".into(),
             titles: vec!["Wrong".into()],
         });
@@ -2968,18 +3165,18 @@ mod tests {
         broker.handle_command(Command::JumpToTrack(2));
         assert!(rx.try_recv().is_err(), "no jump dispatch while metadata loads");
         // Titles resolve (simulating the flat-playlist fetch reporting back).
-        broker.handle_command(Command::YtQueueResolved {
+        broker.handle_command(Command::YtQueueResolved { request_id: broker.yt_request,
             url: url.clone(),
             titles: vec!["One".into(), "Two".into()],
         });
         // Jump to track 2 (1-based) -> Load with playlist_index Some(2).
         broker.handle_command(Command::JumpToTrack(2));
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(2), .. })) => {}
+            Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(2), .. }, _)) => {}
             other => panic!("expected jump load for entry 2, got {other:?}"),
         }
         // The jump target opens: Playing at entry 2.
-        broker.handle_status(Status::Opened {
+        broker.handle_status(Status::Opened { load_id: broker.shared.load_id(),
             source: pl(2),
             sample_rate: 44_100,
             channels: 2,
@@ -3049,7 +3246,7 @@ mod tests {
         // The YouTube link wins: a Youtube Load is dispatched, the local
         // queue is cleared (superseded).
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::Youtube { playlist_index, .. })) => {
+            Ok(DecoderCmd::Load(Source::Youtube { playlist_index, .. }, _)) => {
                 assert_eq!(playlist_index, None, "watch URL is a single video");
             }
             other => panic!("expected youtube load, got {other:?}"),
@@ -3140,7 +3337,7 @@ mod tests {
         let (mut broker, _, rx) = broker_with_sink();
         broker.handle_command(Command::LoadDropped(vec![shortcut.to_string_lossy().into_owned()]));
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::Youtube { format, playlist_index, .. })) => {
+            Ok(DecoderCmd::Load(Source::Youtube { format, playlist_index, .. }, _)) => {
                 assert_eq!(format, "audio-aac-128kbps", "niconico drop must not use fmt 140");
                 assert_eq!(playlist_index, None);
             }
@@ -3163,7 +3360,7 @@ mod tests {
         let (mut broker, _, rx) = broker_with_sink();
         broker.handle_command(Command::LoadDropped(vec![shortcut.to_string_lossy().into_owned()]));
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::Youtube { format, playlist_index, .. })) => {
+            Ok(DecoderCmd::Load(Source::Youtube { format, playlist_index, .. }, _)) => {
                 assert_eq!(format, "30232", "bilibili drop must not use fmt 140");
                 assert_eq!(playlist_index, None);
             }
@@ -3186,7 +3383,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(..))), "initial load pending");
         broker.handle_command(Command::NextTrack);
         match rx.try_recv() {
-            Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(2), .. })) => {}
+            Ok(DecoderCmd::Load(Source::Youtube { playlist_index: Some(2), .. }, _)) => {}
             other => panic!("expected advance during LOADING, got {other:?}"),
         }
         assert_eq!(broker.shared.phase(), Phase::Loading);

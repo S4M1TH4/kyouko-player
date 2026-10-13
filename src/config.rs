@@ -126,7 +126,7 @@ fn parse(text: &str) -> PersistedState {
         let value = value.trim();
         match key {
             "volume" => {
-                if let Ok(v) = value.parse::<f32>() {
+                if let Ok(v) = value.parse::<f32>() && v.is_finite() {
                     state.volume = v.clamp(0.0, 1.0);
                 }
             }
@@ -135,7 +135,7 @@ fn parse(text: &str) -> PersistedState {
                     if band >= EQ_BANDS {
                         break;
                     }
-                    if let Ok(g) = part.trim().parse::<f32>() {
+                    if let Ok(g) = part.trim().parse::<f32>() && g.is_finite() {
                         state.eq_gains[band] = g.clamp(-EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB);
                     }
                 }
@@ -165,6 +165,17 @@ fn parse(text: &str) -> PersistedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonfinite_numbers_fall_back_per_key_without_poisoning_other_settings() {
+        for volume in ["NaN", "inf", "-inf"] {
+            let state = parse(&format!("volume={volume}\neq_gains=NaN,inf,-inf,3.5\neq_enabled=false\nloop=true\n"));
+            assert_eq!(state.volume, PersistedState::default().volume);
+            assert_eq!(&state.eq_gains[..4], &[0.0, 0.0, 0.0, 3.5]);
+            assert!(!state.eq_enabled);
+            assert!(state.loop_enabled);
+        }
+    }
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("kyouko-cfg-test-{}-{tag}.cfg", std::process::id()))

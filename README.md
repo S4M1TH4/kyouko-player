@@ -23,6 +23,12 @@ file I/O, logging, or application mutex acquisition. Playback controls and
 counters use lock-free atomics. The PCM pool holds at least 1.5 seconds of audio
 and primes 500 ms before playback; the device uses its native rate and layout.
 
+Each load carries an identity separate from PCM seek generations. Late decoder
+events cannot resume a stopped track or alter a newer selection. Native input
+is dispatched after its Win32 message handler returns, with Quit taking priority.
+Decoder command delivery never blocks the UI; a saturated pipe retains the latest
+load/stop request and combines pending seeks.
+
 The overlay renders through a persistent GDI memory DC and bitmap, presenting
 the completed image with `UpdateLayeredWindow`. Identical visual snapshots skip
 rendering. The elapsed-time timer runs at 1 Hz only while playing.
@@ -54,6 +60,9 @@ logging. The application has no terminal command reader or system tray icon.
 - Audio output error recovery and headphone jack hot-swap handling. Recovery
   preserves selection, playback intent, and position where seeking is supported.
 - Atomic persistence of volume, EQ, repeat, folder, and track selection.
+- Owned playlist metadata jobs, cancelled on playlist changes or shutdown, with
+  a 45-second process deadline and bounded output. Non-finite configuration
+  values use defaults; non-finite runtime controls leave settings unchanged.
 - Build-time icon generation at 16, 32, 48, and 256 px, embedded as Windows PE
   icon resource ID 1.
 
@@ -146,6 +155,7 @@ ignored tests.
 | `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |
 | `src/config.rs` | State configuration and atomic saves |
 | `src/process.rs` | External process launch policy |
+| `src/playlist.rs` | Owned Windows playlist metadata jobs and deadlines |
 | `src/logging.rs` | Diagnostic logging |
 | `src/ui/` | Win32 overlay, tracklist, rendering, and hotkeys |
 | `build.rs`, `build/icon.rs` | Icon generation and PE resource embedding |
