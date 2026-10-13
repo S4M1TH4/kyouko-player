@@ -164,7 +164,8 @@ fn main() {
     // The kill switch rides along with every Stop/Load/Shutdown so a stalled
     // yt-dlp pipe read can never defer a command or hang shutdown.
     let controls = audio.controls.clone();
-    let link = DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), controls.hook());
+    let link = DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), controls.clone().hook())
+        .with_suspend(controls.suspend_hook());
     let shutdown_link = link.clone();
 
     // Coalesce snapshots outside the UI. The writer parks when nothing changes

@@ -385,6 +385,13 @@ pub enum Command {
 #[derive(Debug)]
 pub enum DecoderCmd {
     Load(Source, u64),
+    /// Reopen the suspended track from its existing bytes/download after a
+    /// device swap. This must not invoke the source-process kill switch.
+    RecoverOutput(Source, u64),
+    /// Park decoding while retaining the current source and download.
+    SuspendOutput,
+    /// Wake the decoder to acknowledge a replacement PCM pool.
+    RefreshOutput,
     /// Jump the playhead by a signed offset in seconds. Executed on the
     /// decoder thread; ignored while no track is open.
     SeekRelative(f64),
@@ -634,12 +641,18 @@ pub struct DecoderLink {
     queued: Receiver<DecoderCmd>,
     shutdown: Arc<Mutex<bool>>,
     interrupt: Option<Arc<dyn Fn() + Send + Sync>>,
+    suspend: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DecoderLink {
     pub fn with_interrupt(tx: Sender<DecoderCmd>, queued: Receiver<DecoderCmd>, interrupt: Arc<dyn Fn() + Send + Sync>) -> Self {
         assert!(tx.capacity().is_some_and(|capacity| capacity >= 2));
-        Self { tx, queued, shutdown: Arc::new(Mutex::new(false)), interrupt: Some(interrupt) }
+        Self { tx, queued, shutdown: Arc::new(Mutex::new(false)), interrupt: Some(interrupt), suspend: None }
+    }
+
+    pub fn with_suspend(mut self, suspend: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.suspend = Some(suspend);
+        self
     }
 
     pub fn send(&self, cmd: DecoderCmd) {
@@ -648,6 +661,7 @@ impl DecoderLink {
             && let Some(f) = &self.interrupt {
                 f();
             }
+        if matches!(cmd, DecoderCmd::SuspendOutput) && let Some(f) = &self.suspend { f(); }
         let mut shutdown = self.shutdown.lock().unwrap_or_else(|e| e.into_inner());
         if *shutdown { return; }
         *shutdown = matches!(cmd, DecoderCmd::Shutdown);
@@ -658,18 +672,22 @@ impl DecoderLink {
             let mut latest = None;
             let mut seek = 0.0;
             let mut restoring = false;
+            let mut refresh = false;
             for command in self.queued.try_iter().chain(std::iter::once(cmd)) {
                 match command {
                     DecoderCmd::SeekRelative(delta) => seek += delta,
                     DecoderCmd::RestorePosition(position) => { seek = position; restoring = true; }
+                    DecoderCmd::RefreshOutput => refresh = true,
                     DecoderCmd::Shutdown => { latest = Some(DecoderCmd::Shutdown); seek = 0.0; break; }
                     control => { latest = Some(control); seek = 0.0; restoring = false; }
                 }
             }
             if let Some(command) = latest {
-                let stopping = matches!(command, DecoderCmd::Stop | DecoderCmd::Shutdown);
+                let stopping = matches!(command, DecoderCmd::Stop | DecoderCmd::Shutdown | DecoderCmd::SuspendOutput);
                 self.tx.try_send(command).expect("single serialized decoder producer has room after coalescing");
                 if stopping { return; }
+            } else if refresh {
+                self.tx.try_send(DecoderCmd::RefreshOutput).expect("output wake precedes a coalesced seek");
             }
             if (seek != 0.0 || restoring) && seek.is_finite() {
                 let command = if restoring { DecoderCmd::RestorePosition(seek.max(0.0)) } else { DecoderCmd::SeekRelative(seek) };
@@ -900,6 +918,10 @@ impl Broker {
     /// Retry uses the same load tail without resetting its per-track budget
     /// or re-running queue ingestion.
     fn start_attempt(&mut self, source: Source, paused: bool) {
+        self.start_attempt_with_output(source, paused, false);
+    }
+
+    fn start_attempt_with_output(&mut self, source: Source, paused: bool, recovering: bool) {
         self.shared.invalidate_load();
         log_info!(
             "BROKER",
@@ -912,6 +934,9 @@ impl Broker {
         self.shared.reset_playhead();
         self.shared.bump_generation();
         if self.output_unavailable {
+            // Selecting another track while disconnected releases the retained
+            // source immediately, rather than holding it until a device returns.
+            self.send_decoder(DecoderCmd::Stop);
             self.output_reload = true;
             self.output_resume = !paused;
             self.output_position = 0.0;
@@ -920,7 +945,8 @@ impl Broker {
             return;
         }
         self.set_phase(Phase::Loading, "load requested");
-        self.send_decoder(DecoderCmd::Load(source, self.shared.load_id()));
+        let id = self.shared.load_id();
+        self.send_decoder(if recovering { DecoderCmd::RecoverOutput(source, id) } else { DecoderCmd::Load(source, id) });
     }
 
     fn playback_failed(&mut self, source: Source, reason: String, generation: u64) {
@@ -1158,7 +1184,7 @@ impl Broker {
         self.output_unavailable = true;
         self.seek_after_open = None;
         self.shared.bump_generation();
-        self.send_decoder(DecoderCmd::Stop);
+        self.send_decoder(DecoderCmd::SuspendOutput);
         if phase != Phase::Stopped { self.set_phase(Phase::Paused, "audio device unavailable"); }
         self.persist();
     }
@@ -1166,9 +1192,9 @@ impl Broker {
     pub fn audio_output_prepared(&mut self, epoch: u64) {
         self.output_epoch = Some(epoch);
         self.shared.set_playhead_frames((self.output_position * self.shared.sample_rate() as f64).round() as u64);
-        // Wakes the parked decoder to consume the latest pool. An acknowledgement
-        // orders old Opened/Finished events before any restored source is loaded.
-        self.send_decoder(DecoderCmd::Stop);
+        // Wakes the parked decoder without dropping its retained source. An acknowledgement
+        // orders old Opened/Finished events before the source is reopened from RAM.
+        self.send_decoder(DecoderCmd::RefreshOutput);
     }
 
     /// 1 Hz playback tick, delivered by the presentation timer (which only
@@ -1616,7 +1642,9 @@ impl Broker {
                     let resume = self.output_resume;
                     self.output_reload = false;
                     if let Some(source) = source {
-                        self.begin_load(source, !resume || position > 0.0);
+                        self.seek_after_open = None;
+                        self.resume_after_seek = None;
+                        self.start_attempt_with_output(source, !resume || position > 0.0, true);
                         if position > 0.0 {
                             self.seek_after_open = Some(position);
                             self.resume_after_seek = Some(resume);
@@ -1881,6 +1909,29 @@ mod tests {
     }
 
     #[test]
+    fn output_commands_do_not_kill_sources_and_refresh_cannot_replace_a_stop() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = kills.clone();
+        let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(move || { counter.fetch_add(1, Ordering::Relaxed); }));
+        link.send(DecoderCmd::SuspendOutput);
+        link.send(DecoderCmd::RecoverOutput(Source::File("a.wav".into()), 1));
+        assert_eq!(kills.load(Ordering::Relaxed), 0);
+        for _ in rx.try_iter() {}
+        link.send(DecoderCmd::Stop);
+        link.send(DecoderCmd::RefreshOutput);
+        link.send(DecoderCmd::RefreshOutput);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)), "a full pipe must retain a real Stop");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(kills.load(Ordering::Relaxed), 1);
+        link.send(DecoderCmd::SeekRelative(1.0));
+        link.send(DecoderCmd::RefreshOutput);
+        link.send(DecoderCmd::SeekRelative(2.0));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::RefreshOutput)));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::SeekRelative(3.0))));
+    }
+
+    #[test]
     fn full_decoder_pipe_coalesces_latest_load_and_seeks_and_keeps_shutdown_final() {
         let (tx, rx) = crossbeam_channel::bounded(2);
         let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
@@ -2006,7 +2057,7 @@ mod tests {
                 broker.shared.set_playhead_frames((position * broker.shared.sample_rate() as f64) as u64);
                 broker.audio_output_lost();
                 assert_eq!(broker.shared.phase(), Phase::Paused);
-                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SuspendOutput)));
                 broker.audio_output_lost();
                 assert!(receiver.try_recv().is_err(), "duplicate loss must not queue more stops");
                 broker.handle_status(Status::Finished { load_id: broker.shared.load_id() });
@@ -2017,11 +2068,11 @@ mod tests {
                 let rate = if cycle % 2 == 0 { 44_100 } else { 48_000 };
                 broker.shared.set_sample_rate(rate);
                 broker.audio_output_prepared(epoch);
-                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RefreshOutput)));
                 broker.handle_status(Status::OutputReady { epoch: epoch + 100 });
                 assert!(receiver.try_recv().is_err());
                 broker.handle_status(Status::OutputReady { epoch });
-                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded, _)) if loaded == source));
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RecoverOutput(loaded, _)) if loaded == source));
                 broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
                     channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
                 assert_eq!(broker.shared.phase(), Phase::Paused, "seek completes before output resumes");
@@ -2040,26 +2091,26 @@ mod tests {
     fn device_recovery_honors_manual_pause_stop_and_quit() {
         let (mut broker, receiver, source) = device_test_broker(true);
         broker.audio_output_lost();
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SuspendOutput)));
         broker.handle_command(Command::TogglePause); // user cancels automatic resume
         broker.audio_output_prepared(4);
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RefreshOutput)));
         broker.handle_status(Status::OutputReady { epoch: 4 });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RecoverOutput(_, _))));
         broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source, sample_rate: 22_050, channels: 1, title: None, duration: None });
         assert_eq!(broker.shared.phase(), Phase::Paused);
         broker.audio_output_lost();
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SuspendOutput)));
         broker.handle_command(Command::Stop);
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
         broker.audio_output_prepared(6);
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RefreshOutput)));
         broker.handle_status(Status::OutputReady { epoch: 6 });
         assert!(receiver.try_recv().is_err(), "a stopped player cannot auto-restart");
         broker.audio_output_lost();
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SuspendOutput)));
         broker.audio_output_prepared(8);
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RefreshOutput)));
         assert!(matches!(broker.handle_command(Command::Quit), Flow::Exit));
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Shutdown)));
         broker.handle_status(Status::OutputReady { epoch: 8 });
@@ -2071,23 +2122,23 @@ mod tests {
         let (mut broker, receiver, _) = device_test_broker(true);
         broker.shared.set_playhead_frames(48_000 * 5);
         broker.audio_output_lost();
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SuspendOutput)));
         let latest = Source::File("new.mp4".into());
         broker.handle_command(Command::Load { source: latest.clone(), paused: false });
-        assert!(receiver.try_recv().is_err(), "no decoder load while the output is absent");
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)), "new selection releases the retained source while output is absent");
         broker.audio_output_prepared(4);
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RefreshOutput)));
         broker.handle_status(Status::OutputReady { epoch: 4 });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(loaded, _)) if loaded == latest));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RecoverOutput(loaded, _)) if loaded == latest));
         broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: latest.clone(), sample_rate: 48_000, channels: 2, title: None, duration: None });
         assert_eq!(broker.shared.phase(), Phase::Playing);
         broker.shared.set_playhead_frames(48_000 * 3);
         broker.audio_output_lost();
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SuspendOutput)));
         broker.audio_output_prepared(6);
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RefreshOutput)));
         broker.handle_status(Status::OutputReady { epoch: 6 });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RecoverOutput(_, _))));
         broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: latest, sample_rate: 48_000, channels: 2, title: None, duration: None });
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RestorePosition(3.0))));
         broker.handle_status(Status::SeekFailed { load_id: broker.shared.load_id() });
@@ -2100,11 +2151,11 @@ mod tests {
         broker.shared.set_playhead_frames(48_000 * 5);
         for epoch in [4, 6] {
             broker.audio_output_lost();
-            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SuspendOutput)));
             broker.audio_output_prepared(epoch);
-            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Stop)));
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RefreshOutput)));
             broker.handle_status(Status::OutputReady { epoch });
-            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RecoverOutput(_, _))));
             broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
                 channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
             assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RestorePosition(5.0))));

@@ -61,8 +61,9 @@ logging. The application has no terminal command reader or system tray icon.
   data; repeating a completely cached stream avoids extraction and download.
 - Audio output error recovery and headphone jack hot-swap handling. Recovery
   preserves selection, playback intent, and position where seeking is supported.
-  Streaming recovery waits on the decoder for the saved position to download
-  before resuming; interactive seeks remain limited to bytes already in RAM.
+  Streaming recovery retains the existing RAM bytes and download worker, avoiding
+  new extraction or downloads. Interactive seeks remain limited to bytes already
+  in RAM; a recovery seek can wait for bytes from the original producer.
 - Atomic persistence of volume, EQ, repeat, folder, and track selection.
 - Owned playlist metadata jobs, cancelled on playlist changes or shutdown, with
   a 45-second process deadline and bounded output. Non-finite configuration

@@ -15,6 +15,7 @@ struct Bytes {
     done: bool,
     cancelled: bool,
     error: Option<String>,
+    reader_epoch: u64,
 }
 
 pub struct StreamBuffer {
@@ -86,6 +87,14 @@ impl StreamBuffer {
         self.ready.notify_all();
     }
 
+    /// Abort obsolete decoder reads without cancelling the shared download.
+    /// Fresh readers can still use all existing and subsequently appended bytes.
+    pub fn retire_readers(&self) {
+        let mut bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
+        bytes.reader_epoch = bytes.reader_epoch.wrapping_add(1);
+        self.ready.notify_all();
+    }
+
     pub fn complete(&self) -> bool {
         let bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
         bytes.done && !bytes.cancelled && bytes.error.is_none()
@@ -122,6 +131,7 @@ impl StreamBuffer {
         MemoryReader {
             buffer: self.clone(),
             position: 0,
+            epoch: self.bytes.lock().unwrap_or_else(|e| e.into_inner()).reader_epoch,
         }
     }
 }
@@ -140,6 +150,7 @@ impl Drop for DownloadedSeek<'_> {
 pub struct MemoryReader {
     buffer: Arc<StreamBuffer>,
     position: u64,
+    epoch: u64,
 }
 
 impl Read for MemoryReader {
@@ -149,13 +160,13 @@ impl Read for MemoryReader {
         }
         let mut bytes = self.buffer.bytes.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            if bytes.cancelled {
+            if bytes.cancelled || self.epoch != bytes.reader_epoch {
                 // read_exact and container readers automatically retry
                 // Interrupted. Cancellation is permanent for this reader;
                 // it must escape their retry loop so a new Load can run.
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    "stream cancelled",
+                    "stream reader retired or download cancelled",
                 ));
             }
             if let Some(error) = &bytes.error {
@@ -193,7 +204,7 @@ impl Seek for MemoryReader {
             SeekFrom::Start(n) => n as i128,
             SeekFrom::Current(n) => self.position as i128 + n as i128,
             SeekFrom::End(n) => {
-                while !bytes.done && !bytes.cancelled {
+                while !bytes.done && !bytes.cancelled && self.epoch == bytes.reader_epoch {
                     if self.buffer.downloaded_only.load(Ordering::Acquire) {
                         return Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -209,7 +220,7 @@ impl Seek for MemoryReader {
                 bytes.data.len() as i128 + n as i128
             }
         };
-        if bytes.cancelled {
+        if bytes.cancelled || self.epoch != bytes.reader_epoch {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "stream cancelled",
@@ -252,6 +263,34 @@ impl MediaSource for MemoryReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retiring_blocked_readers_preserves_the_download_and_fresh_readers() {
+        let buffer = StreamBuffer::new();
+        buffer.append(b"a").unwrap();
+        let mut reader = buffer.reader();
+        let mut end_reader = buffer.reader();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read_tx = tx.clone();
+        let reading = std::thread::spawn(move || {
+            read_tx.send(reader.read_exact(&mut [0; 2]).unwrap_err().kind()).unwrap();
+        });
+        let seeking = std::thread::spawn(move || {
+            tx.send(end_reader.seek(SeekFrom::End(0)).unwrap_err().kind()).unwrap();
+        });
+        buffer.retire_readers();
+        for _ in 0..2 {
+            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), io::ErrorKind::ConnectionAborted);
+        }
+        reading.join().unwrap();
+        seeking.join().unwrap();
+        buffer.append(b"bc").unwrap();
+        buffer.finish(Ok(()));
+        assert!(buffer.complete(), "reader interruption must not cancel the producer");
+        let mut actual = [0; 3];
+        buffer.reader().read_exact(&mut actual).unwrap();
+        assert_eq!(&actual, b"abc");
+    }
 
     #[test]
     fn seek_math_and_replay_read_the_same_allocation() {
