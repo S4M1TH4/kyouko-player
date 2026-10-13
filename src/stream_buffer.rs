@@ -21,6 +21,7 @@ pub struct StreamBuffer {
     bytes: Mutex<Bytes>,
     ready: Condvar,
     downloaded_only: AtomicBool,
+    seeking: AtomicBool,
     limit: usize,
 }
 
@@ -34,6 +35,7 @@ impl StreamBuffer {
             bytes: Mutex::new(Bytes::default()),
             ready: Condvar::new(),
             downloaded_only: AtomicBool::new(false),
+            seeking: AtomicBool::new(false),
             limit,
         })
     }
@@ -87,7 +89,18 @@ impl StreamBuffer {
     }
 
     pub fn downloaded_seek(&self) -> DownloadedSeek<'_> {
-        self.downloaded_only.store(true, Ordering::Release);
+        self.seek_mode(true)
+    }
+
+    /// Recovery runs on the producer thread and may wait for fresh bytes.
+    /// Expose seekability without imposing the interactive seek's RAM-only limit.
+    pub fn recovery_seek(&self) -> DownloadedSeek<'_> {
+        self.seek_mode(false)
+    }
+
+    fn seek_mode(&self, downloaded_only: bool) -> DownloadedSeek<'_> {
+        self.downloaded_only.store(downloaded_only, Ordering::Release);
+        self.seeking.store(true, Ordering::Release);
         DownloadedSeek(self)
     }
 
@@ -99,13 +112,14 @@ impl StreamBuffer {
     }
 }
 
-/// During a user seek, refuse uncached reads/offsets instead of waiting for
-/// network data. Normal decoding/probing may wait for the producer.
+/// Temporarily expose container seekability. User seeks refuse uncached reads;
+/// recovery seeks and normal decoding may wait for the producer.
 pub struct DownloadedSeek<'a>(&'a StreamBuffer);
 
 impl Drop for DownloadedSeek<'_> {
     fn drop(&mut self) {
         self.0.downloaded_only.store(false, Ordering::Release);
+        self.0.seeking.store(false, Ordering::Release);
     }
 }
 
@@ -212,11 +226,11 @@ impl MediaSource for MemoryReader {
     // source. Use progressive parsing until complete, then expose random
     // access; a user seek can always access already downloaded bytes.
     fn is_seekable(&self) -> bool {
-        self.buffer.complete() || self.buffer.downloaded_only.load(Ordering::Acquire)
+        self.buffer.complete() || self.buffer.seeking.load(Ordering::Acquire)
     }
     fn byte_len(&self) -> Option<u64> {
         let bytes = self.buffer.bytes.lock().unwrap_or_else(|e| e.into_inner());
-        (bytes.done || self.buffer.downloaded_only.load(Ordering::Acquire))
+        (bytes.done || self.buffer.seeking.load(Ordering::Acquire))
             .then_some(bytes.data.len() as u64)
     }
 }

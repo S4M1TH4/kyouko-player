@@ -387,6 +387,9 @@ pub enum DecoderCmd {
     /// Jump the playhead by a signed offset in seconds. Executed on the
     /// decoder thread; ignored while no track is open.
     SeekRelative(f64),
+    /// Restore the absolute playhead after rebuilding the output. Unlike an
+    /// interactive seek, this may wait for the new stream download on the decoder.
+    RestorePosition(f64),
     /// Drop the current source and go back to park. Wakes the decoder even
     /// when it is parked waiting for chunk-channel space (select! on both).
     Stop,
@@ -639,7 +642,7 @@ impl DecoderLink {
     }
 
     pub fn send(&self, cmd: DecoderCmd) {
-        if matches!(&cmd, DecoderCmd::SeekRelative(delta) if !delta.is_finite()) { return; }
+        if matches!(&cmd, DecoderCmd::SeekRelative(delta) | DecoderCmd::RestorePosition(delta) if !delta.is_finite()) { return; }
         if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown | DecoderCmd::Load(_, _))
             && let Some(f) = &self.interrupt {
                 f();
@@ -653,11 +656,13 @@ impl DecoderLink {
             // blocked reporting status to this same UI. Coalesce only when full.
             let mut latest = None;
             let mut seek = 0.0;
+            let mut restoring = false;
             for command in self.queued.try_iter().chain(std::iter::once(cmd)) {
                 match command {
                     DecoderCmd::SeekRelative(delta) => seek += delta,
+                    DecoderCmd::RestorePosition(position) => { seek = position; restoring = true; }
                     DecoderCmd::Shutdown => { latest = Some(DecoderCmd::Shutdown); seek = 0.0; break; }
-                    control => { latest = Some(control); seek = 0.0; }
+                    control => { latest = Some(control); seek = 0.0; restoring = false; }
                 }
             }
             if let Some(command) = latest {
@@ -665,8 +670,9 @@ impl DecoderLink {
                 self.tx.try_send(command).expect("single serialized decoder producer has room after coalescing");
                 if stopping { return; }
             }
-            if seek != 0.0 && seek.is_finite() {
-                self.tx.try_send(DecoderCmd::SeekRelative(seek)).expect("coalesced decoder queue uses at most two slots");
+            if (seek != 0.0 || restoring) && seek.is_finite() {
+                let command = if restoring { DecoderCmd::RestorePosition(seek.max(0.0)) } else { DecoderCmd::SeekRelative(seek) };
+                self.tx.try_send(command).expect("coalesced decoder queue uses at most two slots");
             }
         }
     }
@@ -780,7 +786,7 @@ impl Broker {
 
     pub fn with_playlist_fetching(mut self) -> Self { self.metadata_enabled = cfg!(windows); self }
 
-    #[cfg(any(not(windows), debug_assertions))]
+    #[cfg(any(not(windows), debug_assertions, test))]
     pub fn background_events(&self) -> Receiver<()> { self.background_rx.clone() }
 
     pub fn poll_background(&mut self) {
@@ -1584,7 +1590,7 @@ impl Broker {
                 );
                 self.persist();
                 if let Some(position) = self.seek_after_open.take() {
-                    self.send_decoder(DecoderCmd::SeekRelative(position));
+                    self.send_decoder(DecoderCmd::RestorePosition(position));
                 }
             }
             Status::OutputReady { epoch } => {
@@ -1883,6 +1889,27 @@ mod tests {
     }
 
     #[test]
+    fn full_decoder_pipe_preserves_absolute_recovery_seek_and_later_adjustments() {
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
+        link.send(DecoderCmd::Load(Source::File("recovery.wav".into()), 1));
+        link.send(DecoderCmd::SeekRelative(9.0));
+        link.send(DecoderCmd::RestorePosition(3.0));
+        link.send(DecoderCmd::SeekRelative(2.0));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, 1))));
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::RestorePosition(5.0))));
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            link.send(DecoderCmd::RestorePosition(value));
+        }
+        assert!(rx.is_empty());
+        link.send(DecoderCmd::RestorePosition(4.0));
+        link.send(DecoderCmd::SeekRelative(1.0));
+        link.send(DecoderCmd::Stop);
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Stop)));
+        assert!(rx.is_empty(), "Stop supersedes a queued restoration");
+    }
+
+    #[test]
     fn saturated_status_and_command_channels_do_not_block_ui_shutdown() {
         let (tx, rx) = crossbeam_channel::bounded(2);
         let link = DecoderLink::with_interrupt(tx, rx.clone(), Arc::new(|| {}));
@@ -1987,7 +2014,7 @@ mod tests {
                 broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
                     channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
                 assert_eq!(broker.shared.phase(), Phase::Paused, "seek completes before output resumes");
-                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(delta)) if (delta - position).abs() < 1e-6));
+                assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RestorePosition(target)) if (target - position).abs() < 1e-6));
                 broker.shared.set_playhead_frames((position * rate as f64) as u64);
                 broker.handle_status(Status::Seeked { load_id: broker.shared.load_id() });
                 assert_eq!(broker.shared.phase(), if playing { Phase::Playing } else { Phase::Paused });
@@ -2051,7 +2078,7 @@ mod tests {
         broker.handle_status(Status::OutputReady { epoch: 6 });
         assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
         broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: latest, sample_rate: 48_000, channels: 2, title: None, duration: None });
-        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(3.0))));
+        assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RestorePosition(3.0))));
         broker.handle_status(Status::SeekFailed { load_id: broker.shared.load_id() });
         assert_eq!(broker.shared.phase(), Phase::Playing, "unseekable sources restart instead of remaining paused");
     }
@@ -2069,7 +2096,7 @@ mod tests {
             assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::Load(_, _))));
             broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: source.clone(), sample_rate: 22_050,
                 channels: 1, title: None, duration: Some(Duration::from_secs(60)) });
-            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::SeekRelative(5.0))));
+            assert!(matches!(receiver.try_recv(), Ok(DecoderCmd::RestorePosition(5.0))));
             assert_eq!(broker.shared.phase(), Phase::Paused);
         }
         broker.handle_command(Command::TogglePause); // cancel resume while the seek is pending

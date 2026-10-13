@@ -731,7 +731,7 @@ fn run_decoder(
         let first = match cmd {
             DecoderCmd::Load(s, load_id) => (s, load_id),
             // Nothing is open — a seek has nothing to move.
-            DecoderCmd::SeekRelative(_) => continue,
+            DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_) => continue,
             DecoderCmd::Stop => { cache = None; continue; }
             DecoderCmd::Shutdown => break,
         };
@@ -1078,12 +1078,32 @@ fn open_track_inner(
     })
 }
 
+#[derive(Debug)]
+enum DecoderSeek {
+    Relative(f64),
+    Restore(f64),
+}
+
+impl From<f64> for DecoderSeek {
+    fn from(delta: f64) -> Self { Self::Relative(delta) }
+}
+
+impl DecoderSeek {
+    fn from_command(command: DecoderCmd) -> Self {
+        match command {
+            DecoderCmd::SeekRelative(delta) => Self::Relative(delta),
+            DecoderCmd::RestorePosition(position) => Self::Restore(position),
+            _ => unreachable!("only seek commands enter the seek path"),
+        }
+    }
+}
+
 enum SendOutcome {
     Sent,
     Stopped,
     NewSource(Source, u64),
     /// A seek arrived while parked waiting for chunk space.
-    SeekRelative(f64),
+    Seek(DecoderSeek),
     Shutdown,
     SinkGone,
 }
@@ -1143,7 +1163,8 @@ fn send_command(msg: Result<DecoderCmd, crossbeam_channel::RecvError>) -> SendOu
         Ok(DecoderCmd::Stop) => SendOutcome::Stopped,
         Ok(DecoderCmd::Shutdown) | Err(_) => SendOutcome::Shutdown,
         Ok(DecoderCmd::Load(source, id)) => SendOutcome::NewSource(source, id),
-        Ok(DecoderCmd::SeekRelative(delta)) => SendOutcome::SeekRelative(delta),
+        Ok(command @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))) =>
+            SendOutcome::Seek(DecoderSeek::from_command(command)),
     }
 }
 
@@ -1214,10 +1235,12 @@ fn fetch_title_blocking(
 /// only, without HTTP requests. Returns true when the playhead moved. Resets codec
 /// state, stale buffers, the chunk generation and the playhead so decoding
 /// resumes seamlessly at the new position.
+/// An absolute recovery seek may wait for fresh download bytes on this producer
+/// thread; cancellation unblocks it. Interactive relative seeks never wait.
 fn seek_relative(
     track: &mut ActiveTrack,
     shared: &SharedState,
-    delta: f64,
+    seek: impl Into<DecoderSeek>,
     pending: &mut Vec<f32>,
     eq: &mut EqChain,
     resampler: &mut Option<LinearResampler>,
@@ -1228,12 +1251,20 @@ fn seek_relative(
         log_info!("DECODER", "container does not support seeking");
         return track.seek_failed();
     }
-    if !delta.is_finite() { return track.seek_failed(); }
     let previous = shared.position().as_secs_f64();
+    let seek = seek.into();
+    let delta = match seek {
+        DecoderSeek::Relative(delta) => delta,
+        DecoderSeek::Restore(position) => position - previous,
+    };
+    if !delta.is_finite() { return track.seek_failed(); }
     let mut target = (previous + delta).max(0.0);
     if let Some(duration) = track.duration { target = target.min(duration.as_secs_f64()); }
     let buffer = track.stream_buffer.clone();
-    let _downloaded_seek = buffer.as_ref().map(|buffer| buffer.downloaded_seek());
+    let _downloaded_seek = buffer.as_ref().map(|buffer| match seek {
+        DecoderSeek::Relative(_) => buffer.downloaded_seek(),
+        DecoderSeek::Restore(_) => buffer.recovery_seek(),
+    });
     let to = SeekTo::Time {
         time: Time { seconds: target as u64, frac: target.fract() },
         track_id: Some(track.track_id),
@@ -1328,7 +1359,7 @@ fn play_source(
         Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
         Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
         Ok(DecoderCmd::Load(s, load_id)) => return PlayExit::NewSource(s, load_id),
-        Ok(DecoderCmd::SeekRelative(_)) | Err(TryRecvError::Empty) => {}
+        Ok(DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_)) | Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => return PlayExit::Shutdown,
     }
     let mut track = match open_track(&source, child_slot, buffer_slot, replay_buffer) {
@@ -1398,12 +1429,12 @@ fn play_source(
                     exit = PlayExit::NewSource(s, load_id);
                     break 'play;
                 }
-                Ok(DecoderCmd::SeekRelative(delta)) => {
+                Ok(command @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))) => {
                     if load_id != shared.load_id() { continue; }
                     if seek_relative(
                         &mut track,
                         shared,
-                        delta,
+                        DecoderSeek::from_command(command),
                         &mut pending,
                         &mut eq,
                         &mut resampler,
@@ -1569,11 +1600,11 @@ fn play_source(
                         exit = PlayExit::Stopped;
                         break 'play;
                     }
-                    SendOutcome::SeekRelative(delta) => {
+                    SendOutcome::Seek(seek) => {
                         if seek_relative(
                             &mut track,
                             shared,
-                            delta,
+                            seek,
                             &mut pending,
                             &mut eq,
                             &mut resampler,
@@ -1626,11 +1657,11 @@ fn play_source(
                         exit = PlayExit::Stopped;
                         break;
                     }
-                    SendOutcome::SeekRelative(d) => {
+                    SendOutcome::Seek(seek) => {
                         if seek_relative(
                             &mut track,
                             shared,
-                            d,
+                            seek,
                             &mut pending,
                             &mut eq,
                             &mut resampler,
@@ -1696,8 +1727,8 @@ fn play_source(
                             Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
                             Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
                             Ok(DecoderCmd::Load(s, load_id)) => return PlayExit::NewSource(s, load_id),
-                            Ok(DecoderCmd::SeekRelative(delta)) => {
-                                if seek_relative(&mut track, shared, delta, &mut pending, &mut eq, &mut resampler, &mut generation) {
+                            Ok(command @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))) => {
+                                if seek_relative(&mut track, shared, DecoderSeek::from_command(command), &mut pending, &mut eq, &mut resampler, &mut generation) {
                                     chunk_tx.begin(generation);
                                     let _ = status_tx.send(Status::Seeked { load_id });
                                     crate::ui::wake_status();
@@ -2020,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the saved local track/folder and an actual output device"]
+    #[ignore = "requires a saved track or diagnostic URL and an actual output device"]
     fn saved_track_device_hotswap_cycles_recover_on_wasapi() {
         use crate::broker::{Command as PlayerCommand, DecoderLink, Flow, Phase};
         let mut saved = crate::config::load();
@@ -2030,6 +2061,15 @@ mod tests {
             saved.last_folder = None;
             saved.last_playlist_index = None;
         }
+        if let Ok(url) = std::env::var("KYOUKO_TEST_URL") {
+            assert!(url.starts_with("https://"), "diagnostic override must be an HTTPS URL");
+            saved.last_track = Some(url);
+            saved.last_folder = None;
+            saved.last_playlist_index = None;
+        }
+        // Network extraction and a fresh download can take longer than ten
+        // seconds. Apply the same allowance to initial load and every reload.
+        let load_timeout = Duration::from_secs(60);
         let shared = SharedState::new();
         restore_test_controls(&shared, &saved);
         shared.set_loop_enabled(saved.loop_enabled);
@@ -2042,18 +2082,49 @@ mod tests {
         output.start_notifications();
         // No saver is installed: use the real saved selection/controls without
         // writing state.cfg or injecting any window/keyboard/mouse input.
-        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(command_tx, command_rx.clone(), audio.controls.clone().hook()));
+        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(command_tx, command_rx.clone(), audio.controls.clone().hook())).with_playlist_fetching();
+        let background_events = broker.background_events();
+        // Always shut down and join the decoder, even when a live assertion or
+        // deadline fails. Otherwise a diagnostic could retain its child process.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let started = std::time::Instant::now();
         broker.handle_command(PlayerCommand::RestoreState { last_folder: saved.last_folder,
             last_track: saved.last_track, last_playlist_index: saved.last_playlist_index });
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + load_timeout;
         while shared.phase() != Phase::Paused {
-            broker.handle_status(status_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).unwrap());
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "initial load stalled");
+            select! {
+                recv(status_rx) -> status => broker.handle_status(status.unwrap()),
+                recv(background_events) -> _ => broker.poll_background(),
+                default(remaining) => panic!("initial load timed out"),
+            }
             output.handle_device_events(&mut broker);
         }
+        println!("initial stream loaded in {:.2}s", started.elapsed().as_secs_f64());
         broker.handle_command(PlayerCommand::TogglePause);
         output.set_playing(true);
         let output_events = output.signals.events.clone();
         for cycle in 0..4 {
+            // Playing is announced before the producer's 500 ms PCM watermark
+            // fills. Give startup priming its own interval rather than counting
+            // that deliberate silence as lost steady-state playback time.
+            let prime_until = std::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                let remaining = prime_until.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() { break; }
+                select! {
+                    recv(status_rx) -> status => broker.handle_status(status.unwrap()),
+                    recv(output_events) -> _ => output.handle_device_events(&mut broker),
+                    recv(background_events) -> _ => broker.poll_background(),
+                    default(remaining) => break,
+                }
+                output.handle_device_events(&mut broker);
+                output.set_playing(shared.phase() == Phase::Playing);
+            }
+            let counters = output.receiver.as_ref().unwrap().state.clone();
+            assert_eq!(counters.ready_generation.load(Ordering::Acquire), shared.generation(), "PCM must be primed before measuring steady playback");
+            let before_underruns = counters.underrun_frames.load(Ordering::Relaxed);
             let start_position = shared.position().as_secs_f64();
             let observe_until = std::time::Instant::now() + Duration::from_secs(2);
             // Service real output notifications during the fault interval, just
@@ -2064,6 +2135,7 @@ mod tests {
                 select! {
                     recv(status_rx) -> status => broker.handle_status(status.unwrap()),
                     recv(output_events) -> _ => output.handle_device_events(&mut broker),
+                    recv(background_events) -> _ => broker.poll_background(),
                     default(remaining) => break,
                 }
                 output.handle_device_events(&mut broker);
@@ -2072,6 +2144,8 @@ mod tests {
             let position = shared.position().as_secs_f64();
             assert!(position - start_position > 1.7, "healthy playback must continue between device cycles: {}s advanced", position - start_position);
             assert_eq!(shared.phase(), Phase::Playing);
+            assert_eq!(counters.underrun_frames.load(Ordering::Relaxed), before_underruns, "no underruns during healthy playback");
+            drop(counters);
             let old_pool = Arc::downgrade(&output.receiver.as_ref().unwrap().state);
             let epoch = output.signals.stream_state.load(Ordering::Acquire) & !1;
             // Invoke the same callback sink used by CPAL's device-error callback.
@@ -2083,13 +2157,15 @@ mod tests {
             }
             output.handle_device_events(&mut broker);
             assert_eq!(shared.phase(), Phase::Paused);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let recovery_started = std::time::Instant::now();
+            let deadline = recovery_started + load_timeout;
             while shared.phase() != Phase::Playing {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 assert!(!remaining.is_zero(), "device recovery stalled");
                 select! {
                     recv(status_rx) -> status => broker.handle_status(status.unwrap()),
                     recv(output_events) -> _ => output.handle_device_events(&mut broker),
+                    recv(background_events) -> _ => broker.poll_background(),
                     default(remaining) => panic!("device recovery timed out"),
                 }
                 output.handle_device_events(&mut broker);
@@ -2103,7 +2179,7 @@ mod tests {
             output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
             output.handle_device_events(&mut broker);
             assert_eq!(output.signals.stream_state.load(Ordering::Acquire) & !1, new_epoch);
-            println!("device cycle {}: recovered at {:.3}s, retired pool freed, decoder thread unchanged", cycle + 1, shared.position().as_secs_f64());
+            println!("device cycle {}: recovered in {:.2}s at {:.3}s, retired pool freed, decoder thread unchanged", cycle + 1, recovery_started.elapsed().as_secs_f64(), shared.position().as_secs_f64());
         }
         #[cfg(windows)]
         unsafe {
@@ -2111,10 +2187,12 @@ mod tests {
             windows::Win32::System::Ole::OleInitialize(None).unwrap();
             windows::Win32::System::Ole::OleUninitialize();
         }
+        }));
         assert!(matches!(broker.handle_command(PlayerCommand::Quit), Flow::Exit));
         output.set_playing(false);
         drop(output);
         audio.decoder.join().unwrap();
+        if let Err(error) = result { std::panic::resume_unwind(error); }
     }
 
     fn push_pcm(sender: &ChunkSender, cmds: &Receiver<DecoderCmd>, samples: &[f32], generation: u64) {
@@ -2260,7 +2338,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = bounded(1);
         for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0); }
         cmd_tx.send(DecoderCmd::SeekRelative(5.0)).unwrap();
-        assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0), SendOutcome::SeekRelative(5.0)));
+        assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0), SendOutcome::Seek(DecoderSeek::Relative(5.0))));
         assert_eq!(sender.free.len(), 1, "the unsent block must return to its pool");
         sender.begin(1); // paused output never needs to run to free stale blocks
         assert!(receiver.queue.is_empty());
@@ -2682,6 +2760,43 @@ mod tests {
     }
 
     #[test]
+    fn device_recovery_seek_waits_for_progressive_mp4_bytes_and_can_be_cancelled() {
+        for cancel in [false, true] {
+            let buffer = StreamBuffer::new();
+            let data = include_bytes!("../tests/fixtures/silence.m4a");
+            let payload = data.windows(4).position(|bytes| bytes == b"mdat").unwrap() + 4;
+            let prefix = payload + (data.len() - payload) / 2;
+            buffer.append(&data[..prefix]).unwrap();
+            let mut track = open_track(&Source::from_raw("https://youtu.be/recovery"),
+                &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), Some(buffer.clone())).unwrap();
+            let shared = SharedState::new();
+            shared.set_sample_rate(48_000);
+            let (started_tx, started_rx) = bounded(1);
+            let (result_tx, result_rx) = bounded(1);
+            let worker = thread::spawn(move || {
+                let mut generation = shared.generation();
+                started_tx.send(()).unwrap();
+                let restored = seek_relative(&mut track, &shared, DecoderSeek::Restore(0.2),
+                    &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation);
+                result_tx.send((restored, shared.position())).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let premature = result_rx.recv_timeout(Duration::from_millis(30));
+            if cancel { buffer.cancel(); } else {
+                buffer.append(&data[prefix..]).unwrap();
+                buffer.finish(Ok(()));
+            }
+            let result = match premature { Ok(result) => Ok(result), Err(_) => result_rx.recv_timeout(Duration::from_secs(1)) };
+            buffer.cancel(); // unblock the worker even if this regression fails
+            worker.join().unwrap();
+            assert!(premature.is_err(), "recovery waits instead of refusing an uncached target");
+            let (restored, position) = result.unwrap();
+            assert_eq!(restored, !cancel);
+            if !cancel { assert!(position >= Duration::from_millis(150)); }
+        }
+    }
+
+    #[test]
     fn zero_gain_eq_is_exact_passthrough() {
         let mut eq = EqChain::new();
         eq.rebuild(&[0.0; EQ_BANDS], 44_100, 2);
@@ -2869,30 +2984,60 @@ mod tests {
         let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
             cmd_tx.clone(), cmd_rx.clone(), audio.controls.clone().hook(),
-        ));
+        )).with_playlist_fetching();
+        let background_events = broker.background_events();
+        let playlist = crate::broker::playlist_index_of(&url).is_some();
         let result = (|| -> Result<(), String> {
             // Changing a live, partially downloaded stream must unblock the
-            // old reader and start the next URL on the same decoder thread.
-            for raw in [&*url, "https://www.youtube.com/watch?v=jNQXAC9IVRw"] {
-                broker.handle_command(PlayerCommand::Load {
-                    source: Source::from_raw(raw), paused: false,
-                });
-                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            // old reader and advance a playlist (or open another single video)
+            // on the same decoder thread.
+            for step in 0..2 {
+                let raw = if step == 0 || playlist { &*url } else { "https://www.youtube.com/watch?v=jNQXAC9IVRw" };
+                let started = std::time::Instant::now();
+                if step == 1 && playlist {
+                    broker.handle_command(PlayerCommand::NextTrack);
+                } else {
+                    broker.handle_command(PlayerCommand::Load {
+                        source: Source::from_raw(raw), paused: false,
+                    });
+                }
+                let deadline = started + Duration::from_secs(60);
                 while shared.phase() == Phase::Loading {
-                    let status = status_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                        .map_err(|e| format!("waiting for {raw} to open: {e}"))?;
-                    broker.handle_status(status);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    select! {
+                        recv(status_rx) -> status => broker.handle_status(status.map_err(|e| e.to_string())?),
+                        recv(background_events) -> _ => broker.poll_background(),
+                        default(remaining) => return Err(format!("waiting for {raw} to open: timed out after 60s")),
+                    }
                 }
                 if shared.phase() != Phase::Playing {
                     return Err(format!("stream did not enter Playing: {raw}"));
                 }
                 loop {
-                    let chunk = audio.chunk_rx.queue.recv_timeout(Duration::from_secs(10))
+                    let chunk = audio.chunk_rx.queue.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                         .map_err(|e| format!("waiting for decoded audio: {e}"))?;
-                    if chunk.generation != shared.generation() { continue; }
-                    assert!(!chunk.samples().is_empty());
-                    assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
+                    let current = chunk.generation == shared.generation();
+                    if current {
+                        assert!(!chunk.samples().is_empty());
+                        assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
+                    }
+                    recycle(&audio.chunk_rx.recycle, chunk);
+                    if !current { continue; }
                     break;
+                }
+                println!("stream step {}: decoded audio in {:.2}s", step + 1, started.elapsed().as_secs_f64());
+                if playlist {
+                    while broker.track_list().loading {
+                        background_events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                            .map_err(|e| format!("waiting for playlist metadata: {e}"))?;
+                        broker.poll_background();
+                    }
+                    let list = broker.track_list();
+                    if list.titles.len() < 2 || list.current != Some(step) {
+                        return Err(format!("playlist step {}: unexpected list {list:?}", step + 1));
+                    }
+                    println!("playlist: {} tracks, selected entry {}: {}", list.titles.len(), step + 1, list.titles[step]);
+                    assert_eq!(broker.persist_snapshot().last_playlist_index, Some(step + 1));
                 }
             }
             Ok(())

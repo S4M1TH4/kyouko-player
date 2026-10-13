@@ -59,6 +59,8 @@ logging. The application has no terminal command reader or system tray icon.
   data; repeating a completely cached stream avoids extraction and download.
 - Audio output error recovery and headphone jack hot-swap handling. Recovery
   preserves selection, playback intent, and position where seeking is supported.
+  Streaming recovery waits on the decoder for the saved position to download
+  before resuming; interactive seeks remain limited to bytes already in RAM.
 - Atomic persistence of volume, EQ, repeat, folder, and track selection.
 - Owned playlist metadata jobs, cancelled on playlist changes or shutdown, with
   a 45-second process deadline and bounded output. Non-finite configuration
@@ -143,6 +145,20 @@ cargo build --release
 The default tests run without network access or an audio device. Diagnostics
 that require saved local media, WASAPI output, or live streaming are opt-in
 ignored tests.
+
+To test a specific YouTube video or playlist in PowerShell:
+
+```powershell
+$env:KYOUKO_TEST_URL = 'https://www.youtube.com/watch?v=DzHqS7QW3V4'
+cargo test live_youtube_decodes_audio -- --ignored --nocapture
+cargo test saved_track_device_hotswap_cycles_recover_on_wasapi -- --ignored --nocapture
+Remove-Item Env:KYOUKO_TEST_URL
+```
+
+These diagnostics allow 60 seconds per load, leave saved history unchanged,
+and clean up source processes on completion or failure. The playlist diagnostic
+loads its titles and advances to entry 2. The recovery diagnostic reopens real
+WASAPI streams after four injected output faults; it does not unplug hardware.
 
 ## Source map
 
