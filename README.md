@@ -168,8 +168,8 @@ cargo build --release
 `.github/workflows/windows.yml` runs these checks on a fresh Windows 2025
 runner using Rust 1.99.0. It also checks the embedded executable icon, release
 logging, and duplicate-launch protection. It builds for verification and does
-not upload executables or publish packages. AAC fixtures in `tests/fixtures/`
-are repository inputs, so tests do not depend on ignored local files.
+not upload executables or publish packages. Audio tests generate their WAV
+and AAC/MP4 samples in memory using Rust; no fixture files or FFmpeg are needed.
 
 The default tests run without network access or an audio device. Diagnostics
 that require saved local media, WASAPI output, or live streaming are opt-in

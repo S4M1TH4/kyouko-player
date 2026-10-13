@@ -2624,6 +2624,97 @@ mod tests {
         wav
     }
 
+    // Build a fast-start MP4 entirely in memory. AAC-LC permits a single
+    // channel element with zero scalefactor bands: its spectrum is silence,
+    // so no encoder, binary fixture, network, or filesystem is needed.
+    fn silent_aac_mp4() -> Vec<u8> {
+        fn words(values: &[u32]) -> Vec<u8> {
+            values.iter().flat_map(|value| value.to_be_bytes()).collect()
+        }
+        fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut bytes = words(&[u32::try_from(payload.len() + 8).unwrap()]);
+            bytes.extend_from_slice(kind);
+            bytes.extend_from_slice(payload);
+            bytes
+        }
+        fn full_atom(kind: &[u8; 4], flags: u32, payload: &[u8]) -> Vec<u8> {
+            atom(kind, &[words(&[flags]), payload.to_vec()].concat())
+        }
+        fn descriptor(tag: u8, payload: &[u8]) -> Vec<u8> {
+            // All descriptors here fit in a one-byte ISO descriptor length.
+            assert!(payload.len() < 128);
+            [&[tag, payload.len() as u8][..], payload].concat()
+        }
+
+        const RATE: u32 = 48_000;
+        const PACKETS: u32 = 12;
+        const FRAMES_PER_PACKET: u32 = 1024;
+        const DURATION: u32 = PACKETS * FRAMES_PER_PACKET;
+
+        // Encode raw_data_block(): SCE id/tag, global gain, long-window ICS
+        // with no bands/prediction, no pulse/TNS/gain control, then ID_END.
+        let fields = [(0, 3), (0, 4), (140, 8), (0, 1), (0, 2), (0, 1),
+            (0, 6), (0, 1), (0, 1), (0, 1), (0, 1), (7, 3)];
+        let mut frame = 0u32;
+        let mut bits = 0;
+        for (value, width) in fields {
+            frame = (frame << width) | value;
+            bits += width;
+        }
+        assert_eq!(bits, 32);
+        let frame = frame.to_be_bytes();
+
+        // AudioSpecificConfig: AAC-LC (2), 48 kHz (index 3), mono (1),
+        // 1024-sample frames, no core dependency or extension.
+        let asc = ((2u16 << 11) | (3 << 7) | (1 << 3)).to_be_bytes();
+        let decoder_config = descriptor(4, &[
+            vec![0x40, 0x15, 0, 0, 0], words(&[0, 0]), descriptor(5, &asc),
+        ].concat());
+        let esds = full_atom(b"esds", 0, &descriptor(3, &[
+            vec![0, 1, 0], decoder_config, descriptor(6, &[2]),
+        ].concat()));
+        let sample_entry = atom(b"mp4a", &[
+            words(&[0, 1, 0, 0, 0x0001_0010, 0, RATE << 16]), esds,
+        ].concat());
+        let ftyp = atom(b"ftyp", &[b"M4A ".to_vec(), words(&[0]), b"M4A isom".to_vec()].concat());
+
+        // One chunk contains all fixed-size packets. Generate moov twice:
+        // its size is stable, so the final stco points exactly past mdat's
+        // header. Keeping moov first exercises progressive MP4 probing.
+        let movie = |offset| {
+            let stbl = atom(b"stbl", &[
+                full_atom(b"stsd", 0, &[words(&[1]), sample_entry.clone()].concat()),
+                full_atom(b"stts", 0, &words(&[1, PACKETS, FRAMES_PER_PACKET])),
+                full_atom(b"stsc", 0, &words(&[1, 1, PACKETS, 1])),
+                full_atom(b"stsz", 0, &words(&[frame.len() as u32, PACKETS])),
+                full_atom(b"stco", 0, &words(&[1, offset])),
+            ].concat());
+            let dinf = atom(b"dinf", &full_atom(b"dref", 0, &[
+                words(&[1]), full_atom(b"url ", 1, &[]),
+            ].concat()));
+            let minf = atom(b"minf", &[
+                full_atom(b"smhd", 0, &words(&[0])), dinf, stbl,
+            ].concat());
+            let mdia = atom(b"mdia", &[
+                full_atom(b"mdhd", 0, &words(&[0, 0, RATE, DURATION, 0x55c4_0000])),
+                full_atom(b"hdlr", 0, &[words(&[0, u32::from_be_bytes(*b"soun"), 0, 0, 0]), b"Test\0".to_vec()].concat()),
+                minf,
+            ].concat());
+            let matrix = words(&[0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000]);
+            let tkhd = full_atom(b"tkhd", 3, &[
+                words(&[0, 0, 1, 0, DURATION, 0, 0, 0, 0x0100_0000]),
+                matrix.clone(), words(&[0, 0]),
+            ].concat());
+            let mvhd = full_atom(b"mvhd", 0, &[
+                words(&[0, 0, RATE, DURATION, 0x0001_0000, 0x0100_0000, 0, 0]),
+                matrix, words(&[0, 0, 0, 0, 0, 0, 2]),
+            ].concat());
+            atom(b"moov", &[mvhd, atom(b"trak", &[tkhd, mdia].concat())].concat())
+        };
+        let offset = u32::try_from(ftyp.len() + movie(0).len() + 8).unwrap();
+        [ftyp, movie(offset), atom(b"mdat", &frame.repeat(PACKETS as usize))].concat()
+    }
+
     #[test]
     fn track_change_or_repeat_off_releases_the_previous_stream_allocation() {
         let source = Source::from_raw("https://youtu.be/cache");
@@ -2785,11 +2876,36 @@ mod tests {
     }
 
     #[test]
+    fn generated_aac_mp4_decodes_twelve_silent_mono_packets_at_48_khz() {
+        let buffer = StreamBuffer::new();
+        buffer.append(&silent_aac_mp4()).unwrap();
+        buffer.finish(Ok(()));
+        let mut track = open_track(&Source::from_raw("https://youtu.be/generated"),
+            &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), Some(buffer)).unwrap();
+        assert_eq!(track.duration, Some(Duration::from_millis(256)));
+        let mut frames = 0;
+        for _ in 0..12 {
+            let packet = track.format.next_packet().unwrap();
+            let decoded = track.decoder.decode(&packet).unwrap();
+            assert_eq!(decoded.spec().rate, 48_000);
+            assert_eq!(decoded.spec().channels.count(), 1);
+            assert_eq!(decoded.frames(), 1024);
+            frames += decoded.frames();
+            let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+            samples.copy_interleaved_ref(decoded);
+            assert!(samples.samples().iter().all(|sample| *sample == 0.0));
+        }
+        assert_eq!(frames, 12_288);
+        assert!(matches!(track.format.next_packet(), Err(SymphoniaError::IoError(error))
+            if error.kind() == ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
     fn progressive_aac_mp4_starts_and_seeks_before_download_finishes() {
         let buffer = StreamBuffer::new();
         // Intentionally leave the producer unfinished: MP4 must probe via
         // its progressive path, not require a final HTTP/file length.
-        let data = include_bytes!("../tests/fixtures/silence.m4a");
+        let data = silent_aac_mp4();
         let payload = data.windows(4).position(|bytes| bytes == b"mdat").unwrap() + 4;
         let prefix = payload + (data.len() - payload) / 2;
         buffer.append(&data[..prefix]).unwrap();
@@ -2817,7 +2933,7 @@ mod tests {
     fn device_recovery_seek_waits_for_progressive_mp4_bytes_and_can_be_cancelled() {
         for cancel in [false, true] {
             let buffer = StreamBuffer::new();
-            let data = include_bytes!("../tests/fixtures/silence.m4a");
+            let data = silent_aac_mp4();
             let payload = data.windows(4).position(|bytes| bytes == b"mdat").unwrap() + 4;
             let prefix = payload + (data.len() - payload) / 2;
             buffer.append(&data[..prefix]).unwrap();
@@ -2873,7 +2989,7 @@ mod tests {
 
     #[test]
     fn mp4_sample_entry_rate_cannot_change_decoded_pcm_timing() {
-        let fixture = include_bytes!("../tests/fixtures/silence.m4a");
+        let fixture = silent_aac_mp4();
         let entry = fixture.windows(4).position(|bytes| bytes == b"mp4a").unwrap();
         // AudioSampleEntry stores a 16.16 rate 28 bytes after its type.
         let rate_offset = entry + 28;

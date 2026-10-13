@@ -1,9 +1,5 @@
 /target
-/tests/*
-!/tests/fixtures/
-/tests/fixtures/*
-!/tests/fixtures/README.md
-!/tests/fixtures/silence.m4a
+/tests
 /txt
 ARCHITECTURE.md
 /state.cfg
