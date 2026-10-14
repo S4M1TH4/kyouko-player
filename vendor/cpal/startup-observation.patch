@@ -1,0 +1,164 @@
+--- a/src/host/wasapi/stream.rs
++++ b/src/host/wasapi/stream.rs
+@@ -4,7 +4,7 @@
+     ptr, slice,
+     sync::{
+         atomic::{AtomicBool, Ordering},
+-        mpsc::{channel, Receiver, Sender},
++        mpsc::{channel, sync_channel, Receiver, Sender},
+         Arc,
+     },
+     thread::{self, JoinHandle},
+@@ -189,11 +189,54 @@
+     }
+ }
+ 
++/// Result captured on the output worker before any data callback. This is a
++/// local instrumentation extension; thread priority is a startup snapshot,
++/// not a claim about Windows' dynamic scheduler priority at every instant.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum OutputPromotion {
++    Disabled,
++    Mmcss,
++    Fallback { mmcss_error: String },
++    Failed { mmcss_error: String, fallback_error: String },
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct OutputWorkerStartup {
++    pub thread_id: u32,
++    pub thread_priority: Option<i32>,
++    pub promotion: OutputPromotion,
++}
++
++fn output_worker_startup(period_frames: FrameCount, sample_rate: SampleRate) -> OutputWorkerStartup {
++    #[cfg(feature = "realtime")]
++    let promotion = match audio_thread_priority::promote_current_thread_to_real_time(period_frames, sample_rate) {
++        Ok(_) => OutputPromotion::Mmcss,
++        Err(error) => {
++            let mmcss_error = error.to_string();
++            match unsafe { Threading::SetThreadPriority(Threading::GetCurrentThread(), Threading::THREAD_PRIORITY_TIME_CRITICAL) } {
++                Ok(()) => OutputPromotion::Fallback { mmcss_error },
++                Err(error) => OutputPromotion::Failed { mmcss_error, fallback_error: error.to_string() },
++            }
++        }
++    };
++    #[cfg(not(feature = "realtime"))]
++    let promotion = {
++        let _ = (period_frames, sample_rate);
++        OutputPromotion::Disabled
++    };
++    let priority = unsafe { Threading::GetThreadPriority(Threading::GetCurrentThread()) };
++    OutputWorkerStartup {
++        thread_id: unsafe { Threading::GetCurrentThreadId() },
++        thread_priority: (priority != i32::MAX).then_some(priority),
++        promotion,
++    }
++}
++
+ pub struct Stream {
++    output_startup: Option<OutputWorkerStartup>,
+     /// The high-priority audio processing thread calling callbacks.
+     /// Option used for moving out in destructor.
+     ///
+-    /// TODO: Actually set the thread priority.
+     thread: Option<JoinHandle<()>>,
+ 
+     // Commands processed by the `run()` method that is currently running.
+@@ -372,6 +415,7 @@
+ 
+         latch.add_thread(thread.thread().clone());
+         let stream = Stream {
++            output_startup: None,
+             thread: Some(thread),
+             commands: tx,
+             pending_scheduled_event,
+@@ -429,9 +473,14 @@
+         let mut latch = Latch::new();
+         let waiter = latch.waiter();
+ 
++        let (startup_tx, startup_rx) = sync_channel(1);
+         let thread = thread::Builder::new()
+             .name("cpal_wasapi_out".to_owned())
+             .spawn(move || {
++                // Initialization and publication run before the latch and first
++                // callback. The constructor receives one result, without polling.
++                let startup = output_worker_startup(run_context.stream.period_frames, run_context.stream.config.sample_rate);
++                let _ = startup_tx.send(startup);
+                 waiter.wait();
+                 run_output(run_context, &mut data_callback, &error_callback)
+             })
+@@ -442,8 +491,10 @@
+                 )
+             })?;
+ 
++        let output_startup = startup_rx.recv().ok();
+         latch.add_thread(thread.thread().clone());
+         let stream = Stream {
++            output_startup,
+             thread: Some(thread),
+             commands: tx,
+             pending_scheduled_event,
+@@ -453,6 +504,12 @@
+             latch,
+         };
+         Ok(stream)
++    }
++
++    /// Startup scheduling result for output streams (None for input or if
++    /// initialization did not publish a result). Read only from the owner.
++    pub fn output_worker_startup(&self) -> Option<&OutputWorkerStartup> {
++        self.output_startup.as_ref()
+     }
+ 
+     /// Releases the latch so the worker thread can begin processing audio callbacks.
+@@ -658,14 +715,6 @@
+     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
+     error_callback: &ErrorCallbackArc,
+ ) {
+-    #[cfg(feature = "realtime")]
+-    if let Err(err) = boost_current_thread_priority(
+-        run_ctxt.stream.period_frames,
+-        run_ctxt.stream.config.sample_rate,
+-    ) {
+-        emit_error(error_callback, err);
+-    }
+-
+     // The clock frequency is constant for the stream's lifetime.
+     let clock_frequency = match unsafe { run_ctxt.stream.audio_clock.GetFrequency() }
+         .context("Failed to get audio clock frequency")
+--- a/src/host/wasapi/mod.rs
++++ b/src/host/wasapi/mod.rs
+@@ -12,7 +12,7 @@
+     SupportedOutputConfigs,
+ };
+ #[allow(unused_imports)]
+-pub use self::stream::Stream;
++pub use self::stream::{Stream, OutputPromotion, OutputWorkerStartup};
+ use crate::{traits::HostTrait, Error, ErrorKind};
+ 
+ mod device;
+--- a/src/platform/mod.rs
++++ b/src/platform/mod.rs
+@@ -5,6 +5,11 @@
+ //! types are useful in the case that users require switching between audio host APIs at runtime.
+ 
+ pub use self::platform_impl::*;
++
++#[cfg(windows)]
++pub use crate::host::wasapi::{OutputPromotion, OutputWorkerStartup};
++
++
+ 
+ #[cfg(all(
+     feature = "jack",
+--- a/src/host/mod.rs
++++ b/src/host/mod.rs
+@@ -239,6 +239,7 @@
+     feature = "audioworklet",
+ ))]
+ #[inline]
++#[cfg_attr(windows, allow(dead_code))]
+ pub(crate) fn frames_to_duration(
+     frames: crate::FrameCount,
+     rate: crate::SampleRate,
