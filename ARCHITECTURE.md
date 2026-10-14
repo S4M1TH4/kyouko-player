@@ -81,7 +81,7 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
 | `windows` 0.62.2 | Win32/OLE bindings, feature-gated | see `Cargo.toml` feature list |
 | `windows-core` 0.62 (direct dep) | `#[implement]` COM macro support | keeps notification/OLE interface implementations bound to the matching `windows` version |
 | `symphonia` 0.5.5 | local-file decode/probe | |
-| `cpal` 0.18.2 | WASAPI output | closes failed-worker event handles and joins retired workers during stream teardown |
+| `cpal` 0.18.2 | WASAPI output | pinned local source patch exposes worker startup; default `realtime` feature requests MMCSS Audio, then TIME_CRITICAL fallback; joins retired workers |
 | `crossbeam-channel` | cross-thread message arteries | bounded, no async runtime |
 | `atomic-wait` 1.1 | atomic wait/wake | Windows `WaitOnAddress` / `WakeByAddressSingle`; no spinning |
 | `serde_json` | escaped playlist title decoding | keeps multiline/Unicode titles at their original playlist index |
@@ -311,7 +311,10 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
 - **Hot-swap ownership and bounds**: CPAL error callbacks and Windows endpoint
   callbacks only latch bounded events and wake `WM_APP_OUTPUT`; rebuilding and
   destruction occur on the stream's owning UI thread. Stream epochs reject
-  late errors from retired workers. The owner re-queries the current eConsole
+  late startup results, errors and device advisories from retired workers. Epochs
+  are multiples of four; failure and device-advisory flags share the same atomic
+  word. A single epoch-qualified CAS prevents an old advisory/error from
+  flagging a new stream even when it races retirement. The owner re-queries the current eConsole
   render default, resolves a concrete CPAL endpoint, then selects its native
   rate/layout. Binding a concrete endpoint avoids default auto-follow activation
   changing the UI's COM apartment; the app's own notifications handle routing.
@@ -334,6 +337,28 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   500 ms of successfully rendered PCM. No retry timer/polling loop exists.
   DeviceChanged advisories probe the default; Xrun/RealtimeDenied advisories
   do not tear down functioning audio.
+- **Output priority startup**: the default `output-realtime` Cargo feature enables
+  CPAL's maintained `realtime` policy. The pinned `audio_thread_priority` 0.35.1
+  implementation dynamically loads avrt.dll and calls
+  `AvSetMmThreadCharacteristicsW(L"Audio")`; it does not additionally call
+  `AvSetMmThreadPriority`. Registration failure falls back to CPAL's
+  `SetThreadPriority(THREAD_PRIORITY_TIME_CRITICAL)`. Only output workers are
+  affected by this application feature; no process priority, affinity or system
+  configuration changes. Windows remains a soft scheduling environment.
+  The vendor extension initializes on each new output worker before the callback
+  latch, then sends exactly one result through a bounded startup channel. The
+  stream constructor waits for that publication outside callbacks. Native TID,
+  `GetThreadPriority` snapshot and direct disabled/MMCSS/fallback/failure outcome
+  are exposed by the WASAPI stream. Error strings are prepared during startup;
+  missing publication is explicitly unknown. `OutputSignals::publish_startup`
+  logs on the owner once per current epoch. Priority failure remains observable
+  and nonfatal; available audio is not rebuilt because promotion was denied.
+  `GetThreadPriority` is the relative-priority API, not a continuous kernel
+  priority measurement; ETW CSwitch events verify actual scheduling priorities
+  where captured. Registration follows the upstream worker lifetime; stream
+  retirement joins that worker. Sample callbacks contain no scheduling setup,
+  startup-result publication, log formatting or added blocking work.
+  See `vendor/cpal/OUTPUT_STARTUP_PATCH.md` and `startup-observation.patch`.
 - **PCM handoff**: two preallocated bounded atomic rings (`src/pcm_queue.rs`) circulate a fixed
   pool of 4096-frame blocks at the device rate/layout. Capacity is rounded up
   to at least 1.5 seconds at every supported rate; a 500 ms watermark primes
@@ -448,9 +473,20 @@ interruptions while the PCM pool is full and no callback runs.
 The atomic queue work is bounded; Windows scheduling and address wake primitives
 do **not** provide hard real-time guarantees. Decoder starvation and delayed
 output callbacks are independent failure modes. `src/audio_performance.rs` is
-test-only: callbacks capture raw timestamp/clock records in fixed storage, then
-the diagnostic analyzes/prints after destroying and joining the stream. CPU
-accounting and diagnostic analysis stay outside the callback.
+test-only: callbacks capture raw monotonic entry/end times, absolute QPC, CPAL
+callback and predicted-playback timestamps, and frame counts in fixed storage.
+The diagnostic separately analyzes actual entry intervals and device-clock
+intervals after destroying/joining all writers. Sorting, printing, CSV export
+and process CPU accounting stay outside callbacks. A clock regression is
+reported, not silently counted as a zero interval; storage overflow is counted.
+Application execution excludes CPAL/WASAPI waiting, padding, buffer acquisition,
+equilibrium fill, clock calls and buffer release. Callback gaps are not output
+glitch counts and PCM underruns are only decoder/handoff starvation evidence.
+The opt-in harness uses broker state restoration and optional real worker
+replacements with position restoration, without UI input or state saves.
+Trace runs are separate from low-overhead runs; an elevated one-shot helper
+controls only task-owned WPR recordings while builds/player/analysis stay
+unelevated. No tracing helper or recorder remains installed or running.
 See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
 
 ### `src/stream_buffer.rs` — bounded progressive RAM reader
@@ -922,7 +958,7 @@ WM_MOUSEWHEEL (screen lParam) → client coords → renderer.eq_band_at
 |---|---|---|
 | main/UI | `GetMessageW` | all Win32 + OLE + broker drain happens here |
 | decoder | atomic address wait | registered command/capacity/drain predicates; one yt-dlp child at a time |
-| WASAPI (cpal) | audio callback | bounded PCM claims, copy/convert, recycle, atomic counters/drain and useful wake |
+| WASAPI (cpal) | audio event/commands | initializes observed priority before callbacks; bounded PCM claims, copy/convert, recycle, counters/drain and useful wake |
 
 ---
 

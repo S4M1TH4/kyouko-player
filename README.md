@@ -179,6 +179,46 @@ yt-dlp socket requests time out after 15 seconds with one internal retry.
 Timeouts terminate the source process tree and enter the player's existing
 two-attempt recovery policy. Completed RAM playback has no deadline worker.
 
+## Output worker scheduling
+
+Windows output workers request CPAL's maintained `realtime` feature by default.
+The pinned CPAL 0.18.2 policy registers the worker with MMCSS's **Audio** task;
+if registration fails it tries `THREAD_PRIORITY_TIME_CRITICAL` on that worker.
+The player and its decoder keep their normal process/thread settings. Windows
+scheduling supplies no hard real-time guarantees.
+
+A small source patch in `vendor/cpal` makes startup results observable before
+any data callback. The stream owner logs the requested mechanism, native thread
+ID, `GetThreadPriority` snapshot, and directly observed MMCSS/fallback/failure
+result. A missing result is explicitly unverified. Every replacement worker
+initializes and reports again. Epoch-qualified publication and error/advisory
+flags reject retired-worker results. Promotion failure is reported without
+tearing down otherwise available output.
+
+For a disabled comparison build use `--no-default-features`. The opt-in release
+diagnostic restores the saved local source/folder and settings without saving or
+opening the overlay:
+
+```powershell
+cargo test --locked --release --no-default-features saved_track_release_pcm_performance -- --ignored --nocapture --test-threads=1
+cargo test --locked --release saved_track_release_pcm_performance -- --ignored --nocapture --test-threads=1
+# Repeat the two configurations in alternating order. For three real worker replacements:
+$env:KYOUKO_PERF_REPLACE = '1'
+cargo test --locked --release saved_track_release_pcm_performance -- --ignored --nocapture --test-threads=1
+Remove-Item Env:KYOUKO_PERF_REPLACE
+```
+
+`KYOUKO_PERF_RECORDS` optionally names an absolute CSV prefix; each worker segment
+is exported after all callback writers have joined. The callback only stores
+raw monotonic entry/end times, QPC, CPAL timestamps and frame counts in fixed
+storage. Analysis, sorting, formatting, CPU accounting and file writes happen
+outside it. Actual callback-entry intervals, device-clock timestamp intervals,
+application execution time and PCM starvation are separate measurements.
+Long intervals do not prove audible glitches; zero PCM underruns do not prove
+glitch-free output. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for the fresh
+comparison, trace coverage, scheduler evidence and measurement limits, and
+[vendor patch notes](vendor/cpal/OUTPUT_STARTUP_PATCH.md) for the exact extension.
+
 ## Verification
 
 ```text

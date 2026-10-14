@@ -368,8 +368,9 @@ pub struct AudioOut {
 /// Error/COM callbacks only latch events and wake the owner. Epoch-qualified
 /// CAS rejects callbacks from retired streams; the mailbox is bounded to one.
 pub(crate) struct OutputSignals {
-    stream_state: AtomicU64, // even stream epoch, low bit = failed
+    stream_state: AtomicU64, // epoch is a multiple of 4; low bits: failed, device advisory
     consumed_failure: AtomicU64,
+    reported_startup: AtomicU64,
     changed: AtomicBool,
     endpoint_changed: AtomicBool,
     endpoint_hash: AtomicU64,
@@ -378,7 +379,7 @@ pub(crate) struct OutputSignals {
 
 impl OutputSignals {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self { stream_state: AtomicU64::new(2), consumed_failure: AtomicU64::new(0),
+        Arc::new(Self { stream_state: AtomicU64::new(4), consumed_failure: AtomicU64::new(0), reported_startup: AtomicU64::new(0),
             changed: AtomicBool::new(false), endpoint_changed: AtomicBool::new(false),
             endpoint_hash: AtomicU64::new(0), pending: AtomicBool::new(false) })
     }
@@ -405,28 +406,49 @@ impl OutputSignals {
     }
 
     fn stream_error(&self, epoch: u64, error: &cpal::Error) {
-        if self.stream_state.load(Ordering::Acquire) & !1 != epoch { return; }
-        match error.kind() {
-            cpal::ErrorKind::DeviceChanged => { self.device_changed(); return; }
+        let state = self.stream_state.load(Ordering::Acquire);
+        if state & !3 != epoch { return; }
+        let flag = match error.kind() {
+            cpal::ErrorKind::DeviceChanged => 2,
             cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied => return,
-            _ => {}
-        }
-        if self.stream_state.compare_exchange(epoch, epoch | 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            _ => 1,
+        };
+        // Epoch and flags share one CAS: a retirement racing an error or
+        // advisory cannot latch that event onto the replacement's epoch.
+        if state & flag == 0 && self.stream_state.compare_exchange(state, state | flag, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
             self.notify();
         }
     }
 
+    // Synchronously initialized on the output worker, published on its owner.
+    // A retired worker cannot publish scheduling results for a replacement.
+    #[cfg(windows)]
+    fn publish_startup(&self, epoch: u64, result: Option<&cpal::platform::OutputWorkerStartup>) -> bool {
+        if self.stream_state.load(Ordering::Acquire) & !3 != epoch
+            || self.reported_startup.swap(epoch, Ordering::AcqRel) == epoch { return false; }
+        match result {
+            Some(result) => log_info!("AUDIO", "output worker epoch={epoch} requested={} tid={} verified_thread_priority={:?} promotion={:?}",
+                if cfg!(feature = "output-realtime") { "CPAL realtime (MMCSS, TIME_CRITICAL fallback)" } else { "disabled" },
+                result.thread_id, result.thread_priority, result.promotion),
+            None => log_warn!("AUDIO", "output worker epoch={epoch}: startup result unavailable; priority and MMCSS unverified"),
+        }
+        true
+    }
+
     fn next_epoch(&self) -> u64 {
         let previous = self.stream_state.try_update(Ordering::AcqRel, Ordering::Relaxed,
-            |state| Some((state & !1).wrapping_add(2))).unwrap();
-        (previous & !1).wrapping_add(2)
+            |state| Some((state & !3).wrapping_add(4))).unwrap();
+        (previous & !3).wrapping_add(4)
     }
 
     pub(crate) fn take(&self) -> (bool, bool, bool) {
         self.pending.store(false, Ordering::Release);
-        let changed = self.changed.swap(false, Ordering::AcqRel);
+        let mut changed = self.changed.swap(false, Ordering::AcqRel);
         let state = self.stream_state.load(Ordering::Acquire);
-        let failed = state & 1 != 0 && self.consumed_failure.swap(state & !1, Ordering::AcqRel) != state & !1;
+        if state & 2 != 0 && self.stream_state.compare_exchange(state, state & !2, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            changed = true;
+        }
+        let failed = state & 1 != 0 && self.consumed_failure.swap(state & !3, Ordering::AcqRel) != state & !3;
         (changed, failed, self.endpoint_changed.swap(false, Ordering::AcqRel))
     }
 }
@@ -435,7 +457,7 @@ pub(crate) fn endpoint_hash(id: impl Iterator<Item = u16>) -> u64 {
     id.fold(0xcbf29ce484222325, |hash, code| (hash ^ code as u64).wrapping_mul(0x100000001b3))
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Debug)]
 struct OutputKey {
     endpoint: String,
     rate: u32,
@@ -556,7 +578,7 @@ impl AudioOut {
             (Some(s), true) => {
                 if let Err(e) = s.play() {
                     log_error!("AUDIO", "stream.play failed: {e}");
-                    let epoch = self.signals.stream_state.load(Ordering::Acquire) & !1;
+                    let epoch = self.signals.stream_state.load(Ordering::Acquire) & !3;
                     self.signals.stream_error(epoch, &e);
                     return;
                 }
@@ -564,7 +586,7 @@ impl AudioOut {
             (Some(s), false) => {
                 if let Err(e) = s.pause() {
                     log_error!("AUDIO", "stream.pause failed: {e}");
-                    let epoch = self.signals.stream_state.load(Ordering::Acquire) & !1;
+                    let epoch = self.signals.stream_state.load(Ordering::Acquire) & !3;
                     self.signals.stream_error(epoch, &e);
                 }
             }
@@ -628,7 +650,8 @@ pub fn open_output_stream(
     shared: Arc<SharedState>,
 ) -> Result<cpal::Stream, String> {
     let signals = OutputSignals::new();
-    build_output_stream(device, supported, chunk_rx, drained_tx, shared, signals, 2)
+    let epoch = signals.stream_state.load(Ordering::Relaxed);
+    build_output_stream(device, supported, chunk_rx, drained_tx, shared, signals, epoch)
 }
 
 fn build_output_stream(device: cpal::Device, supported: cpal::SupportedStreamConfig,
@@ -644,7 +667,8 @@ fn build_output_stream(device: cpal::Device, supported: cpal::SupportedStreamCon
     };
     // DeviceNotAvailable and backend-specific WASAPI aborts follow the same
     // bounded, epoch-qualified recovery path. No teardown inside this callback.
-    let err_cb = move |err| signals.stream_error(epoch, &err);
+    let error_signals = signals.clone();
+    let err_cb = move |err| error_signals.stream_error(epoch, &err);
 
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream(
@@ -668,6 +692,12 @@ fn build_output_stream(device: cpal::Device, supported: cpal::SupportedStreamCon
         other => return Err(format!("unsupported device sample format {other:?}")),
     }
     .map_err(|e| format!("build output stream: {e}"))?;
+
+    #[cfg(windows)]
+    {
+        let cpal::platform::StreamInner::Wasapi(worker) = stream.as_inner();
+        signals.publish_startup(epoch, worker.output_worker_startup());
+    }
 
     // Stay silent until the first Playing phase; tolerate "not yet running".
     use cpal::traits::StreamTrait;
@@ -2264,7 +2294,7 @@ mod tests {
         ALLOC_TRACKING.with(|tracking| tracking.set(true));
         callback(&mut data, &info);
         callback(&mut data, &info);
-        signals.stream_error(2, &error);
+        signals.stream_error(4, &error);
         signals.endpoint_changed();
         ALLOC_TRACKING.with(|tracking| tracking.set(false));
         assert_eq!(ALLOCATIONS.with(Cell::get), 0);
@@ -2324,15 +2354,15 @@ mod tests {
         let signals = OutputSignals::new();
         assert_eq!(signals.take(), (false, false, false));
         for _ in 0..100 {
-            signals.stream_error(2, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+            signals.stream_error(4, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
             signals.device_changed();
         }
         assert!(signals.pending.load(Ordering::Acquire));
         assert_eq!(signals.take(), (true, true, false));
         assert_eq!(signals.take(), (false, false, false));
         let epoch = signals.next_epoch();
-        assert_eq!(epoch, 4);
-        signals.stream_error(2, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+        assert_eq!(epoch, 8);
+        signals.stream_error(4, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
         assert_eq!(signals.take(), (false, false, false));
         signals.stream_error(epoch, &cpal::Error::with_message(cpal::ErrorKind::BackendError, "WASAPI stream aborted"));
         assert_eq!(signals.take(), (false, true, false));
@@ -2344,6 +2374,36 @@ mod tests {
         assert_eq!(signals.take(), (false, false, false), "nonfatal advisories cannot rebuild the stream");
         signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceChanged));
         assert_eq!(signals.take(), (true, false, false));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn output_startup_publication_fences_retired_results_and_reports_failures_once() {
+        use cpal::platform::{OutputPromotion, OutputWorkerStartup};
+        let signals = OutputSignals::new();
+        let old = signals.stream_state.load(Ordering::Acquire);
+        let result = OutputWorkerStartup { thread_id: 123, thread_priority: Some(0), promotion: OutputPromotion::Disabled };
+        assert!(signals.publish_startup(old, Some(&result)));
+        assert!(!signals.publish_startup(old, Some(&result)));
+        let current = signals.next_epoch();
+        assert!(!signals.publish_startup(old, Some(&result)));
+        assert_eq!(signals.reported_startup.load(Ordering::Acquire), old);
+        signals.stream_error(old, &cpal::Error::new(cpal::ErrorKind::DeviceChanged));
+        signals.stream_error(old, &cpal::Error::new(cpal::ErrorKind::BackendError));
+        assert_eq!(signals.take(), (false, false, false));
+        for promotion in [OutputPromotion::Fallback { mmcss_error: "in-memory MMCSS failure".into() },
+            OutputPromotion::Failed { mmcss_error: "in-memory MMCSS failure".into(), fallback_error: "in-memory priority failure".into() }] {
+            let current = signals.next_epoch();
+            let result = OutputWorkerStartup { thread_id: 456, thread_priority: None, promotion };
+            assert!(signals.publish_startup(current, Some(&result)));
+            assert_eq!(signals.stream_state.load(Ordering::Acquire), current, "priority failure is reported without output teardown");
+            assert_eq!(signals.take(), (false, false, false));
+            assert!(!signals.publish_startup(current, Some(&result)));
+        }
+        assert!(!signals.publish_startup(current, None));
+        let current = signals.next_epoch();
+        assert!(signals.publish_startup(current, None), "missing observation is explicitly unverified");
+        assert!(!signals.publish_startup(current, None));
     }
 
     #[test]
@@ -2643,7 +2703,7 @@ mod tests {
             assert_eq!(counters.underrun_frames.load(Ordering::Relaxed), before_underruns, "no underruns during healthy playback");
             drop(counters);
             let old_pool = Arc::downgrade(&output.receiver.as_ref().unwrap().state);
-            let epoch = output.signals.stream_state.load(Ordering::Acquire) & !1;
+            let epoch = output.signals.stream_state.load(Ordering::Acquire) & !3;
             // Invoke the same callback sink used by CPAL's device-error callback.
             // The hardware stream really closes/reopens; no OS endpoint is disabled.
             match cycle {
@@ -2664,10 +2724,10 @@ mod tests {
             assert!(old_pool.upgrade().is_none(), "retired PCM allocation must be freed");
             assert_eq!(audio.decoder.thread().id(), thread_id, "device swaps reuse the one decoder");
             assert!(audio.controls.output_slot.lock().unwrap().is_none());
-            let new_epoch = output.signals.stream_state.load(Ordering::Acquire) & !1;
+            let new_epoch = output.signals.stream_state.load(Ordering::Acquire) & !3;
             output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
             output.handle_device_events(&mut broker);
-            assert_eq!(output.signals.stream_state.load(Ordering::Acquire) & !1, new_epoch);
+            assert_eq!(output.signals.stream_state.load(Ordering::Acquire) & !3, new_epoch);
             println!("device cycle {}: recovered in {:.2}s at {:.3}s, retired pool freed, decoder thread unchanged", cycle + 1, recovery_started.elapsed().as_secs_f64(), shared.position().as_secs_f64());
         }
         #[cfg(windows)]
