@@ -33,3 +33,11 @@ Modified upstream files: `src/host/wasapi/stream.rs`,
 The last file only suppresses an upstream Windows-only unused helper warning
 that becomes visible for a local path dependency. `startup-observation.patch`
 records the changes against the unmodified pinned registry source for review.
+
+## Subsequent platform pruning
+
+On 2026-10-15 the vendored source was reduced to Windows and Linux desktop audio.
+See `PLATFORM_SCOPE.md` for retained backends/features and removed files. The
+startup-only diff above remains preserved as historical patch provenance;
+manifest, shared declarations and dispatch were additionally narrowed during
+pruning. Retained WASAPI/ALSA/PipeWire/PulseAudio implementations were unchanged.

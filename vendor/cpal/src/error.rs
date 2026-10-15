@@ -185,17 +185,7 @@ impl From<ErrorKind> for Error {
     }
 }
 
-#[cfg(all(
-    feature = "realtime",
-    any(
-        target_os = "windows",
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "android"
-    )
-))]
+#[cfg(all(feature = "realtime", any(target_os = "windows", target_os = "linux")))]
 impl From<audio_thread_priority::AudioThreadPriorityError> for Error {
     fn from(err: audio_thread_priority::AudioThreadPriorityError) -> Self {
         use std::error::Error as StdError;

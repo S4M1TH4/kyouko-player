@@ -43,14 +43,6 @@ impl Latch {
     }
 
     /// Registers a thread to be unparked when [`release`](Self::release) is called.
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-    ))]
     pub(crate) fn add_thread(&mut self, thread: Thread) {
         self.threads.push(thread);
     }
@@ -81,14 +73,6 @@ impl LatchWaiter {
     /// Parks the calling thread until the latch is released or dropped without releasing.
     ///
     /// Returns `true` if the stream is ready, `false` if the [`Latch`] was dropped before release.
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "windows",
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-    ))]
     pub(crate) fn wait(&self) -> bool {
         loop {
             match self.0.upgrade() {
@@ -100,11 +84,5 @@ impl LatchWaiter {
                 }
             }
         }
-    }
-
-    /// Returns `true` if the latch has already been released.
-    #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
-    pub(crate) fn is_released(&self) -> bool {
-        self.0.upgrade().is_some_and(|f| f.load(Ordering::Acquire))
     }
 }

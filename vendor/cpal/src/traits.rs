@@ -2,7 +2,7 @@
 //!
 //! # Custom Host Implementations
 //!
-//! When implementing custom hosts with the `custom` feature, use the [`assert_stream_send!`](crate::assert_stream_send)
+//! When implementing stream types, use the [`assert_stream_send!`](crate::assert_stream_send)
 //! and [`assert_stream_sync!`](crate::assert_stream_sync) macros to verify your `Stream` type meets CPAL's requirements.
 
 use std::{

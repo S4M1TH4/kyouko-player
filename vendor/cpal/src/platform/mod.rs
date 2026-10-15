@@ -1,70 +1,12 @@
-//! Platform-specific items.
-//!
-//! This module also contains the implementation of the platform's dynamically dispatched [`Host`]
-//! type and its associated [`Device`], [`Stream`] and other associated types. These
-//! types are useful in the case that users require switching between audio host APIs at runtime.
-
+//! Platform dispatch for the retained Windows and Linux audio hosts.
 pub use self::platform_impl::*;
-
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "pipewire")))]
+pub use crate::host::pipewire::Host as PipeWireHost;
 #[cfg(windows)]
 pub use crate::host::wasapi::{OutputPromotion, OutputWorkerStartup};
 
-
-
-#[cfg(all(
-    feature = "jack",
-    any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "macos",
-        target_os = "windows",
-    )
-))]
-#[cfg_attr(docsrs, doc(cfg(feature = "jack")))]
-pub use crate::host::jack::Host as JackHost;
-
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-    ),
-    feature = "pipewire",
-))]
-#[cfg_attr(docsrs, doc(cfg(feature = "pipewire")))]
-pub use crate::host::pipewire::Host as PipeWireHost;
-
-#[cfg(feature = "custom")]
-pub use crate::host::custom::{Device as CustomDevice, Host as CustomHost, Stream as CustomStream};
-
-/// A macro to assist with implementing a platform's dynamically dispatched [`Host`] type.
-///
-/// These dynamically dispatched types are necessary to allow for users to switch between hosts at
-/// runtime.
-///
-/// For example the invocation `impl_platform_host(Wasapi wasapi "WASAPI", Asio asio "ASIO")`,
-/// this macro should expand to:
-///
-// This sample code block is marked as text because it's not a valid test,
-// it's just illustrative. (see rust issue #96573)
-/// ```text
-/// pub enum HostId {
-///     Wasapi,
-///     Asio,
-/// }
-///
-/// pub enum Host {
-///     Wasapi(crate::host::wasapi::Host),
-///     Asio(crate::host::asio::Host),
-/// }
-/// ```
-///
-/// And so on for Device, Devices, Host, Stream, SupportedInputConfigs,
-/// SupportedOutputConfigs and all their necessary trait implementations.
-///
+// Generates dynamic dispatch for the platform's available audio backends.
 macro_rules! impl_platform_host {
     ($($(#[cfg($feat: meta)])? $HostVariant:ident $($HostName:literal)? => $Host:ty),* $(,)?) => {
         /// All hosts supported by CPAL on this platform.
@@ -812,15 +754,8 @@ macro_rules! __cpal_select_host_name {
     };
 }
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd"
-))]
+#[cfg(target_os = "linux")]
 mod platform_impl {
-    #[cfg(feature = "jack")]
-    use super::JackHost;
     use crate::host::alsa::Host as AlsaHost;
     #[cfg(feature = "pipewire")]
     use crate::host::pipewire::Host as PipeWireHost;
@@ -829,9 +764,7 @@ mod platform_impl {
     impl_platform_host!(
         #[cfg(feature = "pipewire")] PipeWire => PipeWireHost,
         #[cfg(feature = "pulseaudio")] PulseAudio => PulseAudioHost,
-        #[cfg(feature = "jack")] Jack "JACK" => JackHost,
         Alsa "ALSA" => AlsaHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost,
     );
 
     /// The default host for the current compilation target platform.
@@ -854,114 +787,17 @@ mod platform_impl {
     }
 }
 
-#[cfg(target_vendor = "apple")]
-mod platform_impl {
-    #[cfg(all(feature = "jack", target_os = "macos"))]
-    use super::JackHost;
-    use crate::host::coreaudio::Host as CoreAudioHost;
-
-    impl_platform_host!(
-        CoreAudio => CoreAudioHost,
-        #[cfg(all(feature = "jack", target_os = "macos"))] Jack "JACK" => JackHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost
-    );
-
-    /// The default host for the current compilation target platform.
-    pub fn default_host() -> Host {
-        CoreAudioHost::new()
-            .expect("the default host should always be available")
-            .into()
-    }
-}
-
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-mod platform_impl {
-    #[cfg(all(feature = "audioworklet", target_feature = "atomics"))]
-    use crate::host::audioworklet::Host as AudioWorkletHost;
-    use crate::host::webaudio::Host as WebAudioHost;
-
-    impl_platform_host!(
-        WebAudio => WebAudioHost,
-        #[cfg(all(feature = "audioworklet", target_feature = "atomics"))] AudioWorklet => AudioWorkletHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost
-    );
-
-    /// The default host for the current compilation target platform.
-    pub fn default_host() -> Host {
-        WebAudioHost::new()
-            .expect("the default host should always be available")
-            .into()
-    }
-}
-
 #[cfg(windows)]
 mod platform_impl {
-    #[cfg(feature = "jack")]
-    use super::JackHost;
-    #[cfg(feature = "asio")]
-    use crate::host::asio::Host as AsioHost;
     use crate::host::wasapi::Host as WasapiHost;
 
     impl_platform_host!(
-        #[cfg(feature = "asio")] Asio "ASIO" => AsioHost,
         Wasapi "WASAPI" => WasapiHost,
-        #[cfg(feature = "jack")] Jack "JACK" => JackHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost,
     );
 
     /// The default host for the current compilation target platform.
     pub fn default_host() -> Host {
         WasapiHost::new()
-            .expect("the default host should always be available")
-            .into()
-    }
-}
-
-#[cfg(target_os = "android")]
-mod platform_impl {
-    use crate::host::aaudio::Host as AAudioHost;
-    impl_platform_host!(
-        AAudio => AAudioHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost
-    );
-
-    /// The default host for the current compilation target platform.
-    pub fn default_host() -> Host {
-        AAudioHost::new()
-            .expect("the default host should always be available")
-            .into()
-    }
-}
-
-#[cfg(not(any(
-    windows,
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_vendor = "apple",
-    target_os = "android",
-    all(
-        target_arch = "wasm32",
-        target_os = "unknown",
-        feature = "wasm-bindgen"
-    ),
-)))]
-mod platform_impl {
-    use crate::host::null::Host as NullHost;
-
-    impl_platform_host!(
-        Null => NullHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost,
-    );
-
-    /// The default host for the current compilation target platform.
-    pub fn default_host() -> Host {
-        NullHost::new()
             .expect("the default host should always be available")
             .into()
     }

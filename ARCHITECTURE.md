@@ -359,6 +359,11 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   retirement joins that worker. Sample callbacks contain no scheduling setup,
   startup-result publication, log formatting or added blocking work.
   See `vendor/cpal/OUTPUT_STARTUP_PATCH.md` and `startup-observation.patch`.
+  The source subset retains Windows WASAPI and Linux ALSA/PipeWire/PulseAudio,
+  with shared helpers and license/provenance. Removed platform/feature dispatch
+  and manifest entries are documented in `vendor/cpal/PLATFORM_SCOPE.md`.
+  These audio backends do not depend on X11 or Wayland; future Linux UI work
+  targets Wayland separately. Linux backend implementations were retained intact.
 - **PCM handoff**: two preallocated bounded atomic rings (`src/pcm_queue.rs`) circulate a fixed
   pool of 4096-frame blocks at the device rate/layout. Capacity is rounded up
   to at least 1.5 seconds at every supported rate; a 500 ms watermark primes

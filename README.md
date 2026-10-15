@@ -217,7 +217,10 @@ application execution time and PCM starvation are separate measurements.
 Long intervals do not prove audible glitches; zero PCM underruns do not prove
 glitch-free output. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for the fresh
 comparison, trace coverage, scheduler evidence and measurement limits, and
-[vendor patch notes](vendor/cpal/OUTPUT_STARTUP_PATCH.md) for the exact extension.
+[vendor patch notes](vendor/cpal/OUTPUT_STARTUP_PATCH.md) for the exact extension. The
+vendored subset retains WASAPI on Windows and ALSA/PipeWire/PulseAudio for the
+future Linux Wayland port; see [platform scope](vendor/cpal/PLATFORM_SCOPE.md).
+Linux presentation support is still future work.
 
 ## Verification
 

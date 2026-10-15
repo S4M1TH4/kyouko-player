@@ -163,25 +163,8 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-// Extern crate declarations with `#[macro_use]` must unfortunately be at crate root.
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-extern crate js_sys;
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-extern crate wasm_bindgen;
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-extern crate web_sys;
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("This vendored CPAL subset supports only Windows and Linux.");
 
 pub use device_description::{
     DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceType, InterfaceType,
@@ -192,12 +175,6 @@ pub use platform::{
     SupportedInputConfigs, SupportedOutputConfigs, ALL_HOSTS,
 };
 pub use sample_format::{FromSample, Sample, SampleFormat, SizedSample, I24, U24};
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-use wasm_bindgen::prelude::*;
 
 pub mod device_description;
 mod error;
@@ -391,63 +368,11 @@ pub enum BufferSize {
     Fixed(FrameCount),
 }
 
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-impl wasm_bindgen::describe::WasmDescribe for BufferSize {
-    fn describe() {
-        <Option<FrameCount> as wasm_bindgen::describe::WasmDescribe>::describe();
-    }
-}
-
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-impl wasm_bindgen::convert::IntoWasmAbi for BufferSize {
-    type Abi = <Option<FrameCount> as wasm_bindgen::convert::IntoWasmAbi>::Abi;
-
-    fn into_abi(self) -> Self::Abi {
-        match self {
-            Self::Default => None,
-            Self::Fixed(fc) => Some(fc),
-        }
-        .into_abi()
-    }
-}
-
-#[cfg(all(
-    target_arch = "wasm32",
-    target_os = "unknown",
-    feature = "wasm-bindgen"
-))]
-impl wasm_bindgen::convert::FromWasmAbi for BufferSize {
-    type Abi = <Option<FrameCount> as wasm_bindgen::convert::FromWasmAbi>::Abi;
-
-    unsafe fn from_abi(js: Self::Abi) -> Self {
-        match Option::<FrameCount>::from_abi(js) {
-            None => Self::Default,
-            Some(fc) => Self::Fixed(fc),
-        }
-    }
-}
-
 /// The set of parameters used to describe how to open a stream.
 ///
 /// The sample format is omitted in favour of using a sample type.
 ///
 /// See also [`BufferSize`] for details on buffer size behavior and latency considerations.
-#[cfg_attr(
-    all(
-        target_arch = "wasm32",
-        target_os = "unknown",
-        feature = "wasm-bindgen"
-    ),
-    wasm_bindgen
-)]
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 pub struct StreamConfig {
     pub channels: ChannelCount,
