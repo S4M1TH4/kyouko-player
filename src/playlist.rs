@@ -18,6 +18,10 @@ use windows::Win32::System::Threading::TerminateProcess;
 use windows::core::PCWSTR;
 
 const MAX_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+// A full 5,000-entry playlist takes many paginated requests. Allow five
+// minutes for flat metadata, plus ten seconds of startup/network margin.
+// This is independent of the single-track title and audio download deadlines.
+const METADATA_DEADLINE: Duration = Duration::from_secs(5 * 60 + 10);
 
 pub struct PlaylistResult {
     pub request_id: u64,
@@ -56,7 +60,7 @@ impl PlaylistJob {
             "%(playlist_index)s\t%(title|Unavailable track)j",
             &url,
         ]);
-        Self::spawn(command, url, request_id, notify, Duration::from_secs(45))
+        Self::spawn(command, url, request_id, notify, METADATA_DEADLINE)
     }
 
     fn spawn(
@@ -177,7 +181,7 @@ impl PlaylistJob {
                     return;
                 }
                 let titles = if timed_out.load(Ordering::Acquire) {
-                    Err("playlist metadata deadline exceeded".into())
+                    Err(format!("playlist metadata deadline exceeded ({} seconds)", deadline.as_secs_f64()))
                 } else if bytes.len() as u64 > MAX_METADATA_BYTES {
                     Err("playlist metadata exceeds the 8 MiB limit".into())
                 } else {
@@ -277,6 +281,45 @@ mod tests {
         assert_eq!(result.url, "test-playlist");
         assert_eq!(result.titles.unwrap(), ["Song"]);
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn full_size_playlist_metadata_keeps_every_index() {
+        let (notify, events) = bounded(1);
+        let job = PlaylistJob::spawn(
+            fixture(r#"1..5000 | ForEach-Object { $title = if ($_ -ge 4780 -and $_ -le 4960) { 'Unavailable track' } else { '"Track '+$_+'"' }; [Console]::WriteLine($_.ToString()+[char]9+$title) }"#),
+            "large-playlist".into(),
+            10,
+            notify,
+            Duration::from_secs(10),
+        ).unwrap();
+        events.recv_timeout(Duration::from_secs(15)).unwrap();
+        let titles = job.take_result().unwrap().titles.unwrap();
+        assert_eq!(titles.len(), 5000);
+        for (index, title) in titles.iter().enumerate() {
+            let expected = if (4780..=4960).contains(&(index + 1)) {
+                "Unavailable track".to_string()
+            } else { format!("Track {}", index + 1) };
+            assert_eq!(title, &expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "live yt-dlp playlist metadata; requires KYOUKO_PLAYLIST_TEST_URL and network"]
+    fn supplied_playlist_metadata_uses_production_deadline() {
+        let raw = std::env::var("KYOUKO_PLAYLIST_TEST_URL").expect("KYOUKO_PLAYLIST_TEST_URL");
+        let source = crate::broker::Source::from_raw(&raw);
+        assert!(matches!(source, crate::broker::Source::Youtube { playlist_index: Some(1), .. }));
+        let (notify, events) = bounded(1);
+        let started = std::time::Instant::now();
+        let job = PlaylistJob::start(source.raw().to_string(), 1, notify).unwrap();
+        events.recv_timeout(METADATA_DEADLINE + Duration::from_secs(10)).unwrap();
+        let result = job.take_result().unwrap();
+        let titles = result.titles.unwrap();
+        assert_eq!(result.url, source.raw());
+        assert!(!titles.is_empty());
+        println!("playlist metadata: {} entries in {:.3}s, deadline {}s, url {}",
+            titles.len(), started.elapsed().as_secs_f64(), METADATA_DEADLINE.as_secs(), source.raw());
     }
 
     #[test]

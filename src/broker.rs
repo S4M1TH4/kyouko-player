@@ -70,14 +70,17 @@ impl Source {
 
     /// Inverse of `raw`: URL-shaped strings stream via yt-dlp, everything
     /// else opens as a local file. The format id is per-site (YouTube 140,
-    /// Bilibili 30232). Playlist-shaped URLs (a `list=` parameter without
-    /// an explicit video id) become advancing sources at entry 1.
+    /// Bilibili 30232). YouTube URLs with a nonempty `list=` query parameter
+    /// are canonicalized to the playlist URL and start at entry 1.
     pub fn from_raw(raw: &str) -> Source {
         if raw.starts_with("http://") || raw.starts_with("https://") {
+            let url = youtube_playlist_id(raw)
+                .map(|list| format!("https://www.youtube.com/playlist?list={list}"))
+                .unwrap_or_else(|| raw.to_string());
             Source::Youtube {
-                url: raw.to_string(),
-                format: default_format_for(raw).to_string(),
-                playlist_index: playlist_index_of(raw),
+                format: default_format_for(&url).to_string(),
+                playlist_index: playlist_index_of(&url),
+                url,
             }
         } else {
             Source::File(raw.to_string())
@@ -96,11 +99,28 @@ impl fmt::Display for Source {
     }
 }
 
-/// A URL is playlist-shaped when it carries a `list=` parameter but no
-/// explicit video id (`watch?v=` / `youtu.be/`) — the latter stays a single
-/// video even if it happens to sit inside a playlist.
+fn query_parameter<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+    let (_, query) = url.split('#').next()?.split_once('?')?;
+    query.split('&').filter_map(|part| part.split_once('='))
+        .find_map(|(name, value)| (name == key && !value.is_empty()).then_some(value))
+}
+
+/// A video shared from a YouTube playlist opens that playlist, independent
+/// of its selected video, tracking parameters, or mobile/short-link host.
+fn youtube_playlist_id(url: &str) -> Option<&str> {
+    let (_, address) = url.split_once("://")?;
+    let authority = address.split(['/', '?', '#']).next()?;
+    let host = authority.split(':').next()?.to_ascii_lowercase();
+    if host != "youtube.com" && !host.ends_with(".youtube.com")
+        && host != "youtu.be" && host != "www.youtu.be" { return None; }
+    query_parameter(url, "list")
+}
+
+/// YouTube `list=` takes precedence over a video id. Other stream URLs retain
+/// their existing playlist-shaped routing, using an exact query key.
 pub fn playlist_index_of(url: &str) -> Option<usize> {
-    let has_list = url.contains("list=");
+    if youtube_playlist_id(url).is_some() { return Some(1); }
+    let has_list = query_parameter(url, "list").is_some();
     let is_video = url.contains("watch?v=") || url.contains("youtu.be/");
     (has_list && !is_video).then_some(1)
 }
@@ -114,7 +134,10 @@ pub(crate) fn parse_playlist_titles(raw: &[u8]) -> Result<Vec<String>, String> {
         let (index, title) = line.split_once('\t').ok_or("missing playlist index")?;
         let index = index.parse::<usize>().map_err(|e| e.to_string())?;
         if index == 0 || index > 100_000 { return Err("invalid playlist index".into()); }
-        let title: String = serde_json::from_str(title).map_err(|e| e.to_string())?;
+        // yt-dlp applies its literal fallback after formatting: a missing
+        // title bypasses `j` and arrives unquoted. Keep its original index.
+        let title: String = if title == "Unavailable track" { title.to_string() }
+            else { serde_json::from_str(title).map_err(|e| e.to_string())? };
         if titles.len() < index { titles.resize(index, "Unavailable track".to_string()); }
         titles[index - 1] = title;
     }
@@ -3181,9 +3204,9 @@ mod tests {
 
     #[test]
     fn playlist_titles_keep_newlines_unicode_and_unavailable_indices() {
-        let raw = "1\t\"Song A\"\n3\t\"音楽\\nSecond line \\\"quoted\\\"\"\n";
+        let raw = "1\t\"Song A\"\n3\t\"音楽\\nSecond line \\\"quoted\\\"\"\n4\tUnavailable track\n5\t\"Next song\"\n";
         let titles = parse_playlist_titles(raw.as_bytes()).unwrap();
-        assert_eq!(titles, ["Song A", "Unavailable track", "音楽\nSecond line \"quoted\""]);
+        assert_eq!(titles, ["Song A", "Unavailable track", "音楽\nSecond line \"quoted\"", "Unavailable track", "Next song"]);
         assert!(parse_playlist_titles(b"0\t\"invalid\"\n").is_err());
         assert!(parse_playlist_titles(b"1\tinvalid json\n").is_err());
     }
@@ -3194,13 +3217,15 @@ mod tests {
         // file. Regular offline runs use a long synthetic playlist.
         let titles = match std::env::var_os("KYOUKO_TRACKLIST_TEST_FILE") {
             Some(path) => parse_playlist_titles(&std::fs::read(path).unwrap()).unwrap(),
-            None => (1..=150).map(|index| format!("Song {index}")).collect(),
+            None => (1..=5000).map(|index| format!("Song {index}")).collect(),
         };
         assert!(titles.len() > 12);
-        let url = "https://youtube.com/playlist?list=PLw9JTHoDqqD8y2qG6cyud4_iMzJmKd_3B";
+        let url = "https://www.youtube.com/playlist?list=PLw9JTHoDqqD8y2qG6cyud4_iMzJmKd_3B";
+        let watch = "https://www.youtube.com/watch?v=shared&list=PLw9JTHoDqqD8y2qG6cyud4_iMzJmKd_3B&pp=tracking";
         let (mut broker, sink, rx) = broker_with_sink();
-        broker.handle_command(Command::Load { source: Source::from_raw(url), paused: false });
-        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
+        broker.handle_command(Command::Load { source: Source::from_raw(watch), paused: false });
+        assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(Source::Youtube { url: target, playlist_index: Some(1), .. }, _))
+            if target == url));
         broker.handle_command(Command::YtQueueResolved { request_id: broker.yt_request, url: url.into(), titles: titles.clone() });
         broker.handle_status(Status::Opened { load_id: broker.shared.load_id(), source: Source::from_raw(url), sample_rate: 48_000, channels: 2, title: None, duration: None });
         broker.handle_command(Command::Stop);
@@ -3248,7 +3273,7 @@ mod tests {
     #[test]
     fn gui_jump_shows_the_selected_title_during_loading() {
         let (mut broker, _, rx) = broker_with_sink();
-        let url = "https://youtube.com/playlist?list=test";
+        let url = "https://www.youtube.com/playlist?list=test";
         broker.handle_command(Command::Load { source: Source::from_raw(url), paused: false });
         assert!(matches!(rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
         broker.handle_command(Command::YtQueueResolved { request_id: broker.yt_request, url: url.into(), titles: vec!["First".into(), "Selected\nSong".into()] });
@@ -3549,7 +3574,7 @@ mod tests {
     }
 
     #[test]
-    fn playlist_urls_gain_an_index_videos_do_not() {
+    fn youtube_playlist_links_are_canonicalized_before_routing() {
         match Source::from_raw("https://youtube.com/playlist?list=PLx") {
             Source::Youtube {
                 playlist_index: Some(1),
@@ -3557,12 +3582,36 @@ mod tests {
             } => {}
             other => panic!("playlist URL must advance: {other:?}"),
         }
-        match Source::from_raw("https://www.youtube.com/watch?v=abc&list=PLx") {
-            Source::Youtube {
-                playlist_index: None,
-                ..
-            } => {}
-            other => panic!("watch URL must stay a single video: {other:?}"),
+        let canonical = "https://www.youtube.com/playlist?list=PL_vapIQyT9HiGi47zcVlp9iFS3KuZgmIM";
+        for url in [
+            "https://www.youtube.com/watch?v=cQKGUgOfD8U&list=PL_vapIQyT9HiGi47zcVlp9iFS3KuZgmIM&pp=0gcJCRwDOCosWNin",
+            "https://youtube.com/watch?list=PL_vapIQyT9HiGi47zcVlp9iFS3KuZgmIM&v=cQKGUgOfD8U#index",
+            "http://m.youtube.com/watch?v=cQKGUgOfD8U&list=PL_vapIQyT9HiGi47zcVlp9iFS3KuZgmIM",
+            "https://youtu.be/cQKGUgOfD8U?list=PL_vapIQyT9HiGi47zcVlp9iFS3KuZgmIM&si=tracking",
+            canonical,
+        ] {
+            let source = Source::from_raw(url);
+            assert_eq!(source, Source::Youtube {
+                url: canonical.into(), format: "140".into(), playlist_index: Some(1),
+            });
+            assert_eq!(Source::from_raw(source.raw()), source);
+            assert_eq!(playlist_index_of(url), Some(1));
+        }
+    }
+
+    #[test]
+    fn only_nonempty_youtube_list_query_parameters_are_canonicalized() {
+        for url in [
+            "https://www.youtube.com/watch?v=abc",
+            "https://www.youtube.com/watch?v=abc&list=",
+            "https://www.youtube.com/watch?v=abc&notlist=PLx",
+            "https://www.youtube.com/watch?v=abc#list=PLx",
+            "https://www.youtube.com/watch?v=abc&redirect=https://example.com/?list=PLx",
+            "https://youtube.com.example.com/watch?v=abc&list=PLx",
+            "https://example.com/youtube.com/watch?v=abc&list=PLx",
+            "https://www.bilibili.com/video/BVtest?list=PLx",
+        ] {
+            assert_eq!(Source::from_raw(url).raw(), url);
         }
     }
 

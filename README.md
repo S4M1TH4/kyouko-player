@@ -82,7 +82,12 @@ logging. The application has no terminal command reader or system tray icon.
   in RAM; a recovery seek can wait for bytes from the original producer.
 - Atomic persistence of volume, EQ, repeat, folder, and track selection.
 - Owned playlist metadata jobs, cancelled on playlist changes or shutdown, with
-  a 45-second process deadline and bounded output. Non-finite configuration
+  a 310-second process deadline (five minutes plus ten seconds of margin) and
+  bounded output, allowing large playlists to finish paginated metadata requests.
+  YouTube links with a nonempty `list=` query parameter open the canonical
+  `https://www.youtube.com/playlist?list=...` URL, including shared watch links;
+  video and tracking parameters are discarded and playback starts at entry 1.
+  Non-finite configuration
   values use defaults; non-finite runtime controls leave settings unchanged.
 - Build-time icon generation at 16, 32, 48, and 256 px, embedded as Windows PE
   icon resource ID 1.
@@ -176,8 +181,13 @@ returns. The writer sleeps between records and drains on graceful shutdown.
 Streaming title extraction has a 45-second deadline. A download allows 60
 seconds for its first bytes, then fails after 30 seconds without progress.
 yt-dlp socket requests time out after 15 seconds with one internal retry.
-Timeouts terminate the source process tree and enter the player's existing
+Title/download timeouts terminate the source process tree and enter the existing
 two-attempt recovery policy. Completed RAM playback has no deadline worker.
+The independent full-playlist metadata fetch allows 310 seconds; replacement,
+Stop, or Quit cancels it without waiting for this deadline. Output is capped at
+8 MiB. A metadata timeout logs the failure and terminates that job without
+interrupting audio playback. Missing titles retain an `Unavailable track`
+placeholder at their original index.
 
 ## Output worker scheduling
 
@@ -254,6 +264,20 @@ These diagnostics allow 60 seconds per load, leave saved history unchanged,
 and clean up source processes on completion or failure. The playlist diagnostic
 loads its titles and advances to entry 2. The recovery diagnostic reopens real
 WASAPI streams after four injected output faults; it does not unplug hardware.
+
+For large playlists, verify metadata independently of those 60-second playback
+diagnostics, using the production 310-second playlist deadline:
+
+```powershell
+$env:KYOUKO_PLAYLIST_TEST_URL = 'https://www.youtube.com/playlist?list=YOUR_PLAYLIST_ID'
+cargo test --locked supplied_playlist_metadata_uses_production_deadline -- --ignored --nocapture
+Remove-Item Env:KYOUKO_PLAYLIST_TEST_URL
+```
+
+This fetches only flat indexed titles, reports the count and elapsed time, and
+does not start playback or modify saved state. Shared watch links with `list=`
+use the same canonicalization as dropped links. Offline tests generate 5,000
+titles and verify index preservation, final-track selection and restoration.
 
 For a single video from any supported platform, run
 `cargo test live_stream_seeks_and_repeats_from_the_same_ram_buffer -- --ignored --nocapture`

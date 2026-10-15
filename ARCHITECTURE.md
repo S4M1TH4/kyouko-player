@@ -175,7 +175,10 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
 - **Playlist metadata**: the one-shot flat fetch prints the original index
   plus a JSON-escaped title using UTF-8. `parse_playlist_titles` decodes each
   title as one item, preserving multiline/Unicode names and filling gaps
-  with unavailable-track placeholders so click indices cannot drift. Both
+  with unavailable-track placeholders so click indices cannot drift. yt-dlp's
+  literal `Unavailable track` fallback bypasses JSON formatting; the parser
+  accepts that exact unquoted sentinel while still rejecting other malformed
+  JSON. Both
   success and failure enter a one-slot result mailbox and wake the UI pump;
   a paused open drawer therefore updates without adding a timer.
   Each job has a request ID independent of its URL, so an A/B/A switch cannot
@@ -185,10 +188,13 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   - `File(String)`
   - `Youtube { url, format, playlist_index: Option<usize> }` — despite the
     name this variant covers *every* yt-dlp platform.
-  - `from_raw(&str)`: any `http(s)://` becomes `Youtube` (playlist-shaped
-    URLs — `list=` without a watch id — become advancing sources at entry 1);
-    everything else is a local file. `raw()` is the exact inverse
-    (persistence stores it).
+  - `from_raw(&str)`: any `http(s)://` becomes `Youtube`. YouTube URLs with a
+    nonempty, exact `list=` query key (including watch/mobile/short links) are
+    normalized to `https://www.youtube.com/playlist?list=...`, discarding the
+    video, tracking parameters and fragment, and become advancing sources at
+    entry 1. Host matching excludes lookalike domains; empty values, other query
+    keys and fragments do not trigger normalization. Everything else is a local
+    file. `raw()` returns the normalized source (persistence stores it).
   - `default_format_for(url) -> &'static str`: per-site yt-dlp format id —
     YouTube `140`, **Bilibili `30232`** (`bilibili.com/`, `b23.tv/`),
     **Niconico `bestaudio[format_id^=audio-aac-]`** (`nicovideo.jp/`, `nico.ms/`)
@@ -550,12 +556,29 @@ The process belongs to a Windows job with KILL_ON_JOB_CLOSE. Cancellation and
 deadlines terminate the whole job, including helpers; handles also enforce
 cleanup on application exit.
 An owned deadline thread parks on a condition variable until completion,
-cancellation or 45 seconds, then terminates stalled work. Socket timeout/retries
+cancellation or 310 seconds (five minutes for paginated full-playlist metadata
+plus ten seconds of margin), then terminates stalled work. This deadline is
+independent of the 45-second single-track title deadline. Socket timeout/retries
 are bounded, stdout is capped at 8 MiB, and indexed parsing caps 100,000 entries.
 Each job returns at most one result through its own mailbox; wake notifications
 coalesce without blocking on a full command pipe. A request ID and URL fence
 results after replacement/cancellation. Drop closes both worker lifetimes and
 all handles. No permanent thread, periodic poll, or idle deadline remains.
+
+The supplied 4,960-entry playlist previously exceeded the 45-second metadata
+limit: an unbounded diagnostic fetch completed in 98.739 seconds, including a
+YouTube HTTP 503 retry, with 456,638 bytes of indexed metadata. The byte/entry
+limits were not responsible. The longer deadline remains a finite network
+budget, not a guarantee that every server/network condition will complete.
+The same playlist also contained 181 missing-title fallbacks at indices
+4,780–4,960. Their unquoted `Unavailable track` values previously made JSON
+parsing reject the whole list even when the fetch completed; these now retain
+their original positions as placeholders.
+With both fixes, the production metadata loader accepted the supplied shared
+watch link, canonicalized it, and loaded all 4,960 entries in 94.298 seconds
+within the 310-second deadline. The captured indexed output also passed broker
+selection/persistence/restoration checks at entry 4,960. Offline process tests
+generate 5,000 entries including the same 181 literal fallbacks.
 
 ### `src/ui/win32.rs` — native presentation and input dispatch
 
