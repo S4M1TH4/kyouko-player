@@ -834,6 +834,19 @@ impl Broker {
 
     pub fn with_playlist_fetching(mut self) -> Self { self.metadata_enabled = cfg!(windows); self }
 
+    /// Controlled metadata/list UI workload: real commands, deferred output,
+    /// no source processes. Only available in the finite diagnostic build.
+    #[cfg(feature = "release-diagnostics")]
+    pub(crate) fn diagnostic_playlist(&mut self, raw: &[u8]) -> Result<(), String> {
+        let titles = parse_playlist_titles(raw)?;
+        self.metadata_enabled = false;
+        self.audio_output_lost();
+        let url = "https://www.youtube.com/playlist?list=diagnostic".to_string();
+        self.handle_command(Command::Load { source: Source::from_raw(&url), paused: true });
+        self.handle_command(Command::YtQueueResolved { url, request_id: self.yt_request, titles });
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn background_events(&self) -> Receiver<()> { self.background_rx.clone() }
 

@@ -87,3 +87,5 @@ cpal = { path = "vendor/cpal" }
 [features]
 default = ["output-realtime"]
 output-realtime = ["cpal/realtime"]
+# Finite full-application assessment; absent from ordinary builds.
+release-diagnostics = ["windows/Win32_System_ProcessStatus"]

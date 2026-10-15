@@ -234,6 +234,42 @@ Linux presentation support is still future work.
 
 ## Verification
 
+The finite full-application release assessment uses the real overlay, UI command
+pump, decoder, output, logging and state writer. Its Rust controller is optional.
+
+The Python runner is a local assessment artifact retained under ignored
+`target/release-assessment/`; it is not included in repository checkouts. The
+commands below use that retained runner alongside the versioned Rust controller.
+
+```powershell
+cargo build --locked --release --features release-diagnostics
+New-Item -ItemType Directory -Force target/release-assessment | Out-Null
+Copy-Item target/release/kyouko-player.exe target/release-assessment/kyouko-assessment.exe
+python target/release-assessment/release_assessment.py --fixtures
+python target/release-assessment/release_assessment.py idle local low folder synthetic codecs --repeats 3
+python target/release-assessment/release_assessment.py network saved --repeats 3
+python target/release-assessment/release_assessment.py --analyze
+python target/release-assessment/release_assessment.py --archive-state
+python target/release-assessment/release_assessment.py --clean-fixtures
+```
+
+Fixture generation requires FFmpeg/ffprobe; the runner uses Python's standard
+library. Network runs additionally require yt-dlp and its runtime. The real
+`state.cfg` supplies settings and the `saved` source, and is hashed before/after.
+Each process writes only to its own temporary LOCALAPPDATA. Raw plans, results,
+logs, fixture recipes and analysis are under `target/release-assessment/`.
+Normal tests require none of these external tools, media or audio hardware.
+
+The controller requires both `KYOUKO_APP_PLAN`/`KYOUKO_APP_RESULT` and a
+`diagnostic-owned` marker beside isolated state. It sends production commands
+and finite UI inspection messages; it injects no mouse/keyboard input. The
+`low` workload disables timestamp recording and sleeps throughout CPU windows.
+Other runs capture first application PCM delivery in fixed atomic storage;
+this measures neither physical sound latency nor device glitches. Synthetic
+playlist output is deferred so controlled selection tests launch no network
+processes. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for boundaries and results.
+Ordinary builds exclude the controller and all its hooks.
+
 ```text
 cargo check --locked
 cargo clippy --locked --all-targets -- -D warnings
@@ -298,7 +334,8 @@ seek/repeat diagnostic; it does not change application settings.
 | `src/audio.rs` | Decoding, DSP, PCM pool, and output stream ownership |
 | `src/pcm_queue.rs` | Preallocated atomic PCM queues with bounded claim attempts |
 | `src/decoder_wake.rs` | Decoder command delivery and race-safe address wait/wake |
-| `src/audio_performance.rs` | Opt-in release CPU and callback timing diagnostics |
+| `src/audio_performance.rs` | Opt-in PCM-only CPU and callback timing diagnostics |
+| `src/ui/win32/performance.rs` | Finite full-application release assessment controller |
 | `src/audio_device.rs` | Windows audio endpoint notifications |
 | `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |
 | `src/config.rs` | State configuration and atomic saves |

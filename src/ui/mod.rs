@@ -25,6 +25,8 @@ mod headless;
 mod render;
 #[cfg(windows)]
 mod win32;
+#[cfg(all(windows, feature = "release-diagnostics"))]
+pub(crate) use win32::performance;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};

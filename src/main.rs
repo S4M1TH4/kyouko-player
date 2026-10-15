@@ -70,6 +70,8 @@ use crate::broker::{Broker, Command, DecoderCmd, DecoderLink, SharedState, Sourc
 use crate::ui::CMD_TX;
 
 fn main() {
+    #[cfg(all(windows, feature = "release-diagnostics"))]
+    let diagnostic = ui::performance::start();
     // Claim the state directory before logging, restoration or device setup.
     // A duplicate launch must not touch another instance's settings/logs/hotkeys.
     let _instance = match config::InstanceGuard::acquire(&config::path()) {
@@ -193,6 +195,8 @@ fn main() {
     let _ = audio.decoder.join();
     drop(persistence);
     log_info!("MAIN", "shutdown complete — echo faded");
+    #[cfg(all(windows, feature = "release-diagnostics"))]
+    if let Some(diagnostic) = diagnostic { let _ = diagnostic.join(); }
 }
 
 /// Console control handler: Ctrl+C, Ctrl+Break and terminal-close are turned

@@ -500,6 +500,39 @@ controls only task-owned WPR recordings while builds/player/analysis stay
 unelevated. No tracing helper or recorder remains installed or running.
 See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
 
+### Full-application release diagnostics
+
+Full-application diagnostics are separately compiled with the opt-in
+`release-diagnostics` feature. `src/ui/win32/performance.rs` runs a finite plan
+alongside normal `main` initialization, the actual visible overlay, UI pump,
+WASAPI, logger and state writer. A marker beside isolated state is mandatory.
+Commands use the bounded production CMD_TX and WM_APP_BROKER path; UI inspections
+and explicit drawer/controlled-metadata operations use private message 0x8007.
+There is no synthetic mouse/keyboard input. Default builds exclude every hook.
+
+The recorder distinguishes command dequeue, completed broker handling, first
+UI sync/draw completion, matching decoder Opened/Seeked/SeekFailed status,
+sync after that status, and first PCM copied into an application output slice.
+Draw completion is an API-side boundary, not compositor presentation. A static
+2048-slot atomic recorder captures at most one QPC timestamp per armed command;
+slots are never reused, so a racing older callback cannot fill a newer slot.
+Wrong generations and later deliveries read no clock; overflow is counted.
+No callback allocation, lock, I/O, formatting, retry loop or analysis is added.
+
+Only the finite controller may inspect repeatedly while awaiting a bounded
+milestone. During low-overhead CPU windows, timestamp capture is disabled and
+the controller sleeps; there is no application polling thread or idle timer.
+GetProcessTimes and process-memory counters are read at window boundaries.
+The generated 5000-entry list uses production parsing and presentation, with
+source output deferred via the existing unavailable-output path. Its selection
+timings are explicitly separate from network/PCM timings. The real metadata
+worker may export indexed stdout in diagnostic builds only, outside callbacks.
+The local-only `target/release-assessment/release_assessment.py` retains plans,
+fixture recipes, logs, process measurements and nearest-rank analysis alongside
+it. Python tools and raw artifacts are ignored, rather than versioned source;
+the Rust controller and its Cargo feature remain part of the repository.
+See README for commands and PCM_PERFORMANCE.md for the assessment.
+
 ### `src/stream_buffer.rs` — bounded progressive RAM reader
 
 One `Arc<StreamBuffer>` owns a compressed `Vec<u8>` capped at **60 MiB**.

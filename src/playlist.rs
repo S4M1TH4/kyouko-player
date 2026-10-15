@@ -168,6 +168,10 @@ impl PlaylistJob {
                     terminate(&process, &group);
                 }
                 let status = child.wait();
+                #[cfg(feature = "release-diagnostics")]
+                if let Some(prefix) = std::env::var_os("KYOUKO_APP_METADATA") {
+                    let _ = std::fs::write(format!("{}-{request_id}.tsv", std::path::Path::new(&prefix).display()), &bytes);
+                }
                 *done.0.lock().unwrap_or_else(|error| error.into_inner()) = true;
                 done.1.notify_all();
                 let watchdog = worker_watchdog

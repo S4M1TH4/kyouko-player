@@ -1,3 +1,417 @@
+# Full-application release assessment — 2026-10-15
+
+This section measures the complete Windows player with its visible 80×96 overlay,
+production Win32 message pump, broker, decoder, WASAPI, asynchronous logger and
+state writer. It adds no performance optimization and claims no improvement.
+The older output-worker study below has narrower CPU/memory boundaries and
+must not be substituted for these full-process measurements.
+
+## Reproduction, scope and retained evidence
+
+Source baseline: `c5161d5a22c92b242a0696fd5514678ba42fc68f`, plus the reviewable
+diagnostic additions. The 310-second metadata deadline, literal missing-title
+fallbacks and watch-link `list=` canonicalization remain intact. No commits,
+pushes, packaging, codec, hotkey, scheduling, affinity or system configuration
+changes were made.
+
+Host: Windows 11 Pro 26200, AMD Ryzen 9 270 (8 cores/16 logical processors),
+about 15.3 GiB visible RAM, Rust 1.99.0. Output: Speakers (Realtek(R) Audio),
+native 48 kHz stereo F32, default shared-mode buffer. Player and tools ran
+unelevated; observed process priority was NORMAL_PRIORITY_CLASS (32).
+The existing CPAL/MMCSS output-worker policy was preserved. No ETW tracing or
+device-output glitch measurement was performed in this assessment.
+
+The real saved selection was YouTube playlist
+`PLE9NBypnb2JkRek6qiG0FPPiZYWa8r90F`, entry 1, with no saved local folder.
+Its settings supplied every run: volume 100%, EQ enabled, gains
+`1,5,4,2,3,3,-2,-3,-4,-5` dB, repeat off. Local scenarios replace only source/
+selection in isolated temporary state. The real state file's before/after SHA256
+is retained in `state-preservation.json`; it was never written by this work.
+
+Build/run commands are in README's Verification section. Run all measurements
+sequentially, after builds finish. Three fresh processes repeat each scenario.
+Idle/paused/playing/stopped CPU windows warm for two seconds and observe twenty
+seconds. Folder and synthetic-list windows observe ten seconds after the same
+warm-up; each codec observes eight seconds after two seconds of warm-up. Timing
+runs have a finite controller which probes only while awaiting milestones;
+`low` disables timing capture and sleeps throughout CPU observation windows.
+No permanent sampler, polling worker or idle timer was added. Commands travel
+through production CMD_TX, WM_APP_BROKER, broker handling and UI sync. No mouse,
+keyboard or manual playback tests were used.
+
+Raw evidence is retained locally at
+`C:\Users\rei\Documents\repo\kyouko-player\target\release-assessment\`:
+
+- `environment.json`, `fixtures.json`, `state-preservation.json` and build/test logs;
+- `<scenario>-<run>/plan.json`, `result.json`, `launch.json`, archived player logs
+  and state snapshots; network `metadata-*.tsv` contains actual indexed stdout;
+- `analysis.json` contains pooled and per-run nearest-rank distributions, process
+  memory/CPU windows, startup samples, underruns and recorder overflow;
+- analysis/reproduction source: `target/release-assessment/release_assessment.py`; this table
+  generator is retained as `target/release-assessment/make_report.py`.
+
+Generated media and temporary LOCALAPPDATA trees are removed after assessment;
+recipes/probe output/hashes remain. FFmpeg 8.1.1 generated sixteen 60-second
+440 Hz low-level fixtures: PCM16 (22.05 kHz mono, 44.1 kHz stereo, 48 kHz 5.1/7.1),
+float PCM96 stereo, PCM24/192 stereo, FLAC96/5.1 and FLAC48/MKV, MP3/44.1,
+Vorbis48 in Ogg/WebM, AAC-LC48 in M4A and AAC-LC44.1 in MP4, AAC-LC24 mono ADTS,
+IMA ADPCM48 stereo and MS ADPCM44.1 mono. Probe output documents actual layouts.
+The 5000-file folder uses task-owned hardlinks to generated WAV copies in groups
+of 1000 (NTFS rejected a single group's 1024th extra link). Equal mtimes make
+this a count/selection/scan workload, not a varied-storage corpus. A three-file
+folder supplies next/previous tests. The 5000-entry indexed synthetic metadata
+contains Unicode titles and literal missing-title entries 4780–4960.
+
+## Measurement boundaries
+
+CPU is process kernel+user time from GetProcessTimes divided by measured QPC
+wall time: **100% means one logical core**. Divide by 16 for whole-machine
+capacity on this host. CPU includes normal application workers plus the sleeping
+diagnostic controller; it excludes child yt-dlp/ffmpeg processes, the parent
+Python runner, warm-up, analysis and export. No tracing is mixed into these
+windows. Short windows and process-time quantization limit small percentages;
+0.00% does not prove that absolutely no instructions executed.
+
+Working set is resident process pages (including shared pages); private commit
+is PROCESS_MEMORY_COUNTERS_EX.PrivateUsage. Peak working set and PeakPagefileUsage
+are **process-lifetime peaks through that snapshot**, not window-only peaks or
+continuous samples. The latter is reported as peak process commit. Tables use
+boundary snapshots; transients between them are represented by the OS peak
+counters. No external-process memory is added to the player. The diagnostic's
+static 2048-slot atomic recorder and plan/controller storage are included.
+
+PCM sample storage is separate: nineteen 4096×2×4-byte allocations = **622592
+bytes (608 KiB)** at this output layout, not total process RAM. The existing
+1.5-second capacity (rounded to 1.536 s here), 500 ms priming, 60 MiB compressed
+cache cap, lock-free PCM handoff and event-driven decoder wake remain unchanged.
+
+All latency timestamps are QPC on the same machine. Request begins immediately
+before the finite controller constructs/sends a command. Acceptance ends at
+dequeue on the actual UI thread; application ends after broker handling returns.
+First sync ends after phase/output/timer updates, overlay draw attempt and drawer
+refresh. Matching decoder status and sync after that status are separately
+recorded for Opened/Seeked/SeekFailed; stale load identities are rejected.
+These are API-side UI boundaries, **not compositor/display scanout latency**.
+First application PCM ends after nonempty current-generation samples have been
+copied to an output slice, before the callback/backend returns. It includes
+priming for loads/seeks, and is **not physical audible-output latency**.
+
+The callback records at most one timestamp in each never-reused static slot,
+using bounded atomics and one CAS, with no allocation, locks, logging, I/O,
+sorting or retry. Wrong generations and subsequent deliveries read no clock.
+Overflow is counted. Inspection completion is a separate controller upper bound
+with nominal 10 ms waits; scheduler overshoot is retained. Exact callback/status
+timestamps do not inherit that polling quantization. Quit application includes
+final-save flush; process-exit timing additionally includes stream/UI retirement,
+decoder/logger joins, diagnostic JSON export and parent process-wait return.
+
+Launch starts immediately before CreateProcess via Python Popen. Window-shown
+ends after the actual initial layered draw and ShowWindow return. Usable ends
+when the UI pump services its first inspection after initial command drain/sync.
+Restored-ready is the matching Opened status that stages the saved source paused;
+the separately reported observed-ready includes controller delivery. It does not
+promise that the PCM pool has already filled its entire capacity.
+The first final-binary launch is separated from later warm launches; no cache
+flush, cache manipulation or power-setting change was made, so no cold-cache
+claim is justified.
+
+All distribution cells below are **p50 / p95 / p99 / maximum**, nearest rank.
+For three samples p95/p99 equal maximum; these are descriptive repetitions,
+not high-confidence tail estimates. Per-run distributions remain in analysis.json.
+
+
+## Full-process CPU and memory
+
+| Workload (runs) | CPU % one core, range (median) | Working set MiB | Private commit MiB | Peak WS / commit MiB |
+| --- | ---: | ---: | ---: | ---: |
+| idle (3) | 0.0000–0.0000 (0.0000) | 14.39–14.43 | 3.16–3.18 | 14.43 / 3.22 |
+| paused (3) | 0.0000–0.0000 (0.0000) | 14.76–14.88 | 3.30–3.47 | 14.88 / 3.53 |
+| playing (3) | 1.5624–2.3436 (2.2655) | 14.85–14.99 | 3.35–3.56 | 14.99 / 3.56 |
+| stopped (3) | 0.0000–0.0000 (0.0000) | 14.82–14.95 | 3.32–3.51 | 14.99 / 3.56 |
+| folder_playing (3) | 1.8749–2.4998 (1.8749) | 18.34–18.81 | 6.10–6.60 | 18.81 / 6.70 |
+| synthetic_paused (3) | 0.0000–0.1562 (0.0000) | 17.07–17.42 | 4.66–4.94 | 17.42 / 4.98 |
+
+The `low` rows have timestamp recording disabled. Folder/synthetic rows are
+separate instrumented workload observations. An open synthetic drawer can
+receive ordinary window-system work even though playback/output is deferred.
+
+
+The following peaks also include command/list work outside CPU windows, through
+the last retained workload snapshot. Final diagnostic JSON serialization and
+process exit are outside these memory boundaries.
+
+| Scenario | Run-to-run peak working set MiB | Run-to-run peak process commit MiB |
+| --- | ---: | ---: |
+| idle | 14.39–14.43 | 3.19–3.22 |
+| low | 14.86–14.99 | 3.38–3.56 |
+| local | 15.95–16.06 | 4.65–4.77 |
+| folder | 18.37–18.82 | 6.49–6.70 |
+| synthetic | 17.10–17.45 | 4.66–4.98 |
+| codecs | 16.95–17.14 | 4.98–5.19 |
+| network | 22.33–22.53 | 65.57–65.61 |
+| saved | 19.00–19.40 | 64.11–64.16 |
+
+### Codec playback (three 8-second observations per fixture)
+
+| Workload (runs) | CPU % one core, range (median) | Working set MiB | Private commit MiB | Peak WS / commit MiB |
+| --- | ---: | ---: | ---: | ---: |
+| pcm16-44100-stereo.wav (3) | 1.5623–2.1484 (1.9529) | 14.88–14.95 | 3.40–3.48 | 14.95 / 3.52 |
+| float-96000-stereo.wav (3) | 3.9060–4.2966 (3.9061) | 14.94–15.03 | 3.43–3.53 | 15.03 / 3.53 |
+| pcm24-192000-stereo.wav (3) | 5.6639–8.0072 (5.8592) | 14.99–15.09 | 3.46–3.60 | 15.09 / 3.60 |
+| pcm16-22050-mono.wav (3) | 0.5859–0.9765 (0.9764) | 15.04–15.20 | 3.51–3.71 | 15.20 / 3.72 |
+| pcm16-48000-51.wav (3) | 3.3202–5.2729 (4.0972) | 15.19–15.27 | 3.66–3.78 | 15.27 / 3.78 |
+| pcm16-48000-71.wav (3) | 4.8825–7.2263 (6.8348) | 15.23–15.32 | 3.71–3.84 | 15.32 / 3.84 |
+| flac-96000-51.flac (3) | 9.1788–11.1319 (9.5691) | 15.80–15.89 | 4.23–4.32 | 15.89 / 4.32 |
+| mp3-44100-stereo.mp3 (3) | 1.7576–2.3435 (1.9528) | 15.54–15.62 | 3.96–4.07 | 15.90 / 4.34 |
+| vorbis-48000-stereo.ogg (3) | 2.3433–2.9292 (2.3436) | 16.42–16.66 | 4.58–4.98 | 16.66 / 4.98 |
+| aac-48000-stereo.m4a (3) | 2.1483–2.5387 (2.3436) | 16.19–16.46 | 4.44–4.68 | 16.66 / 4.98 |
+| aac-24000-mono.aac (3) | 0.3906–0.9765 (0.7811) | 16.17–16.40 | 4.08–4.59 | 16.66 / 4.98 |
+| ima-48000-stereo.wav (3) | 2.3427–3.1246 (2.3435) | 16.16–16.40 | 4.05–4.58 | 16.66 / 4.98 |
+| msadpcm-44100-mono.wav (3) | 0.9765–1.7577 (1.5623) | 16.25–16.44 | 4.53–4.62 | 16.66 / 4.98 |
+| vorbis-48000-stereo.webm (3) | 2.5390–2.7340 (2.5390) | 16.92–17.13 | 4.93–5.19 | 17.14 / 5.19 |
+| flac-48000-stereo.mkv (3) | 1.7578–2.9212 (2.3436) | 16.49–16.97 | 4.89–5.11 | 17.14 / 5.19 |
+| aac-44100-stereo.mp4 (3) | 1.9529–2.3437 (2.1481) | 16.50–16.92 | 4.65–4.91 | 17.14 / 5.19 |
+
+These instrumented matrix observations include the actual overlay and source
+rate/layout conversion; they are separate from the dedicated low-overhead
+steady-playback rows. Eight seconds per file is not full-track/long-duration QA.
+
+Fixtures run in the manifest's fixed order within each process; later memory
+rows therefore inherit allocator state and lifetime peaks from earlier tracks.
+
+
+## Startup and local command latency
+
+| Startup workload/boundary | n | Distribution ms |
+| --- | ---: | --- |
+| codecs/window_ms | 3 | 118.086 / 855.657 / 855.657 / 855.657 |
+| codecs/usable_ms | 3 | 130.312 / 867.702 / 867.702 / 867.702 |
+| folder/window_ms | 3 | 121.374 / 137.604 / 137.604 / 137.604 |
+| folder/usable_ms | 3 | 1051.769 / 1118.047 / 1118.047 / 1118.047 |
+| folder/restored_ready_status_ms | 3 | 1052.861 / 1119.545 / 1119.545 / 1119.545 |
+| idle/window_ms | 3 | 117.682 / 125.811 / 125.811 / 125.811 |
+| idle/usable_ms | 3 | 133.249 / 138.064 / 138.064 / 138.064 |
+| local/window_ms | 3 | 107.399 / 505.377 / 505.377 / 505.377 |
+| local/usable_ms | 3 | 124.310 / 519.005 / 519.005 / 519.005 |
+| local/restored_ready_status_ms | 3 | 124.360 / 519.124 / 519.124 / 519.124 |
+| low/window_ms | 3 | 123.250 / 132.673 / 132.673 / 132.673 |
+| low/usable_ms | 3 | 136.084 / 144.934 / 144.934 / 144.934 |
+| network/window_ms | 3 | 109.364 / 127.830 / 127.830 / 127.830 |
+| network/usable_ms | 3 | 147.690 / 157.149 / 157.149 / 157.149 |
+| network/network_ready_status_ms | 3 | 45197.650 / 61780.494 / 61780.494 / 61780.494 |
+| saved/window_ms | 3 | 109.820 / 122.713 / 122.713 / 122.713 |
+| saved/usable_ms | 3 | 152.063 / 161.059 / 161.059 / 161.059 |
+| saved/network_ready_status_ms | 3 | 16271.224 / 19692.371 / 19692.371 / 19692.371 |
+| synthetic/window_ms | 3 | 126.527 / 145.213 / 145.213 / 145.213 |
+| synthetic/usable_ms | 3 | 136.719 / 156.302 / 156.302 / 156.302 |
+
+The first final-binary launch was local-1; local-2 and local-3 are its warm
+repetitions. This distinction is observational; startup differences are not
+attributed solely to caches. The detailed samples follow.
+
+| Scenario/run | Window shown ms | UI usable ms | Restored status ms | Observed ready ms |
+| --- | ---: | ---: | ---: | ---: |
+| codecs-1 | 855.657 | 867.702 | — | — |
+| codecs-2 | 111.157 | 123.114 | — | — |
+| codecs-3 | 118.086 | 130.312 | — | — |
+| folder-1 | 113.014 | 1030.407 | 1032.318 | 1034.268 |
+| folder-2 | 121.374 | 1051.769 | 1052.861 | 1055.716 |
+| folder-3 | 137.604 | 1118.047 | 1119.545 | 1121.079 |
+| idle-1 | 115.412 | 128.957 | — | — |
+| idle-2 | 117.682 | 133.249 | — | — |
+| idle-3 | 125.811 | 138.064 | — | — |
+| local-1 | 505.377 | 519.005 | 519.124 | 520.050 |
+| local-2 | 106.017 | 121.099 | 121.151 | 121.628 |
+| local-3 | 107.399 | 124.310 | 124.360 | 124.818 |
+| low-1 | 119.164 | 134.113 | — | 134.624 |
+| low-2 | 123.250 | 136.084 | — | 136.820 |
+| low-3 | 132.673 | 144.934 | — | 145.405 |
+| network-1 | 127.830 | 157.149 | — | — |
+| network-2 | 109.364 | 147.690 | — | — |
+| network-3 | 105.880 | 132.981 | — | — |
+| saved-1 | 105.026 | 161.059 | — | — |
+| saved-2 | 109.820 | 140.372 | — | — |
+| saved-3 | 122.713 | 152.063 | — | — |
+| synthetic-1 | 126.527 | 136.719 | — | — |
+| synthetic-2 | 145.213 | 156.302 | — | — |
+| synthetic-3 | 116.513 | 128.151 | — | — |
+
+Local commands: three independent processes, twelve repeated pause/resume,
+forward/backward seek and next/previous sequences per process, after a two-second
+playback warm-up. Initial resume is also retained (39 resumes vs 36 other repeated
+commands). Stop/restart/Quit have three samples each.
+
+| Command | Acceptance ms | Broker applied ms | First UI sync ms | Status UI sync ms | First PCM ms |
+| --- | --- | --- | --- | --- | --- |
+| pause | 10.201 / 12.280 / 13.203 / 13.203 | 10.232 / 12.315 / 13.250 / 13.250 | 10.853 / 12.887 / 13.926 / 13.926 | — | — |
+| resume | 0.065 / 0.228 / 1.140 / 1.140 | 0.088 / 0.251 / 1.164 / 1.164 | 0.514 / 1.067 / 2.523 / 2.523 | — | 5.895 / 10.302 / 30.659 / 30.659 |
+| seek_forward | 10.229 / 16.983 / 23.331 / 23.331 | 10.270 / 17.017 / 23.363 / 23.363 | 10.272 / 27.224 / 33.023 / 33.023 | 10.984 / 27.650 / 33.527 / 33.527 | 23.606 / 28.234 / 34.336 / 34.336 |
+| seek_backward | 0.041 / 0.096 / 2.088 / 2.088 | 0.067 / 0.154 / 2.130 / 2.130 | 0.069 / 0.157 / 2.132 / 2.132 | 0.834 / 1.065 / 4.509 / 4.509 | 11.925 / 17.241 / 19.017 / 19.017 |
+| next | 0.045 / 0.104 / 0.202 / 0.202 | 0.078 / 0.169 / 0.235 / 0.235 | 0.632 / 1.214 / 1.504 / 1.504 | 1.520 / 2.466 / 6.869 / 6.869 | 14.247 / 21.206 / 28.622 / 28.622 |
+| previous | 10.251 / 12.305 / 20.067 / 20.067 | 10.294 / 12.340 / 20.108 / 20.108 | 10.895 / 13.936 / 35.862 / 35.862 | 11.558 / 16.500 / 36.498 / 36.498 | 24.423 / 29.001 / 30.286 / 30.286 |
+| stop | 10.693 / 11.098 / 11.098 / 11.098 | 10.732 / 11.136 / 11.136 / 11.136 | 11.360 / 11.730 / 11.730 / 11.730 | — | — |
+| restart | 0.156 / 0.159 / 0.159 / 0.159 | 0.200 / 0.200 / 0.200 / 0.200 | 0.698 / 0.701 / 0.701 / 0.701 | 1.219 / 1.511 / 1.511 / 1.511 | 14.729 / 15.060 / 15.060 / 15.060 |
+| quit | 10.293 / 10.785 / 10.785 / 10.785 | 14.150 / 14.321 / 14.321 / 14.321 | — | — | — |
+
+Local Quit request → process exit: **41.507 / 47.029 / 47.029 / 47.029 ms**.
+
+
+| Command | First-PCM p50 by run 1 / 2 / 3, ms | First-PCM p95 by run 1 / 2 / 3, ms |
+| --- | --- | --- |
+| resume | 5.732 / 5.895 / 6.228 | 10.026 / 30.659 / 10.302 |
+| seek_forward | 23.606 / 23.848 / 20.492 | 28.234 / 34.336 / 28.032 |
+| seek_backward | 11.925 / 10.843 / 11.825 | 16.382 / 19.017 / 17.241 |
+| next | 15.169 / 11.768 / 14.209 | 21.206 / 19.366 / 28.622 |
+| previous | 25.437 / 21.949 / 24.392 | 28.787 / 29.001 / 30.286 |
+
+## Large folders and controlled streaming lists
+
+All three folder runs restored **5000** entries with the saved **2500th**
+source selected. Dropping the same folder rescanned it through production
+classification/sorting; each run then made five jumps to each of 1/2500/5000.
+Selected title, source filename and current index agreed. The real drawer was
+opened and painted with UpdateWindow; jumps refreshed its selected-row snapshot.
+
+| Operation | Distribution ms |
+| --- | --- |
+| Folder drop → broker applied | 449.033 / 449.668 / 449.668 / 449.668 |
+| Folder drop → fresh PCM | 460.164 / 472.542 / 472.542 / 472.542 |
+| Folder drawer creation/paint | 18.791 / 20.666 / 20.666 / 20.666 |
+| Folder jump 1 → PCM | 23.742 / 32.094 / 32.094 / 32.094 |
+| Folder jump 2500 → PCM | 24.036 / 30.367 / 30.367 / 30.367 |
+| Folder jump 5000 → PCM | 23.082 / 28.626 / 28.626 / 28.626 |
+| Synthetic parse + queue application + sync | 9.868 / 25.286 / 25.286 / 25.286 |
+| Synthetic drawer creation/paint | 13.764 / 26.010 / 26.010 / 26.010 |
+
+Folder scanning/restoration are synchronous UI/broker work: shallow scanning
+does not make a large folder nonblocking. The roughly 0.45-second drop handler
+and roughly one-second restore are a measured responsiveness limitation. No
+unrelated asynchronous-scan refactor or optimization was introduced.
+
+The synthetic list uses production indexed parsing (including 181 literal
+missing-title fallbacks) and actual list presentation, with output deferred via
+the existing unavailable-output path. No network/decode latency is implied. Each
+run made twelve jumps to each of 1/2500/5000, checking selection and immediately
+persisted playlist index. The parse figure includes queue setup and sync; it is
+not isolated parser CPU time.
+
+| Synthetic jump | Broker applied ms | UI sync ms |
+| --- | --- | --- |
+| 1 | 0.100 / 0.215 / 0.237 / 0.237 | 0.881 / 1.248 / 1.671 / 1.671 |
+| 2500 | 0.086 / 0.297 / 3.133 / 3.133 | 0.934 / 1.618 / 4.187 / 4.187 |
+| 5000 | 0.089 / 0.169 / 0.169 / 0.169 | 0.962 / 1.562 / 1.601 / 1.601 |
+
+## Network workloads (separate from controlled results)
+
+The supplied workload is [this 4960-entry YouTube playlist](https://www.youtube.com/playlist?list=PL_vapIQyT9HiGi47zcVlp9iFS3KuZgmIM).
+Its first entry supplied actual playback; jumps to 1/2480/4960 verify selection,
+title and persistence through the UI command path. Jumped-to network entries
+were cancelled without waiting for their audio, so these jumps do not establish
+that every entry is playable. The final entry is an unavailable-title placeholder.
+
+| Workload (runs) | CPU % one core, range (median) | Working set MiB | Private commit MiB | Peak WS / commit MiB |
+| --- | ---: | ---: | ---: | ---: |
+| supplied playlist playing (3) | 1.7968–2.5781 (2.4218) | 15.57–17.06 | 63.83–63.99 | 17.06 / 64.08 |
+| saved playlist playing (3) | 1.7968–2.2655 (1.8749) | 15.94–17.98 | 63.86–63.95 | 17.98 / 63.95 |
+
+| Run | Restored paused status from launch s | Metadata observed ready from launch s |
+| --- | ---: | ---: |
+| network-1 | 45.198 | 164.897 |
+| network-2 | 61.780 | 166.860 |
+| network-3 | 28.722 | 164.214 |
+| saved-1 | 15.720 | 38.114 |
+| saved-2 | 19.692 | 42.078 |
+| saved-3 | 16.271 | 38.680 |
+
+Metadata ready is the first finite probe seeing loading=false and the complete
+expected count. It includes fetch/pagination/retries, indexed JSON parsing,
+mailbox application and UI-pump dispatch, plus probe overshoot. Playback and its
+20-second observation precede the metadata wait; if metadata completes earlier,
+that probe is only an upper bound. Production log timestamps retain the actual
+resolved event separately. Network server/cache conditions were not controlled.
+
+
+| Run | Indexed rows / missing titles | Metadata applied, seconds from logging init | Raw bytes | Selected indices match raw titles/persistence |
+| --- | ---: | ---: | ---: | --- |
+| network-1 | 4960 / 181 | 164.866 | 456638 | [1, 2480, 4960] / True |
+| network-2 | 4960 / 181 | 166.835 | 456638 | [1, 2480, 4960] / True |
+| network-3 | 4960 / 181 | 164.192 | 456638 | [1, 2480, 4960] / True |
+| saved-1 | 42 / 0 | 6.403 | 2965 | [1] / True |
+| saved-2 | 42 / 0 | 9.654 | 2965 | [1] / True |
+| saved-3 | 42 / 0 | 8.361 | 2965 | [1] / True |
+
+The log-side boundary begins at logging initialization (after diagnostic-plan
+setup) and ends when the UI broker accepts the fully fetched/parsed title list.
+Log timestamps resolve to one millisecond. It is a combined startup/fetch/parse/
+application wall time, not isolated parser CPU time or a process-spawn interval.
+These timing runs include the diagnostic stdout export before parsing. A staged
+stream can report Opened before its PCM priming watermark is reached; network
+resume samples include remaining download/priming time.
+Synthetic parsing/application is separately controlled above. Actual indexed
+stdout was replayed through the existing offline broker selection/restoration
+regression after all observations.
+
+
+| Network command | Broker applied ms | First UI sync ms | First PCM ms |
+| --- | --- | --- | --- |
+| network/network_resume | 0.057 / 0.169 / 0.169 / 0.169 | 1.026 / 1.574 / 1.574 / 1.574 | 382.604 / 3275.938 / 3275.938 / 3275.938 |
+| network/network_jump_1 | 0.283 / 0.328 / 0.328 / 0.328 | 1.295 / 1.587 / 1.587 / 1.587 | — |
+| network/network_jump_2480 | 0.061 / 0.067 / 0.067 / 0.067 | 2.668 / 3.104 / 3.104 / 3.104 | — |
+| network/network_jump_4960 | 0.483 / 25.438 / 25.438 / 25.438 | 3.145 / 49.564 / 49.564 / 49.564 | — |
+| network/network_stop | 0.531 / 0.876 / 0.876 / 0.876 | 1.608 / 3.026 / 3.026 / 3.026 | — |
+| network/quit | 4.320 / 25.313 / 25.313 / 25.313 | — | — |
+| saved/network_resume | 0.052 / 0.054 / 0.054 / 0.054 | 1.033 / 1.258 / 1.258 / 1.258 | 374.151 / 382.416 / 382.416 / 382.416 |
+
+Supplied-playlist Quit → process exit: **43.990 / 53.249 / 53.249 / 53.249 ms**;
+saved-source Quit → process exit: **51.623 / 59.322 / 59.322 / 59.322 ms**.
+
+
+## Underruns, defects, verification and limits
+
+Completed result files: **24**; failed final runs: **0**. Maximum cumulative PCM underruns in a run: **0 frames**; recorder overflow: **0**.
+
+
+These counters cover startup priming rules, playback and command transitions
+within the recorded runs; generation changes are not silently counted as EOF.
+Zero PCM underruns does not prove glitch-free device output. Callback gaps were
+not used as audible-glitch evidence. No physical waveform/listening validation,
+compositor timing, hardware input delivery, output-glitch tracing, alternate hardware, cold-cache study,
+long-duration playback, Linux/Wayland, Opus, ALAC or full HE-AAC reconstruction
+was assessed. Child-process CPU/memory is outside the process tables.
+
+No reproducible product correctness defect requiring a fix was found in the
+completed controlled workloads. A pilot wrongly expected Next on a one-file
+queue to keep playing; production correctly stopped at queue end. The corrected
+three-file workload was repeated from scratch. Its failed pilot logs remain
+under `pilot-oneentry/` and are excluded from final statistics. The initial
+fixture hardlink-limit failure was a generator issue, corrected with groups; it
+supplies no player-performance data. No before/after improvement is claimed.
+
+Verification passed with no Rust warnings:
+
+```text
+cargo check --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked                             # 190 passed, 10 ignored
+cargo build --locked --release
+cargo clippy --locked --all-targets --features release-diagnostics -- -D warnings
+cargo test --locked --features release-diagnostics # 192 passed, 10 ignored
+cargo build --locked --release --features release-diagnostics
+python -m unittest discover -s target/release-assessment -p release_assessment.py   # 3 passed
+```
+
+New offline tests cover command parameter validation and fixed first-delivery
+storage: generation rejection, one timestamp, no clock read for later/wrong
+deliveries, no slot reuse and counted overflow. Python tests cover empty/nearest-
+rank distributions, one-core CPU scaling and invalid intervals. Existing
+allocation-free callbacks, PCM/wake, stream-buffer/cache/recovery, persistence,
+playlist index preservation, source canonicalization and cleanup tests passed.
+Changes are diagnostic/reporting only; ordinary builds exclude the controller
+and its hooks, and retain the existing decoder/downloader/recovery behavior.
+
+
+---
+
 # Output worker priority evaluation — 2026-10-14
 
 CPAL realtime promotion is enabled by default. These samples demonstrate more

@@ -478,6 +478,14 @@ impl OutputKey {
 }
 
 impl AudioOut {
+    #[cfg(feature = "release-diagnostics")]
+    pub(crate) fn diagnostic_counters(&self) -> (u64, u64, usize) {
+        self.receiver.as_ref().map_or((0, 0, 0), |r| (
+            r.state.underrun_frames.load(Ordering::Relaxed),
+            r.state.rendered_frames.load(Ordering::Relaxed),
+            (r.queue.capacity() + 1) * CHUNK_FRAMES * self.shared.as_ref().map_or(0, |s| s.device_channels() as usize) * size_of::<f32>(),
+        ))
+    }
     pub fn new(stream: Option<cpal::Stream>) -> Self {
         Self { stream, playing: false, signals: OutputSignals::new(), receiver: None, drained: None,
             shared: None, controls: None, key: None, error_recovery_used: false,
@@ -781,6 +789,8 @@ impl PcmOutput {
         if shared.generation() != generation { return events; }
         // Silence while priming or starved must not move the track playhead.
         shared.add_frames_played((written / channels) as u64);
+        #[cfg(all(windows, feature = "release-diagnostics"))]
+        if written > 0 { crate::ui::performance::pcm_delivered(generation); }
         self.chunks.state.rendered_frames.fetch_add((written / channels) as u64, Ordering::Relaxed);
         let eof = self.chunks.state.eof_generation.load(Ordering::Acquire) == generation;
         if written < data.len() && self.started == generation && !eof {

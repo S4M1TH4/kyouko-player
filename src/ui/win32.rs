@@ -63,6 +63,8 @@ use crate::audio::AudioOut;
 use super::render::{Renderer,
     TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position};
 use super::{set_pump_hwnd, WM_APP_BROKER, WM_APP_STATUS, WM_APP_OUTPUT};
+#[cfg(feature = "release-diagnostics")]
+pub(crate) mod performance;
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status, TrackList};
 use crate::{log_debug, log_error, log_info, log_warn};
 
@@ -409,6 +411,8 @@ pub fn run(
         let eq = (*state).shared.eq_gains();
         (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase(), &eq);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        #[cfg(feature = "release-diagnostics")]
+        performance::ready(hwnd);
         log_info!(
             "UI",
             "echo window up: {width}x{height} @ ({pos_x},{pos_y}) — layered, topmost, non-activating"
@@ -715,6 +719,8 @@ fn sync(s: &mut UiState) {
         s.renderer.draw(s.hwnd, &panel, phase, &eq);
     }
     refresh_tracklist(s);
+    #[cfg(feature = "release-diagnostics")]
+    performance::presented();
 }
 
 /// true = a Quit was processed → caller must destroy the window.
@@ -727,7 +733,12 @@ fn drain_commands(s: &mut UiState) -> bool {
         match super::take_local().map(Ok).unwrap_or_else(|| s.cmd_rx.try_recv()) {
             Ok(Command::ToggleOverlay) => toggle_visible(s),
             Ok(cmd) => {
-                if s.broker.handle_command(cmd) == Flow::Exit {
+                #[cfg(feature = "release-diagnostics")]
+                performance::accepted(&cmd, &s.shared);
+                let flow = s.broker.handle_command(cmd);
+                #[cfg(feature = "release-diagnostics")]
+                performance::applied();
+                if flow == Flow::Exit {
                     return true;
                 }
             }
@@ -743,7 +754,11 @@ fn drain_commands(s: &mut UiState) -> bool {
 fn drain_statuses(s: &mut UiState) -> bool {
     loop {
         match s.status_rx.try_recv() {
-            Ok(st) => s.broker.handle_status(st),
+            Ok(st) => {
+                #[cfg(feature = "release-diagnostics")]
+                performance::status(&st, &s.shared);
+                s.broker.handle_status(st);
+            }
             Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => {
                 s.broker.handle_command(Command::Quit);
@@ -1063,6 +1078,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         let s = &mut *state;
         match msg {
+            #[cfg(feature = "release-diagnostics")]
+            performance::MESSAGE => {
+                performance::inspect(s);
+                LRESULT(0)
+            }
             WM_CREATE => {
                 s.hotkeys.register(hwnd);
                 LRESULT(0)
