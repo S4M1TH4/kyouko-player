@@ -1,3 +1,215 @@
+# Measured EQ CPU optimization — 2026-10-16
+
+The EQ decoder path now keeps each band's channel history in local f64 variables
+for a packet and stores it once afterward. It previously indexed and updated
+the Vec history for every sample. Coefficients, arithmetic order, per-band f32
+rounding, channel independence, gain rebuilds and packet-boundary history are
+preserved. There is no change to audio scheduling, output priority, source
+formats, buffer policies, downloader/cache/recovery or hotkeys.
+
+This section supersedes the older assessment's lack of an optimization claim
+for **this EQ change**. The historical sections below retain their original
+sources, dates and scopes. This is not new CPU evidence for MMCSS promotion.
+
+## Comparable before/after procedure
+
+Baseline: the original EQ loop from `980ed99`. Candidate: packet-local EQ history.
+Both include identical opt-in stage profiling hooks and native output identity
+export, use the same locked dependencies, compiler and release settings, and
+retain the default CPAL realtime feature. Matched source copies, source/binary
+hashes and the exact build helper are retained locally. Both builds, fixture
+generation and prerequisite checks finished before the comparison observations
+began. The final release-mode equivalence check ran afterward.
+Source hashes use UTF-8 with LF line endings; binary hashes cover raw bytes.
+
+The full application ran with the visible production overlay, UI pump, decoder,
+WASAPI, logger and state writer, plus a finite diagnostic controller. Commands
+used production CMD_TX and UI dispatch. The controller slept throughout each
+CPU window; UI/callback timestamp capture and decoder-stage profiling were
+disabled. No mouse/keyboard input was injected. The normal player adds no timer,
+polling thread or callback recording for this optimization.
+
+Six complete rounds each compared adjacent baseline/candidate processes for six
+EQ-on workloads and two controls: **96 fresh processes, 96 observation windows**.
+The comparison ran across 15–16 October in the host's Asia/Colombo time zone.
+Every process warmed for five seconds and observed twenty seconds. Case order
+rotated by round; paired variant order alternated. Each pair used identical
+source bytes, settings, phase, duration, device and output format. No power plan,
+affinity, process priority, driver, registry or system-cache setting changed.
+Normal background activity and CPU-frequency behavior were not controlled.
+
+Host: Windows 11 Pro 26200, AMD Ryzen 9 270, 8 cores/16 logical processors,
+Rust 1.99.0. All tools/player processes ran unelevated; measured process class
+was NORMAL_PRIORITY_CLASS=32. Every run directly reported MMCSS registration
+success and output-worker GetThreadPriority=13. Native endpoint, 48 kHz stereo
+F32 and unchanged output identity were checked at both observation boundaries.
+No unplanned output replacement was accepted.
+
+The saved source/settings were read once and frozen in the manifest: a local
+113.894-second MP3, volume 100%, EQ on with gains
+`1,5,4,2,3,3,-2,-3,-4,-5` dB, repeat off. Generated 80-second, low-level 440 Hz
+fixtures cover AAC-LC/48 kHz stereo, Vorbis/48 kHz stereo, FLAC/96 kHz 5.1,
+PCM16/48 kHz stereo and PCM24/192 kHz stereo. The source hashes and complete
+FFmpeg/ffprobe recipes are retained. Bypass and paused controls use the same
+48 kHz WAV; bypass changes only isolated temporary state. Network was excluded.
+
+CPU is GetProcessTimes kernel+user time divided by measured QPC wall time:
+**100% means one logical core**, not the whole machine. Divide by 16 for this
+host's whole-machine capacity. Values include the full player and its sleeping
+controller, excluding launch/warm-up, parent Python, analysis/export and build
+work. Twenty-second windows are subject to process-time quantization and ordinary
+background variation; 0.00% is not proof of absolutely no executed instructions.
+
+Every observation checked steady phase/generation, the same native output key,
+no PCM underruns and unchanged PCM storage. Playing windows delivered
+approximately 1× application PCM; paused windows delivered no frames.
+The existing 1.5-second capacity, 500 ms priming and 60 MiB compressed
+cache cap remain intact. PCM sample storage remains 622592 bytes / 608 KiB on
+this device, separate from total process memory.
+
+## CPU results
+
+All per-workload cells summarize six matched pairs. Percentage-point differences
+are candidate minus baseline, so negative values mean less process CPU. Relative
+savings are computed within each pair before averaging. Individual workload
+statistics are descriptive/exploratory, not multiple-comparison significance
+claims. Raw pairs retain run-to-run variation.
+
+| Workload | Baseline mean CPU % (range) | Candidate mean CPU % (range) | Mean change, percentage points | Mean paired relative saving |
+| --- | ---: | ---: | ---: | ---: |
+| saved_mp3 | 2.3046 (2.0312–2.8123) | 1.3932 (1.1718–1.5625) | -0.9114 | 39.5% |
+| aac48 | 2.2785 (1.9531–2.6561) | 1.3021 (0.8594–1.7187) | -0.9765 | 42.8% |
+| vorbis48 | 2.2395 (2.0312–2.4218) | 1.3802 (1.0937–1.7968) | -0.8594 | 38.5% |
+| flac96_51 | 9.2966 (8.8277–9.8436) | 3.4762 (3.2029–3.8279) | -5.8204 | 62.6% |
+| wav48 | 2.5520 (2.1875–2.9686) | 1.0414 (0.7812–1.1719) | -1.5106 | 58.5% |
+| wav192 | 6.2498 (5.7808–6.5625) | 2.7083 (2.1093–3.5154) | -3.5415 | 56.5% |
+| eq_off | 0.6119 (0.3125–0.8591) | 0.7422 (0.3125–1.1718) | +0.1302 | — (control) |
+| paused | 0.0130 (0.0000–0.0781) | 0.0000 (0.0000–0.0000) | -0.0130 | — (control) |
+
+| Workload | Baseline CPU % by pair 1–6 | Candidate CPU % by pair 1–6 |
+| --- | --- | --- |
+| saved_mp3 | 2.344 / 2.187 / 2.109 / 2.031 / 2.344 / 2.812 | 1.484 / 1.328 / 1.250 / 1.172 / 1.562 / 1.562 |
+| aac48 | 2.187 / 2.344 / 1.953 / 2.266 / 2.656 / 2.265 | 0.859 / 1.406 / 1.484 / 1.172 / 1.719 / 1.172 |
+| vorbis48 | 2.187 / 2.031 / 2.187 / 2.344 / 2.266 / 2.422 | 1.094 / 1.406 / 1.094 / 1.797 / 1.250 / 1.641 |
+| flac96_51 | 8.828 / 9.609 / 9.218 / 9.844 / 9.062 / 9.219 | 3.828 / 3.436 / 3.203 / 3.828 / 3.203 / 3.359 |
+| wav48 | 2.266 / 2.812 / 2.734 / 2.344 / 2.969 / 2.187 | 1.172 / 1.172 / 0.781 / 0.937 / 1.092 / 1.094 |
+| wav192 | 6.484 / 5.781 / 6.094 / 6.562 / 6.484 / 6.094 | 2.578 / 3.515 / 2.500 / 2.578 / 2.969 / 2.109 |
+| eq_off | 0.312 / 0.547 / 0.859 / 0.547 / 0.625 / 0.781 | 0.859 / 0.859 / 0.625 / 0.625 / 0.312 / 1.172 |
+| paused | 0.000 / 0.000 / 0.078 / 0.000 / 0.000 / 0.000 | 0.000 / 0.000 / 0.000 / 0.000 / 0.000 / 0.000 |
+
+The predefined primary comparison gives each EQ-on workload equal weight within
+each complete round, then compares the six round-level relative savings:
+
+- Mean equal-weight relative CPU reduction: **49.72%**.
+- Descriptive paired-bootstrap 95% interval, resampling whole rounds:
+  **47.75–51.31%**.
+- Exact paired sign-flip, two-sided p: **0.03125** (64 possible sign assignments).
+- Every EQ-on workload's mean improved: **True**.
+- Round-level relative savings: **52.09 / 45.30 / 51.73 / 49.29 / 49.25 / 50.65%**.
+
+This is one predefined primary contrast, with a 5% practical threshold, rather
+than treating all workload p-values as independent discoveries. The bootstrap
+uses 20000 resamples and a fixed seed; six rounds give limited uncertainty
+resolution. The primary result describes this equally weighted local workload
+set, not a population of users, codecs, settings or hardware.
+
+EQ-off and paused results are controls. No CPU benefit is claimed when the EQ
+path is bypassed, when all bands are inactive, or while playback is paused.
+Control variation remains in the table rather than being discarded.
+
+The bypass control averaged 0.612% baseline versus 0.742% candidate, a
+**+0.130 percentage-point** difference. Its paired-bootstrap interval spans
+**−0.130 to +0.378 points**, with an exploratory sign-flip p of 0.375; four
+pairs increased and two decreased. These observations establish neither a
+bypass improvement nor a reproducible regression. They also do not prove the
+absence of a small regression. At this low CPU level, avoid interpreting
+relative percentages. Paused readings were zero except for one baseline
+0.078% window; no paused saving is inferred.
+
+## Profiling and output equivalence
+
+The separate heavier profiling runs timed successful decoder packet-read,
+decode, sample-copy, EQ, volume, resampling and channel-mix/copy stages. These
+are wall durations including preemption/allocation, not exclusive CPU instruction
+time; PCM capacity waits and sample callbacks are excluded. Profiling was not
+enabled in any of the 96 comparison CPU windows.
+
+| Profiling case | Original EQ share of measured stage wall time | Original EQ µs/packet | Candidate EQ µs/packet |
+| --- | ---: | ---: | ---: |
+| saved_mp3 | 84.6% | 402.832 | 117.108 |
+| aac48 | 91.1% | 339.915 | 99.504 |
+| flac96_51 | 94.7% | 7521.884 | 2012.237 |
+
+The focused regression retains the original sample-at-a-time implementation as
+a test-only reference. It requires identical f32 sample bits and f64 history bits
+across six rates (22.05/24/44.1/48/96/192 kHz), mono/stereo/5.1/7.1, three gain
+patterns, varied packet boundaries, subnormal inputs, silence tails and gain/seek
+history rebuilds. No f32/f64 precision reduction, coefficient change, filter
+reordering, approximation or output-rate shortcut is used.
+
+All 96 comparison windows had zero PCM underrun frames, unchanged output
+identity and stable generation. Playing windows delivered approximately 1× PCM;
+paused windows delivered none. This does not
+establish glitch-free device output or physical audible-output latency. No
+output-glitch trace or listening/waveform study was performed.
+
+
+| Variant | Boundary working set MiB | Boundary private commit MiB | Peak working set / process commit MiB through observation |
+| --- | ---: | ---: | ---: |
+| baseline | 14.80–15.82 | 3.34–4.23 | 15.82 / 4.23 |
+| candidate | 14.77–15.88 | 3.33–4.23 | 15.88 / 4.27 |
+
+These are process-memory counters, including the common diagnostic plan/controller
+and fixed storage. Peaks are process-lifetime peaks through that snapshot, not
+window-only peaks or post-export process-exit peaks. No RAM-saving claim is made.
+
+## Verification, reproduction and limits
+
+Required Rust checks and diagnostic-feature checks passed:
+
+```text
+cargo check --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked                              # 191 passed, 10 ignored
+cargo build --locked --release
+cargo clippy --locked --all-targets --features release-diagnostics -- -D warnings
+cargo test --locked --features release-diagnostics # 194 passed, 10 ignored
+cargo test --locked --release eq_packet_locals
+python -m unittest discover -s target/cpu-eval -p runner.py # 2 passed
+```
+
+The native endpoint/format export is an owner-thread diagnostic snapshot.
+Decoder profiling and its counter test compile only with release-diagnostics;
+it exports on track teardown and introduces no sampling worker or idle timer.
+The original per-sample EQ helper exists only in tests. Existing callback
+allocation, queue/wake, seeking, stream/cache/downloader/recovery, persistence,
+playlist indexing and cleanup tests passed. The actual saved state was hashed
+before/after and never written; isolated state, generated fixtures and task-owned
+processes were cleaned up. No commit, push or packaging was performed.
+
+Raw evidence and local-only Python tools are retained under
+`C:\Users\rei\Documents\repo\kyouko-player\target\cpu-eval\`:
+
+- `design.json`, `schedule.json`, `environment.json`, `manifest.json`, device key,
+  source/binary hashes and matched source copies;
+- `runs/<case>-p<pair>-<variant>/`: plans, raw process counters, PCM/output
+  snapshots, launches, initial/final isolated state and application logs;
+- `profiles/`: separate stage totals and original/candidate profiling runs;
+- `comparison.json`, `runner.py`, `build_variants.py`, `write_report.py` and
+  build/test logs. All Python files remain ignored local tools.
+
+To reproduce with those retained local tools, recreate fixtures, build matched
+variants, finish builds/tests, run the comparison, then analyse/export. Never
+overwrite an existing result directory; use a new task-owned output directory
+for a new experiment. Source recipes and settings must be revalidated when
+changing host/device/file. Current measurements exclude network fetches,
+physical output glitches, long-duration playback, other devices/machines and
+Linux/Wayland or deferred codecs. Hardware-wide or all-settings CPU savings,
+energy savings and scheduling improvements are not established by this study.
+
+
+---
+
 # Full-application release assessment — 2026-10-15
 
 This section measures the complete Windows player with its visible 80×96 overlay,

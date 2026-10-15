@@ -403,6 +403,11 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   above the decoded rate's Nyquist frequency are bypassed to avoid unstable
   filters. Symphonia 0.5 decodes the AAC core; this timing correction does
   not add HE-AAC SBR or parametric-stereo reconstruction.
+- **EQ packet processing**: each active band's channel history stays in local
+  f64 variables across one packet, then is stored once. The recurrence retains
+  the original arithmetic order and f32 rounding after each band, with separate
+  history for every channel. A test-only original loop verifies sample and
+  history bits across rates, layouts, packet boundaries, silence and rebuilds.
 - Title sidecar: `.title` file next to a local media file overrides the
   display name.
 - **Stream cache**: decoder-owned `StreamCache` retains exactly one successful
@@ -531,6 +536,14 @@ The local-only `target/release-assessment/release_assessment.py` retains plans,
 fixture recipes, logs, process measurements and nearest-rank analysis alongside
 it. Python tools and raw artifacts are ignored, rather than versioned source;
 the Rust controller and its Cargo feature remain part of the repository.
+`src/audio_cpu_profile.rs` is also diagnostic-feature-only. An optional
+`KYOUKO_DSP_PROFILE` destination enables seven decoder-stage wall counters;
+successful packet stages include preemption/allocation and exclude capacity
+waits and callbacks. Export occurs at track teardown. With the variable unset,
+no stage clock is read. No sampler, timer or additional worker is created.
+UI inspection exports the owner's native output key to verify endpoint, rate,
+channels and format during comparisons. The matched EQ study retains its
+ignored local Python tools and raw process measurements in `target/cpu-eval/`.
 See README for commands and PCM_PERFORMANCE.md for the assessment.
 
 ### `src/stream_buffer.rs` — bounded progressive RAM reader

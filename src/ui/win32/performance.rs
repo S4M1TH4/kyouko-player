@@ -124,6 +124,7 @@ pub(super) fn inspect(s: &mut UiState) {
     let _ = session.replies.try_send(json!({
         "begin": begin, "end": end, "phase": format!("{:?}", s.shared.phase()),
         "generation": s.shared.generation(), "position": s.shared.position().as_secs_f64(),
+        "output_key": s.audio_out.diagnostic_output_key(),
         "count": list.titles.len(), "current": list.current.map(|i| i + 1),
         "title": list.current.and_then(|i| list.titles.get(i)), "loading": list.loading,
         "persisted_index": s.broker.persist_snapshot().last_playlist_index,

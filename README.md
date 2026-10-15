@@ -17,6 +17,12 @@ native messages and dispatches commands. A dedicated decoder thread performs
 file and stream reads, Symphonia decoding, equalization, resampling, and volume
 processing before handing prepared samples to CPAL/WASAPI.
 
+The EQ keeps each band's channel history in local f64 variables for a decoded
+packet and stores it afterward. Sample arithmetic and per-band f32 rounding
+remain unchanged; a regression compares samples and filter history bit for bit
+with the original loop. Measured CPU comparisons are in
+[PCM performance measurements](PCM_PERFORMANCE.md).
+
 The sample callback uses preallocated PCM blocks and bounded atomic rings.
 Each queue claim makes one attempt and returns on contention. It performs no
 heap allocation/deallocation, file I/O, decoding, logging, mutex acquisition,
@@ -270,6 +276,15 @@ playlist output is deferred so controlled selection tests launch no network
 processes. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for boundaries and results.
 Ordinary builds exclude the controller and all its hooks.
 
+For decoder-stage profiling in a finite diagnostic run, `KYOUKO_DSP_PROFILE`
+names a JSON output file. The decoder records successful packet-read, decode,
+sample-copy, EQ, volume, resampling and channel-mix/copy wall durations, then
+writes them at track teardown. These include preemption and allocation and
+exclude PCM capacity waits and callbacks. Leave profiling unset for process CPU
+comparisons. Native output identity is included in diagnostic UI snapshots.
+The separate matched EQ comparison retains local tools and raw evidence under
+ignored `target/cpu-eval/`; Python tools are not shipped in the repository.
+
 ```text
 cargo check --locked
 cargo clippy --locked --all-targets -- -D warnings
@@ -335,6 +350,7 @@ seek/repeat diagnostic; it does not change application settings.
 | `src/pcm_queue.rs` | Preallocated atomic PCM queues with bounded claim attempts |
 | `src/decoder_wake.rs` | Decoder command delivery and race-safe address wait/wake |
 | `src/audio_performance.rs` | Opt-in PCM-only CPU and callback timing diagnostics |
+| `src/audio_cpu_profile.rs` | Optional decoder-stage wall timings for finite release diagnostics |
 | `src/ui/win32/performance.rs` | Finite full-application release assessment controller |
 | `src/audio_device.rs` | Windows audio endpoint notifications |
 | `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |

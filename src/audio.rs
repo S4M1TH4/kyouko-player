@@ -70,6 +70,9 @@ use crate::{log_info, log_warn, log_debug};
 #[cfg(test)]
 #[path = "audio_performance.rs"]
 mod performance;
+#[cfg(all(windows, feature = "release-diagnostics"))]
+#[path = "audio_cpu_profile.rs"]
+mod cpu_profile;
 
 /// One decoded, EQ'd, volume-applied, resampled block of interleaved f32
 /// samples at the DEVICE rate. Allocated once in the pool, then recycled.
@@ -478,6 +481,10 @@ impl OutputKey {
 }
 
 impl AudioOut {
+    #[cfg(feature = "release-diagnostics")]
+    pub(crate) fn diagnostic_output_key(&self) -> Option<String> {
+        self.key.as_ref().map(|key| format!("{key:?}"))
+    }
     #[cfg(feature = "release-diagnostics")]
     pub(crate) fn diagnostic_counters(&self) -> (u64, u64, usize) {
         self.receiver.as_ref().map_or((0, 0, 0), |r| (
@@ -1692,6 +1699,8 @@ fn play_source_with_output(
     let mut mix_buf: Vec<f32> = Vec::new();
     let mut bad_packets: u64 = 0;
     let mut opened = false;
+    #[cfg(all(windows, feature = "release-diagnostics"))]
+    let mut profile = cpu_profile::Profile::new(&source);
     'decode: loop {
         let mut exit = PlayExit::Eof;
         let mut failure_reason = None;
@@ -1745,6 +1754,8 @@ fn play_source_with_output(
                 }
             }
 
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            let stamp = profile.start();
             let packet = match track
                 .seek_packet
                 .take()
@@ -1772,11 +1783,15 @@ fn play_source_with_output(
                     break 'play;
                 }
             };
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            profile.end(cpu_profile::Stage::Read, stamp);
             track.next_ts = packet.ts().saturating_add(packet.dur());
             if packet.track_id() != track.track_id {
                 continue; // attached streams (cover art etc.)
             }
 
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            let stamp = profile.start();
             let decoded = match track.decoder.decode(&packet) {
                 Ok(d) => d,
                 Err(SymphoniaError::DecodeError(_)) => {
@@ -1793,6 +1808,8 @@ fn play_source_with_output(
                     break 'play;
                 }
             };
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            profile.end(cpu_profile::Stage::Decode, stamp);
 
             let spec = *decoded.spec();
             let (pcm_rate, pcm_channels) = match decoded_pcm_format(spec) {
@@ -1839,13 +1856,19 @@ fn play_source_with_output(
                 sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
             }
             let sb = sample_buf.as_mut().unwrap();
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            let stamp = profile.start();
             sb.copy_interleaved_ref(decoded);
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            profile.end(cpu_profile::Stage::Copy, stamp);
             let frames = sb.len() / track.channels;
             if frames == 0 {
                 continue;
             }
 
             // EQ at the source rate, before any resampling.
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            let stamp = profile.start();
             if shared.eq_enabled() {
                 if shared.take_eq_dirty() || !eq.built {
                     eq.rebuild(&shared.eq_gains(), track.sample_rate, track.channels);
@@ -1855,15 +1878,23 @@ fn play_source_with_output(
                     track.channels,
                 );
             }
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            profile.end(cpu_profile::Stage::Eq, stamp);
             // Volume after EQ.
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            let stamp = profile.start();
             let vol = shared.volume();
             if vol != 1.0 {
                 for s in &mut sb.samples_mut()[..frames * track.channels] {
                     *s *= vol;
                 }
             }
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            profile.end(cpu_profile::Stage::Volume, stamp);
 
             // Resample only on rate mismatch; then mix to the device layout.
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            let stamp = profile.start();
             rate_buf.clear();
             if track.sample_rate == dst_rate {
                 rate_buf.extend_from_slice(&sb.samples()[..frames * track.channels]);
@@ -1877,6 +1908,10 @@ fn play_source_with_output(
                     &mut rate_buf,
                 );
             }
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            profile.end(cpu_profile::Stage::Resample, stamp);
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            let stamp = profile.start();
             if dst_channels != track.channels {
                 mix_buf.clear();
                 convert_channels(&rate_buf, track.channels, dst_channels, &mut mix_buf);
@@ -1884,6 +1919,8 @@ fn play_source_with_output(
             } else {
                 pending.extend_from_slice(&rate_buf);
             }
+            #[cfg(all(windows, feature = "release-diagnostics"))]
+            profile.end(cpu_profile::Stage::Mix, stamp);
 
             // Emit fixed-size chunks; backpressure parks in send_chunk.
             while pending.len() >= chunk_samples {
@@ -2152,6 +2189,7 @@ impl Biquad {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn process(&mut self, ch: usize, x: f32) -> f32 {
         let z = &mut self.z[ch];
@@ -2162,8 +2200,7 @@ impl Biquad {
     }
 }
 
-/// 10-band cascade. `apply` is the only per-sample cost of the whole player's
-/// DSP: ~20 multiply-adds per sample for stereo with all bands active.
+/// Ten source-rate peaking filters; each channel retains its own f64 history.
 struct EqChain {
     bands: Vec<Biquad>,
     built: bool,
@@ -2188,10 +2225,23 @@ impl EqChain {
             if !band.active {
                 continue;
             }
-            for ch in 0..channels {
-                for i in (ch..buf.len()).step_by(channels) {
-                    buf[i] = band.process(ch, buf[i]);
+            let (b0, b1, b2, a1, a2) = (band.b0, band.b1, band.b2, band.a1, band.a2);
+            for (ch, state) in band.z[..channels].iter_mut().enumerate() {
+                // Keep one channel's recurrence in locals for the entire
+                // packet, rather than indexing and updating Vec history for
+                // every sample. Preserve operation order and f32 rounding at
+                // each band's output, including across packet boundaries.
+                let [mut x1, mut x2, mut y1, mut y2] = *state;
+                for sample in buf.iter_mut().skip(ch).step_by(channels) {
+                    let xv = *sample as f64;
+                    let y = b0 * xv + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                    x2 = x1;
+                    x1 = xv;
+                    y2 = y1;
+                    y1 = y;
+                    *sample = y as f32;
                 }
+                *state = [x1, x2, y1, y2];
             }
         }
     }
@@ -2244,6 +2294,61 @@ impl LinearResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eq_packet_locals_match_original_samples_and_history_bit_for_bit() {
+        fn original(eq: &mut EqChain, data: &mut [f32], channels: usize) {
+            for band in &mut eq.bands {
+                if !band.active { continue; }
+                for channel in 0..channels {
+                    for index in (channel..data.len()).step_by(channels) {
+                        data[index] = band.process(channel, data[index]);
+                    }
+                }
+            }
+        }
+        for rate in [22_050, 24_000, 44_100, 48_000, 96_000, 192_000] {
+            for channels in [1, 2, 6, 8] {
+                for gains in [[1.0,5.0,4.0,2.0,3.0,3.0,-2.0,-3.0,-4.0,-5.0],
+                    [0.0,-12.0,0.0,12.0,0.04,-0.04,4.0,-8.0,6.0,-3.0], [0.0; EQ_BANDS]] {
+                    let (mut expected, mut actual) = (EqChain::new(), EqChain::new());
+                    expected.rebuild(&gains, rate, channels);
+                    actual.rebuild(&gains, rate, channels);
+                    let mut seed = 0x1234abcd_u32;
+                    let source: Vec<_> = (0..8193 * channels).map(|i| {
+                        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+                        if i > 6000 * channels { 0.0 } else if i % 97 == 0 { f32::from_bits(1) }
+                        else { (seed as i32 as f32) / i32::MAX as f32 * 0.25 }
+                    }).collect();
+                    let mut offset = 0;
+                    for frames in [1, 3, 64, 257, 1024, 4096, 2748] {
+                        let end = (offset + frames * channels).min(source.len());
+                        let mut left = source[offset..end].to_vec();
+                        let mut right = left.clone();
+                        original(&mut expected, &mut left, channels);
+                        actual.apply(&mut right, channels);
+                        assert!(left.iter().zip(&right).all(|(a,b)| a.to_bits() == b.to_bits()), "rate {rate}, channels {channels}");
+                        for (a,b) in expected.bands.iter().zip(&actual.bands) {
+                            assert_eq!(a.active,b.active);
+                            for (za,zb) in a.z.iter().zip(&b.z) {
+                                assert!(za.iter().zip(zb).all(|(x,y)| x.to_bits() == y.to_bits()));
+                            }
+                        }
+                        offset = end;
+                    }
+                    assert_eq!(offset,source.len());
+                    // A seek/gain rebuild must still reset every history.
+                    expected.rebuild(&[-3.0; EQ_BANDS], rate, channels);
+                    actual.rebuild(&[-3.0; EQ_BANDS], rate, channels);
+                    let mut left = source[..128*channels].to_vec();
+                    let mut right = left.clone();
+                    original(&mut expected,&mut left,channels);
+                    actual.apply(&mut right,channels);
+                    assert!(left.iter().zip(&right).all(|(a,b)| a.to_bits() == b.to_bits()));
+                }
+            }
+        }
+    }
 
     fn callback_info() -> cpal::OutputCallbackInfo {
         let timestamp = cpal::StreamInstant::new(1, 0);
