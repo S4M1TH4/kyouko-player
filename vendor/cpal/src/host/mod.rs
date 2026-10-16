@@ -1,6 +1,3 @@
-// Modified for kyouko-player: WASAPI startup observation and/or the
-// Windows/Linux platform subset. See MODIFICATIONS.md in the CPAL root.
-
 // Local platform subset; retained backend implementations follow upstream.
 #[cfg(target_os = "linux")]
 pub(crate) mod alsa;

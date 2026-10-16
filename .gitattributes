@@ -1,7 +1,0 @@
-# Preserve upstream legal documents and source archives byte for byte.
-/LICENSE -text
-/THIRD_PARTY_NOTICES.md -text
-# Upstream legal files also retain their original whitespace verbatim.
-/licenses/** -text -whitespace
-# The reviewed lockfile hash must also survive Windows Git checkouts.
-/Cargo.lock text eol=lf

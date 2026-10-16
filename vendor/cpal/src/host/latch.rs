@@ -1,6 +1,3 @@
-// Modified for kyouko-player: WASAPI startup observation and/or the
-// Windows/Linux platform subset. See MODIFICATIONS.md in the CPAL root.
-
 //! Stream-readiness latch used by backends with dedicated worker threads.
 //!
 //! Prevents worker threads from invoking user callbacks before the `Stream` handle has been

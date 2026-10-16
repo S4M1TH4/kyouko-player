@@ -1,6 +1,3 @@
-// Modified for kyouko-player: WASAPI startup observation and/or the
-// Windows/Linux platform subset. See MODIFICATIONS.md in the CPAL root.
-
 //! Low-level library for audio input and output, written in Rust.
 //!
 //! For higher-level audio playback and capture, consider
