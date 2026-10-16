@@ -249,28 +249,11 @@ Linux presentation support is still future work.
 The finite full-application release assessment uses the real overlay, UI command
 pump, decoder, output, logging and state writer. Its Rust controller is optional.
 
-The Python runner is a local assessment artifact retained under ignored
-`target/release-assessment/`; it is not included in repository checkouts. The
-commands below use that retained runner alongside the versioned Rust controller.
-
-```powershell
-cargo build --locked --release --features release-diagnostics
-New-Item -ItemType Directory -Force target/release-assessment | Out-Null
-Copy-Item target/release/kyouko-player.exe target/release-assessment/kyouko-assessment.exe
-python target/release-assessment/release_assessment.py --fixtures
-python target/release-assessment/release_assessment.py idle local low folder synthetic codecs --repeats 3
-python target/release-assessment/release_assessment.py network saved --repeats 3
-python target/release-assessment/release_assessment.py --analyze
-python target/release-assessment/release_assessment.py --archive-state
-python target/release-assessment/release_assessment.py --clean-fixtures
-```
-
-Fixture generation requires FFmpeg/ffprobe; the runner uses Python's standard
-library. Network runs additionally require yt-dlp and its runtime. The real
-`state.cfg` supplies settings and the `saved` source, and is hashed before/after.
-Each process writes only to its own temporary LOCALAPPDATA. Raw plans, results,
-logs, fixture recipes and analysis are under `target/release-assessment/`.
-Normal tests require none of these external tools, media or audio hardware.
+The completed assessments used local Python runners, generated media, isolated
+state and raw logs. Those temporary artifacts have been removed. Results,
+methods and limitations remain in [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
+Repeating the measurements requires recreating the runners and fixtures.
+Normal tests require none of those tools, media or audio hardware.
 
 The controller requires both `KYOUKO_APP_PLAN`/`KYOUKO_APP_RESULT` and a
 `diagnostic-owned` marker beside isolated state. It sends production commands
@@ -301,13 +284,12 @@ sample-copy, EQ, volume, resampling and channel-mix/copy wall durations, then
 writes them at track teardown. These include preemption and allocation and
 exclude PCM capacity waits and callbacks. Leave profiling unset for process CPU
 comparisons. Native output identity is included in diagnostic UI snapshots.
-The separate matched EQ comparison retains local tools and raw evidence under
-ignored `target/cpu-eval/`; Python tools are not shipped in the repository.
+The separate matched EQ comparison's local tools and raw evidence have been
+removed; its results remain in the performance report.
 
 The second-endpoint assessment used Headphones (BT SPEAKER) on the same computer,
 with 96 matched CPU windows, about 31 minutes of continuous playback, and separate
-startup/command timing. Raw evidence and local tools are retained under ignored
-`target/device-bt-20261016/`. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for the
+startup/command timing. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for the
 measured active-EQ savings, bypass-control increase, initial-resume outlier and
 limits; this does not establish physical Bluetooth latency or glitch-free output.
 
@@ -315,22 +297,19 @@ A separate BT resume follow-up covers 30 resumes after 1/15/60/120-second pauses
 and fresh launches. With PCM already primed, the measured delay preceded the first
 render callback; PCM copying then took at most 0.004 ms. This localizes the delay
 to the output resumption path without identifying a particular Windows/driver/
-Bluetooth component or measuring audible sound. Raw evidence and local tools are
-under ignored `target/bt-resume-20261016/`; normal pause behavior is unchanged.
+Bluetooth component or measuring audible sound. Normal pause behavior is unchanged.
 
 The bypass CPU follow-up uses eight matched pairs with 120-second windows and
 the exact original binaries. Mean change was +0.039 percentage points of one
 core, with a descriptive 95% interval of −0.005 to +0.083; the earlier increase
 was not reproduced at the predeclared +0.10-point bound. Smaller effects remain
-possible. Raw evidence and local tools are under ignored
-`target/bt-bypass-20261016/`; see [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
+possible. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
 
 Memory controls found that retaining full diagnostic snapshots caused growth
 even while paused: three matched pairs averaged +498 KiB with retained snapshots
 versus -97 KiB with streaming. A separate six-minute streamed playback check had
 zero PCM underruns and a +28 KiB first-to-last private-commit change. Multi-hour
-stability remains unverified. Raw evidence and local tools are under ignored
-`target/bt-memory-20261016/`; see [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
+stability remains unverified. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
 
 ```text
 cargo fmt --package kyouko-player -- --check

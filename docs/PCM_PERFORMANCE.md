@@ -1,3 +1,8 @@
+> Cleanup note: temporary assessment tools and raw artifacts have been removed.
+> The results and methods below remain a historical record. Other local artifact
+> paths and tool commands describe the original runs; they are no longer
+> available here. Reproduction requires recreating the tools and fixtures.
+
 # Diagnostic memory-retention controls — 2026-10-16
 
 The preceding 31-minute BT run showed private-commit first/last-window means of
@@ -555,15 +560,12 @@ Initial resume → first application PCM was **1524.820 / 46.265 / 32.751 ms** b
 
 ## Reproduction, verification and remaining limits
 
-Raw plans/results, initial/final isolated state, player logs, validated counters,
-binary hashes, source recipes, native endpoint inventory, frozen settings,
-schedule/design and local-only tools are retained under
-`C:\Users\rei\Documents\repo\kyouko-player\target\device-bt-20261016\`.
-`measure.py` uses the retained binaries from `target/cpu-eval/`; `report.py` uses
-that study's paired-analysis helper and the tested percentile helper from
-`target/release-assessment/`. All Python tools and raw media remain ignored.
-Reproduction requires those local artifacts, Python, FFmpeg and the same active
-default endpoint; use a fresh output directory and revalidate hashes/settings.
+The runs collected plans/results, isolated state, player logs, validated counters,
+binary hashes, source recipes, endpoint inventory, frozen settings and schedules.
+The local analysis reused paired-comparison and tested percentile helpers.
+Those temporary artifacts and tools have since been removed. Reproduction
+requires recreating them, Python, FFmpeg and the same active default endpoint;
+use a fresh output directory and revalidate hashes/settings.
 Two offline calculation tests cover native rate/layout parsing, one-core CPU
 scaling, PCM delivery at 16/44.1/48 kHz and endpoint mismatch rejection. Required
 Cargo checks/build/tests were run after the measurements, with 191 tests passed
@@ -576,7 +578,6 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
 python -m unittest discover -s target/device-bt-20261016 -p measure.py
-python -m unittest discover -s target/release-assessment -p release_assessment.py
 ```
 
 The original bit-identical EQ reference regression and previous check results
@@ -815,7 +816,7 @@ state writer. It adds no performance optimization and claims no improvement.
 The older output-worker study below has narrower CPU/memory boundaries and
 must not be substituted for these full-process measurements.
 
-## Reproduction, scope and retained evidence
+## Measurement method, scope and evidence
 
 Source baseline: `c5161d5a22c92b242a0696fd5514678ba42fc68f`, plus the reviewable
 diagnostic additions. The 310-second metadata deadline, literal missing-title
@@ -835,10 +836,11 @@ The real saved selection was YouTube playlist
 Its settings supplied every run: volume 100%, EQ enabled, gains
 `1,5,4,2,3,3,-2,-3,-4,-5` dB, repeat off. Local scenarios replace only source/
 selection in isolated temporary state. The real state file's before/after SHA256
-is retained in `state-preservation.json`; it was never written by this work.
+was recorded in the temporary state-preservation log; it was never written by
+this work.
 
-Build/run commands are in README's Verification section. Run all measurements
-sequentially, after builds finish. Three fresh processes repeat each scenario.
+Measurements ran sequentially after builds finished. Three fresh processes
+repeated each scenario.
 Idle/paused/playing/stopped CPU windows warm for two seconds and observe twenty
 seconds. Folder and synthetic-list windows observe ten seconds after the same
 warm-up; each codec observes eight seconds after two seconds of warm-up. Timing
@@ -848,19 +850,11 @@ No permanent sampler, polling worker or idle timer was added. Commands travel
 through production CMD_TX, WM_APP_BROKER, broker handling and UI sync. No mouse,
 keyboard or manual playback tests were used.
 
-Raw evidence is retained locally at
-`C:\Users\rei\Documents\repo\kyouko-player\target\release-assessment\`:
+Temporary raw evidence, Python runners and report-generation tools were removed
+after completion. The results and measurement methods remain in this report.
 
-- `environment.json`, `fixtures.json`, `state-preservation.json` and build/test logs;
-- `<scenario>-<run>/plan.json`, `result.json`, `launch.json`, archived player logs
-  and state snapshots; network `metadata-*.tsv` contains actual indexed stdout;
-- `analysis.json` contains pooled and per-run nearest-rank distributions, process
-  memory/CPU windows, startup samples, underruns and recorder overflow;
-- analysis/reproduction source: `target/release-assessment/release_assessment.py`; this table
-  generator is retained as `target/release-assessment/make_report.py`.
-
-Generated media and temporary LOCALAPPDATA trees are removed after assessment;
-recipes/probe output/hashes remain. FFmpeg 8.1.1 generated sixteen 60-second
+Generated media and temporary LOCALAPPDATA trees were removed after assessment.
+FFmpeg 8.1.1 generated sixteen 60-second
 440 Hz low-level fixtures: PCM16 (22.05 kHz mono, 44.1 kHz stereo, 48 kHz 5.1/7.1),
 float PCM96 stereo, PCM24/192 stereo, FLAC96/5.1 and FLAC48/MKV, MP3/44.1,
 Vorbis48 in Ogg/WebM, AAC-LC48 in M4A and AAC-LC44.1 in MP4, AAC-LC24 mono ADTS,
@@ -1205,7 +1199,6 @@ cargo build --locked --release
 cargo clippy --locked --all-targets --features release-diagnostics -- -D warnings
 cargo test --locked --features release-diagnostics # 192 passed, 10 ignored
 cargo build --locked --release --features release-diagnostics
-python -m unittest discover -s target/release-assessment -p release_assessment.py   # 3 passed
 ```
 
 New offline tests cover command parameter validation and fixed first-delivery

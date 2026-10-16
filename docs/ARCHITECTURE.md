@@ -551,18 +551,16 @@ The generated 5000-entry list uses production parsing and presentation, with
 source output deferred via the existing unavailable-output path. Its selection
 timings are explicitly separate from network/PCM timings. The real metadata
 worker may export indexed stdout in diagnostic builds only, outside callbacks.
-The local-only `target/release-assessment/release_assessment.py` retains plans,
-fixture recipes, logs, process measurements and nearest-rank analysis alongside
-it. Python tools and raw artifacts are ignored, rather than versioned source;
-the Rust controller and its Cargo feature remain part of the repository.
+The temporary Python runners and raw assessment artifacts have been removed.
+The documented results, Rust controller and its Cargo feature remain part of
+the repository. Repeating the measurements requires recreating the local tools.
 `src/diagnostics/audio_cpu_profile.rs` is also diagnostic-feature-only. An optional
 `KYOUKO_DSP_PROFILE` destination enables seven decoder-stage wall counters;
 successful packet stages include preemption/allocation and exclude capacity
 waits and callbacks. Export occurs at track teardown. With the variable unset,
 no stage clock is read. No sampler, timer or additional worker is created.
 UI inspection exports the owner's native output key to verify endpoint, rate,
-channels and format during comparisons. The matched EQ study retains its
-ignored local Python tools and raw process measurements in `target/cpu-eval/`.
+channels and format during comparisons.
 See [README](../README.md) for commands and
 [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for the assessment.
 
