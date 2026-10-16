@@ -6,7 +6,7 @@ A high-performance, minimalist Win32 media player designed for global hotkey
 operation and resource efficiency. A compact floating overlay provides playback
 status, track selection, and equalizer adjustment.
 
-Initial release in preparation: **0.1.0**. See the [changelog](CHANGELOG.md)
+**Version 0.1.0** — initial Windows release. See the [changelog](CHANGELOG.md)
 for release notes.
 
 Execution is event driven. Idle and paused playback park the decoder and stop

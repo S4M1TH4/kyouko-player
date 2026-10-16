@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.1.0 — Unreleased
+## 0.1.0 — 2026-10-17
 
-Planned initial Windows release. The version is defined in `Cargo.toml`.
+Initial Windows release.
 
 ### Features
 
