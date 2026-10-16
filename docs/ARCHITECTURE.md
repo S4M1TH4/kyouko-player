@@ -216,9 +216,8 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   metadata reads no longer run inside every sort comparison. Ordering remains
   newest first, with undated entries last.
   The same extension filter applies to direct startup loads and restored file
-  history. AIFF, CAF, MP1, MP2 and Opus extensions are rejected because their
-  readers or decoders are disabled. Recognized containers can contain unsupported
-  codecs (for example ALAC in M4A); decoder construction rejects those tracks.
+  history. Supported audio codecs are MP3, AAC-LC, FLAC, Vorbis, PCM and ADPCM
+  within those containers.
 - **Panel text**: `render_panel(&SharedState, Option<&TrackMeta>)` — the
   five diagnostic text rows (header/time/track/vol/dual
   `eq` + `repeat` state row). Band gains are deliberately *not* text; the
@@ -396,15 +395,13 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   logging happens on the stream owner. No callback path sends a Crossbeam event.
 - **Decoded PCM format is authoritative**: `AudioBufferRef::spec()` supplies
   the source rate and channel stride for EQ, resampling, channel mixing and
-  `Status::Opened`. MP4 sample-entry rates are provisional hints: HE-AACv2
-  may advertise 44.1 kHz while Symphonia emits its 22.05 kHz mono AAC core.
-  Treating that core as 44.1 kHz doubles speed/pitch. Each decoded format is
+  `Status::Opened`. MP4 sample-entry rates are provisional hints; playback uses
+  the actual decoded PCM rate to preserve speed and pitch. Each decoded format is
   validated, and format changes reset EQ/resampler/interleaving buffers.
   Container `time_base` remains separate for duration and seek timestamps;
   `SharedState.sample_rate` remains the output device rate. EQ bands at or
   above the decoded rate's Nyquist frequency are bypassed to avoid unstable
-  filters. Symphonia 0.5 decodes the AAC core; this timing correction does
-  not add HE-AAC SBR or parametric-stereo reconstruction.
+  filters.
 - **EQ packet processing**: each active band's channel history stays in local
   f64 variables across one packet, then is stored once. The recurrence retains
   the original arithmetic order and f32 rounding after each band, with separate
@@ -1160,8 +1157,8 @@ bounded allocation, deallocation on track changes/repeat-off, downloader
 joining, and two identical RAM replays without any source process. An in-memory
 Rust generator builds AAC-LC silence and a fast-start MP4 container to verify playback and
 seeking with only a partial download, immediate refusal of future bytes,
-and seeking after completion. Tests require no network, audio device, FFmpeg,
-or files in the ignored `tests/` directory. A decode validation checks all
+and seeking after completion. These tests generate their fixtures in memory and
+require no network, audio device or FFmpeg. A decode validation checks all
 twelve generated packets for 48 kHz mono silence, 1024 frames per packet,
 and the complete 256 ms duration.
 

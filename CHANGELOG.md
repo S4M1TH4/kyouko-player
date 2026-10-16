@@ -43,4 +43,4 @@ Planned initial Windows release. The version is defined in `Cargo.toml`.
 
 - Windows 10 or 11. Network playback requires `yt-dlp` and its runtime dependencies;
   see the [README](README.md) for setup and supported formats.
-- Linux/Wayland, Opus, ALAC and full HE-AAC reconstruction remain deferred.
+- Linux/Wayland presentation remains deferred.

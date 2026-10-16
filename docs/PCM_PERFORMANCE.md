@@ -1,7 +1,6 @@
-> Cleanup note: temporary assessment tools and raw artifacts have been removed.
-> The results and methods below remain a historical record. Other local artifact
-> paths and tool commands describe the original runs; they are no longer
-> available here. Reproduction requires recreating the tools and fixtures.
+> Temporary assessment tools, raw artifacts and measured binaries were removed
+> after completion. The results and methods below remain a historical record.
+> Reproduction requires recreating the tools, fixtures and matched builds.
 
 # Diagnostic memory-retention controls — 2026-10-16
 
@@ -80,7 +79,7 @@ with first-to-last change **+220.0 KiB**.
 These remain instrumented-process boundary measurements, not a proof of flat
 production memory or glitch-free audible output.
 
-## Diagnostic change, checks and retained evidence
+## Diagnostic change and verification
 
 `KYOUKO_APP_OBSERVATIONS` optionally names a new JSONL destination. A bounded
 buffered writer on the finite controller serializes and flushes each observation
@@ -96,17 +95,14 @@ Required checks passed: normal check/clippy/test/release build (191 tests),
 diagnostic clippy/test/release build (196 tests), ten environment-dependent tests
 ignored in each configuration. The final default release executable was rebuilt
 without diagnostics before measurements. No speculative production memory fix
-was made. The source/binary hashes, finite design, schedule, generated-source
-recipe/hash, plans, launch/priority logs, raw JSON/JSONL, initial/final isolated
-state, validated values and offline analysis are under ignored
-`target/bt-memory-20261016/`. Local Python helpers reuse the retained isolated
-runner from `target/device-bt-20261016/measure.py`; no Python is versioned.
+was made. Source/binary hashes, the finite design, schedule, source recipes,
+plans, logs, raw JSON/JSONL, isolated state and offline analysis were collected
+for the study. Those temporary artifacts and Python helpers were later removed.
 
 Real state, current saved Ogg selection and source music were preserved. Generated
-fixture and task-owned isolated state/processes were cleaned up after verification;
-raw evidence and the diagnostic binary remain local. No commit or push was made.
-Other machines, multi-hour playback, physical audible-output
-latency/device glitches and compositor/input timing remain unverified. A longer
+fixture and task-owned isolated state/processes were cleaned up after verification.
+Comparable measurements on other machines, multi-hour playback, physical
+audible-output latency/device glitches and compositor/input timing remain unverified. A longer
 memory study should use streamed observations to avoid this retention confound.
 
 
@@ -117,8 +113,8 @@ memory study should use streamed observations to avoid this retention confound.
 This study follows the earlier BT SPEAKER bypass-control increase of +0.182
 percentage points of one logical core. It reuses the **exact original two release
 binaries**, rather than comparing one old binary against the newer callback-timing
-diagnostic build. Baseline/candidate hashes are checked for every launch and match
-target/cpu-eval/variant-hashes.json. The EQ is disabled in both variants, so the
+diagnostic build. Baseline/candidate hashes were checked for every launch against
+the original binary manifest. The EQ is disabled in both variants, so the
 changed EQ loop is bypassed. The source of any whole-binary CPU difference cannot
 be inferred merely from the source location of that loop.
 
@@ -196,7 +192,7 @@ The table includes every predefined valid observation, with no selected reruns
 or omitted unfavorable pairs. This is a new local paired experiment, not a direct
 controlled test proving why the earlier short-window samples were higher. Changed
 window duration, elapsed position, longer source and different test time are
-documented; the older raw measurements and conclusions remain below. No compiler,
+documented; the older measurement summaries and conclusions remain below. No compiler,
 binary-code layout, counter-accounting, frequency or background-load cause is
 established from CPU totals alone.
 
@@ -221,24 +217,20 @@ made. Zero PCM underruns does not establish glitch-free Bluetooth/device output.
 
 Two offline calculation tests passed: 120-second CPU scaling/delivery with
 underrun rejection, and the predeclared decision-boundary cases. Existing paired
-analysis is reused from target/cpu-eval/runner.py, whose calculation tests remain
-documented in the earlier report. The application code and retained binaries were
+analysis reused the original study's paired-comparison helper, whose calculation
+tests remain documented in the earlier report. The application code and binaries were
 not modified for this comparison; the preceding normal/diagnostic Rust check
 results remain documented below. No speculative code fix was made.
 
-Raw design, schedule, frozen settings, fixture recipe/hash, copied binary hashes,
-plans/results, application logs, validated measurements, initial/final isolated
-state, launch records and analysis are retained under
-`C:\Users\rei\Documents\repo\kyouko-player\target\bt-bypass-20261016\`.
-Local-only measure.py reuses the finite isolated helper from
-target/device-bt-20261016/measure.py and the exact binaries in target/cpu-eval/;
-report.py reuses its paired-analysis helper. Those retained dependencies are
-required for reproduction. Use a fresh output directory and revalidate the active
-default endpoint, settings and hashes. Python tools and raw artifacts are ignored.
+The temporary design files, schedules, frozen settings, source recipes, binary
+hashes, plans/results, logs, isolated state and analysis tools were later removed.
+Reproduction requires recreating the finite isolated-run helper, paired-analysis
+tools, fixtures and matched binaries. Use a fresh output directory and revalidate
+the active default endpoint, settings and hashes.
 
 The real state and source selection were preserved; isolated state, generated
-fixture and task-owned processes were cleaned up. No commit, push or packaging
-was performed. This covers one host, native device format and bypass workload.
+fixture and task-owned processes were cleaned up. This covers one host, native
+device format and bypass workload.
 Other sources/settings/hardware, system-wide CPU, physical output
 latency, device glitches and multi-hour memory behavior remain unverified.
 
@@ -299,9 +291,8 @@ The render callback reads at most two independent boundary clocks per armed comm
 outside normal builds, with no callback allocation, I/O, lock, blocking channel,
 sorting or unbounded recording. When timing capture is disabled it reads no
 boundary clocks. This instrumented build is for latency diagnosis, not new CPU
-comparison evidence. Source snapshots and binary hashes are retained.
-The final source differs from the measured snapshot only by a corrected module
-documentation comment describing the two recorders; the audit records that edit.
+comparison evidence. Source snapshots and binary hashes were recorded during
+the study and later removed with its temporary artifacts.
 
 ## Results
 
@@ -328,7 +319,7 @@ Priming was already marked ready before every resume: **True**.
 Maximum broker-handled and first UI sync/draw latencies were
 **0.582 ms** and **46.722 ms**.
 The maximum callback-entry → first copied PCM interval was
-**0.004 ms**. Raw per-round pairs remain in analysis.json.
+**0.004 ms**.
 
 All six processes retained the same native output key, PCM storage of 608 KiB,
 and matching generation across each resume. There were **zero PCM underruns,
@@ -354,7 +345,7 @@ processes on one endpoint/machine, not an estimate for all Bluetooth hardware.
 Physical sound capture, radio/power-state tracing and native Start timing remain
 unverified. External playback and system scheduling were not controlled.
 
-## Verification and retained evidence
+## Verification
 
 Normal checks passed: cargo check, Clippy with warnings denied, 191 tests (10
 ignored), and the normal release build. Diagnostic Clippy, 195 tests (10 ignored)
@@ -372,19 +363,12 @@ cargo build --locked --release
 cargo clippy --locked --all-targets --features release-diagnostics -- -D warnings
 cargo test --locked --features release-diagnostics
 cargo build --locked --release --features release-diagnostics
-python -m unittest discover -s target/bt-resume-20261016 -p resume.py
 ```
 
-Local-only tools and evidence are retained under
-`C:\Users\rei\Documents\repo\kyouko-player\target\bt-resume-20261016\`:
-design/manifest, exact source snapshots, binary hashes and diagnostic executable,
-build/test logs, runs/round-*/ plans/results/initial-final state/application logs,
-prelaunch-gap QPC boundaries, validated samples, analysis.json and report.py.
-resume.py reuses the isolated-run helper in target/device-bt-20261016/measure.py.
-All Python tools remain ignored. The source music was read only; no generated
-media was needed. Task-owned processes and isolated state were cleaned up.
-Existing assessment edits and the untracked audio_cpu_profile.rs were preserved.
-No commit, push or packaging was performed.
+Temporary manifests, source snapshots, binary hashes, diagnostic executables,
+logs, plans/results, isolated state, validated samples and local analysis tools
+were later removed. The source music was read only; no generated media was
+needed. Task-owned processes and isolated state were cleaned up.
 
 
 ---
@@ -395,9 +379,9 @@ The second-device study uses **Headphones (BT SPEAKER)** on the same computer.
 The player directly reported endpoint
 `{0.0.0.00000000}.{16409415-e7e2-4e08-9290-b04bc91d5f2e}`,
 **48 kHz, stereo, F32**. This is the WASAPI application format, not the Bluetooth
-transport codec. Windows endpoint inventory and every run's output key are
-retained. An initial paused probe still selected Realtek; it was excluded before
-any playback measurement. The user then selected BT SPEAKER as Windows output,
+transport codec. Windows endpoint inventory and every run's output key were
+recorded during the study. An initial paused probe still selected Realtek; it was
+excluded before any playback measurement. The user then selected BT SPEAKER as Windows output,
 and two subsequent paused probes confirmed the intended endpoint.
 
 ## Procedure and boundaries
@@ -410,7 +394,7 @@ volume 100%, active EQ gains `1,5,4,2,3,3,-2,-3,-4,-5` dB, repeat-off settings
 and fixture recipes were frozen. Generated fixtures were recreated with the same
 FFmpeg: WAV, AAC and FLAC hashes match the previous fixtures; regenerated Ogg
 Vorbis container bytes differ. Both builds use the identical frozen new Vorbis
-file within this study. Its new/previous hashes and encoding recipe are retained.
+file within this study. Its new/previous hashes and encoding recipe were recorded.
 
 Six complete rounds cover six EQ-on workloads, plus bypass and paused controls:
 **96 fresh full-application processes and 96 CPU windows**, each with five seconds
@@ -471,7 +455,7 @@ paired-bootstrap interval **+0.0521 to
 +0.3125 points**, exploratory sign-flip
 p **0.06250**. No paused/bypass benefit is
 assumed, and small control readings should not be interpreted using relative
-percentages. All raw pairs and the control uncertainty are retained in analysis.json.
+percentages. The analysis included all raw pairs and the control uncertainty.
 Five of the six bypass pairs increased. The positive bootstrap interval and
 exploratory exact p of 0.0625 leave a possible small bypass cost unresolved;
 this is a focused follow-up item, not evidence that bypass behavior is cost-free.
@@ -570,14 +554,13 @@ Two offline calculation tests cover native rate/layout parsing, one-core CPU
 scaling, PCM delivery at 16/44.1/48 kHz and endpoint mismatch rejection. Required
 Cargo checks/build/tests were run after the measurements, with 191 tests passed
 and 10 ignored. Three existing offline analysis tests also passed for the reused
-percentile/CPU/evidence helpers. Local logs record the following checks:
+percentile/CPU/evidence helpers. The following checks passed during that study:
 
 ```text
 cargo check --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
-python -m unittest discover -s target/device-bt-20261016 -p measure.py
 ```
 
 The original bit-identical EQ reference regression and previous check results
@@ -585,12 +568,11 @@ remain documented below. There was no new production-code optimization or fix.
 
 The real state hash was unchanged, task-owned processes and isolated state were
 cleaned up, and generated fixtures were removed after their hashes were checked.
-No commit, push or packaging was performed.
 
 Coverage now includes two audio endpoints on one computer and this bounded
-continuous playback run. Other computers, multi-hour playback,
+continuous playback run. Comparable measurements on other computers, multi-hour playback,
 physical audible-output latency, Bluetooth transport/device glitches, compositor
-and hardware-input timing, network playback and deferred codecs/platforms remain
+and hardware-input timing, network playback and other platforms remain
 unverified. Do not generalize these local EQ results to all settings or hardware.
 
 
@@ -615,8 +597,8 @@ Baseline: the original EQ loop from `980ed99`. Candidate: packet-local EQ histor
 Both include identical opt-in stage profiling hooks and native output identity
 export, use the same locked dependencies, compiler and release settings, and
 retain the default CPAL realtime feature. Matched source copies, source/binary
-hashes and the exact build helper are retained locally. Both builds, fixture
-generation and prerequisite checks finished before the comparison observations
+hashes and the build helper were recorded during the study and later removed.
+Both builds, fixture generation and prerequisite checks finished before the comparison observations
 began. The final release-mode equivalence check ran afterward.
 Source hashes use UTF-8 with LF line endings; binary hashes cover raw bytes.
 
@@ -648,8 +630,8 @@ The saved source/settings were read once and frozen in the manifest: a local
 `1,5,4,2,3,3,-2,-3,-4,-5` dB, repeat off. Generated 80-second, low-level 440 Hz
 fixtures cover AAC-LC/48 kHz stereo, Vorbis/48 kHz stereo, FLAC/96 kHz 5.1,
 PCM16/48 kHz stereo and PCM24/192 kHz stereo. The source hashes and complete
-FFmpeg/ffprobe recipes are retained. Bypass and paused controls use the same
-48 kHz WAV; bypass changes only isolated temporary state. Network was excluded.
+FFmpeg/ffprobe recipes were recorded during the study. Bypass and paused controls
+use the same 48 kHz WAV; bypass changes only isolated temporary state. Network was excluded.
 
 CPU is GetProcessTimes kernel+user time divided by measured QPC wall time:
 **100% means one logical core**, not the whole machine. Divide by 16 for this
@@ -671,7 +653,7 @@ All per-workload cells summarize six matched pairs. Percentage-point differences
 are candidate minus baseline, so negative values mean less process CPU. Relative
 savings are computed within each pair before averaging. Individual workload
 statistics are descriptive/exploratory, not multiple-comparison significance
-claims. Raw pairs retain run-to-run variation.
+claims. The analysis included run-to-run variation.
 
 | Workload | Baseline mean CPU % (range) | Candidate mean CPU % (range) | Mean change, percentage points | Mean paired relative saving |
 | --- | ---: | ---: | ---: | ---: |
@@ -773,7 +755,6 @@ cargo build --locked --release
 cargo clippy --locked --all-targets --features release-diagnostics -- -D warnings
 cargo test --locked --features release-diagnostics # 194 passed, 10 ignored
 cargo test --locked --release eq_packet_locals
-python -m unittest discover -s target/cpu-eval -p runner.py # 2 passed
 ```
 
 The native endpoint/format export is an owner-thread diagnostic snapshot.
@@ -783,26 +764,18 @@ The original per-sample EQ helper exists only in tests. Existing callback
 allocation, queue/wake, seeking, stream/cache/downloader/recovery, persistence,
 playlist indexing and cleanup tests passed. The actual saved state was hashed
 before/after and never written; isolated state, generated fixtures and task-owned
-processes were cleaned up. No commit, push or packaging was performed.
+processes were cleaned up.
 
-Raw evidence and local-only Python tools are retained under
-`C:\Users\rei\Documents\repo\kyouko-player\target\cpu-eval\`:
-
-- `design.json`, `schedule.json`, `environment.json`, `manifest.json`, device key,
-  source/binary hashes and matched source copies;
-- `runs/<case>-p<pair>-<variant>/`: plans, raw process counters, PCM/output
-  snapshots, launches, initial/final isolated state and application logs;
-- `profiles/`: separate stage totals and original/candidate profiling runs;
-- `comparison.json`, `runner.py`, `build_variants.py`, `write_report.py` and
-  build/test logs. All Python files remain ignored local tools.
-
-To reproduce with those retained local tools, recreate fixtures, build matched
-variants, finish builds/tests, run the comparison, then analyse/export. Never
+Temporary manifests, source/binary hashes, matched source copies, plans, raw
+counters, snapshots, logs, isolated state, stage profiles and Python tools were
+removed after completion. Reproduction requires recreating those tools and
+fixtures, building matched variants, finishing builds/tests, running the
+comparison and then analysing/exporting. Never
 overwrite an existing result directory; use a new task-owned output directory
 for a new experiment. Source recipes and settings must be revalidated when
 changing host/device/file. Current measurements exclude network fetches,
 physical output glitches, long-duration playback, other devices/machines and
-Linux/Wayland or deferred codecs. Hardware-wide or all-settings CPU savings,
+Linux/Wayland. Hardware-wide or all-settings CPU savings,
 energy savings and scheduling improvements are not established by this study.
 
 
@@ -820,9 +793,8 @@ must not be substituted for these full-process measurements.
 
 Source baseline: `c5161d5a22c92b242a0696fd5514678ba42fc68f`, plus the reviewable
 diagnostic additions. The 310-second metadata deadline, literal missing-title
-fallbacks and watch-link `list=` canonicalization remain intact. No commits,
-pushes, packaging, codec, hotkey, scheduling, affinity or system configuration
-changes were made.
+fallbacks and watch-link `list=` canonicalization remain intact. The assessment
+made no codec, hotkey, scheduling, affinity or system configuration changes.
 
 Host: Windows 11 Pro 26200, AMD Ryzen 9 270 (8 cores/16 logical processors),
 about 15.3 GiB visible RAM, Rust 1.99.0. Output: Speakers (Realtek(R) Audio),
@@ -919,7 +891,7 @@ power-setting change was made.
 
 All distribution cells below are **p50 / p95 / p99 / maximum**, nearest rank.
 For three samples p95/p99 equal maximum; these are descriptive repetitions,
-not high-confidence tail estimates. Per-run distributions remain in analysis.json.
+not high-confidence tail estimates.
 
 
 ## Full-process CPU and memory
@@ -1178,14 +1150,14 @@ within the recorded runs; generation changes are not silently counted as EOF.
 Zero PCM underruns does not prove glitch-free device output. Callback gaps were
 not used as audible-glitch evidence. No physical waveform/listening validation,
 compositor timing, hardware input delivery, output-glitch tracing, alternate
-hardware, long-duration playback, Linux/Wayland, Opus, ALAC or full HE-AAC reconstruction
+hardware, long-duration playback or Linux/Wayland
 was assessed. Child-process CPU/memory is outside the process tables.
 
 No reproducible product correctness defect requiring a fix was found in the
 completed controlled workloads. A pilot wrongly expected Next on a one-file
 queue to keep playing; production correctly stopped at queue end. The corrected
-three-file workload was repeated from scratch. Its failed pilot logs remain
-under `pilot-oneentry/` and are excluded from final statistics. The initial
+three-file workload was repeated from scratch. The failed pilot was excluded
+from final statistics. The initial
 fixture hardlink-limit failure was a generator issue, corrected with groups; it
 supplies no player-performance data. No before/after improvement is claimed.
 
@@ -1292,7 +1264,7 @@ occupied logical core**, not whole-machine Task Manager usage. The measurement
 includes decoder, WASAPI worker and diagnostic broker/test harness. It excludes
 normal overlay/save/log workers, initialization, warm-up, replacement/recovery
 work, later analysis and CSV export. Observation wall time was about 20 seconds
-per run (small event-wait deadline overshoot is retained in raw logs).
+per run, including the small event-wait deadline overshoot.
 
 ## Corrected diagnostic boundaries
 
@@ -1513,10 +1485,8 @@ process/sample-memory scopes are deliberately narrower than full-app CPU/RSS.
 promotion on all measured replacement workers, and fewer attributable render
 starvation notifications in the healthy traced pair. **Not demonstrated:** a
 general audible-smoothness guarantee, general CPU savings, PCM RAM savings or
-hard real-time scheduling. Changes remain uncommitted; no push or packaging.
+hard real-time scheduling.
 
-Raw run logs/CSV, `comparison.json`, ETLs, provider inventories, TraceEvent exports,
-`trace-correlation.json` and analysis scripts are retained locally under
-`target/priority-eval/` (ignored build/diagnostic artifacts). Source/settings,
-worker identities, distribution variation and counter scopes are independently
-reviewable there. `state.cfg` was read, not rewritten.
+The raw logs/CSV, ETLs, provider inventories, TraceEvent exports, correlation
+records and analysis scripts were temporary artifacts and have been removed.
+`state.cfg` was read, not rewritten.

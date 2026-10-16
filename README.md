@@ -140,9 +140,8 @@ window. Click X to quit; the full click is consumed before shutdown.
 
 Local files use the same extension filter for drops, folder scans, startup
 arguments, and restored history: `.mp3`, `.flac`, `.wav`, `.m4a`, `.aac`, `.mp4`,
-`.mkv`, `.webm`, and `.ogg`. Other extensions are ignored. Container recognition
-does not guarantee codec support: ALAC in M4A/MP4 and Opus in OGG/WebM are
-rejected by the decoder. AIFF, CAF, MP1, and MP2 support is not enabled.
+`.mkv`, `.webm`, and `.ogg`. Supported audio codecs are MP3, AAC-LC, FLAC, Vorbis,
+PCM and ADPCM within those containers.
 
 Settings are stored in `%LOCALAPPDATA%\kyouko-player\state.cfg`, falling back to
 `state.cfg` in the working directory when `LOCALAPPDATA` is unavailable.
