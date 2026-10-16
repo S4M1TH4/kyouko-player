@@ -43,17 +43,17 @@
 //! Release builds are GUI overlay processes with no console or stdin reader.
 
 mod audio;
-mod decoder_wake;
-mod pcm_queue;
 #[cfg(windows)]
 mod audio_device;
 mod broker;
 mod config;
 mod deadline;
+mod decoder_wake;
 mod logging;
-mod process;
+mod pcm_queue;
 #[cfg(windows)]
 mod playlist;
+mod process;
 mod stream_buffer;
 mod ui;
 
@@ -76,7 +76,10 @@ fn main() {
     // A duplicate launch must not touch another instance's settings/logs/hotkeys.
     let _instance = match config::InstanceGuard::acquire(&config::path()) {
         Ok(Some(guard)) => guard,
-        Ok(None) => { eprintln!("kyouko-player is already running"); return; }
+        Ok(None) => {
+            eprintln!("kyouko-player is already running");
+            return;
+        }
         Err(error) => {
             let _logging = logging::init();
             log_error!("MAIN", "cannot acquire instance lock: {error}");
@@ -97,7 +100,10 @@ fn main() {
         let _ = SetConsoleOutputCP(65001); // CP_UTF8
         use windows::Win32::System::Console::SetConsoleCtrlHandler;
         if SetConsoleCtrlHandler(Some(on_console_ctrl), true).is_err() {
-            log_warn!("MAIN", "SetConsoleCtrlHandler failed — Ctrl+C will be abrupt");
+            log_warn!(
+                "MAIN",
+                "SetConsoleCtrlHandler failed — Ctrl+C will be abrupt"
+            );
         }
     }
 
@@ -115,7 +121,11 @@ fn main() {
         let mut parts = Vec::new();
         for (band, gain) in restored.eq_gains.iter().enumerate() {
             if gain.abs() >= 0.05 {
-                parts.push(format!("{}Hz {:+.1}", crate::broker::EQ_BAND_HZ[band], gain));
+                parts.push(format!(
+                    "{}Hz {:+.1}",
+                    crate::broker::EQ_BAND_HZ[band],
+                    gain
+                ));
             }
         }
         if parts.is_empty() {
@@ -147,7 +157,10 @@ fn main() {
     if let Some(arg) = std::env::args().nth(1) {
         let source = Source::from_raw(&arg);
         log_info!("MAIN", "launch track: {source} (autoplay)");
-        let _ = cmd_tx.send(Command::Load { source, paused: false });
+        let _ = cmd_tx.send(Command::Load {
+            source,
+            paused: false,
+        });
     } else if restored.last_folder.is_some() || restored.last_track.is_some() {
         let _ = cmd_tx.send(Command::RestoreState {
             last_folder: restored.last_folder,
@@ -164,7 +177,13 @@ fn main() {
         shared.set_device_channels(2);
     }
     let audio = audio::spawn(shared.clone(), decoder_rx.clone(), status_tx);
-    let audio_out = AudioOut::managed(device, audio.chunk_rx, audio.drained_tx, shared.clone(), audio.controls.clone());
+    let audio_out = AudioOut::managed(
+        device,
+        audio.chunk_rx,
+        audio.drained_tx,
+        shared.clone(),
+        audio.controls.clone(),
+    );
 
     // The kill switch rides along with every Stop/Load/Shutdown so a stalled
     // yt-dlp pipe read can never defer a command or hang shutdown.
@@ -176,12 +195,18 @@ fn main() {
     // Coalesce snapshots outside the UI. The writer parks when nothing changes
     // and its guard drains the latest snapshot before releasing the instance lock.
     let persistence = config::SaveWriter::start(config::path()).ok();
-    let saver = if let Some(writer) = &persistence { writer.saver() } else {
+    let saver = if let Some(writer) = &persistence {
+        writer.saver()
+    } else {
         log_warn!("CFG", "cannot start state writer; saving synchronously");
         Arc::new(|state| config::store(&state))
     };
-    let mut broker = Broker::new(shared, link).with_saver(saver).with_playlist_fetching();
-    if let Some(writer) = &persistence { broker = broker.with_flush(writer.flusher()); }
+    let mut broker = Broker::new(shared, link)
+        .with_saver(saver)
+        .with_playlist_fetching();
+    if let Some(writer) = &persistence {
+        broker = broker.with_flush(writer.flusher());
+    }
     log_info!("MAIN", "broker online — entering sleep-on-idle event loop");
     ui::run(broker, cmd_rx, status_rx, audio_out);
 
@@ -196,7 +221,9 @@ fn main() {
     drop(persistence);
     log_info!("MAIN", "shutdown complete — echo faded");
     #[cfg(all(windows, feature = "release-diagnostics"))]
-    if let Some(diagnostic) = diagnostic { let _ = diagnostic.join(); }
+    if let Some(diagnostic) = diagnostic {
+        let _ = diagnostic.join();
+    }
 }
 
 /// Console control handler: Ctrl+C, Ctrl+Break and terminal-close are turned
@@ -206,7 +233,10 @@ fn main() {
 unsafe extern "system" fn on_console_ctrl(ctrl: u32) -> windows::core::BOOL {
     use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT};
     if matches!(ctrl, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
-        log_warn!("MAIN", "console control event {ctrl} — requesting graceful quit");
+        log_warn!(
+            "MAIN",
+            "console control event {ctrl} — requesting graceful quit"
+        );
         crate::ui::request_quit();
         true.into()
     } else {

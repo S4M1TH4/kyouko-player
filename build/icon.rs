@@ -86,7 +86,13 @@ mod tests {
             let color_end = 40 + size * size * 4;
             let pixels = &frame[40..color_end];
             assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[3] == 255));
-            assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[3] > 0 && p[3] < 255));
+            assert!(
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|p| p[3] > 0 && p[3] < 255)
+            );
             for (pixel_index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
                 assert_eq!(&pixel[..3], &[RGB[2], RGB[1], RGB[0]]);
                 let y = pixel_index / size;

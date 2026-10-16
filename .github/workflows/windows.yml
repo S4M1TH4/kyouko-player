@@ -25,9 +25,11 @@ jobs:
           persist-credentials: false
       - name: Install tested Rust toolchain
         run: |
-          rustup toolchain install 1.99.0 --profile minimal --component clippy
+          rustup toolchain install 1.99.0 --profile minimal --component clippy --component rustfmt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default 1.99.0
+      - name: Formatting
+        run: cargo fmt --package kyouko-player -- --check
       - name: Check
         run: cargo check --locked
       - name: Clippy

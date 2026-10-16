@@ -170,7 +170,13 @@ impl PlaylistJob {
                 let status = child.wait();
                 #[cfg(feature = "release-diagnostics")]
                 if let Some(prefix) = std::env::var_os("KYOUKO_APP_METADATA") {
-                    let _ = std::fs::write(format!("{}-{request_id}.tsv", std::path::Path::new(&prefix).display()), &bytes);
+                    let _ = std::fs::write(
+                        format!(
+                            "{}-{request_id}.tsv",
+                            std::path::Path::new(&prefix).display()
+                        ),
+                        &bytes,
+                    );
                 }
                 *done.0.lock().unwrap_or_else(|error| error.into_inner()) = true;
                 done.1.notify_all();
@@ -185,7 +191,10 @@ impl PlaylistJob {
                     return;
                 }
                 let titles = if timed_out.load(Ordering::Acquire) {
-                    Err(format!("playlist metadata deadline exceeded ({} seconds)", deadline.as_secs_f64()))
+                    Err(format!(
+                        "playlist metadata deadline exceeded ({} seconds)",
+                        deadline.as_secs_f64()
+                    ))
                 } else if bytes.len() as u64 > MAX_METADATA_BYTES {
                     Err("playlist metadata exceeds the 8 MiB limit".into())
                 } else {
@@ -303,7 +312,9 @@ mod tests {
         for (index, title) in titles.iter().enumerate() {
             let expected = if (4780..=4960).contains(&(index + 1)) {
                 "Unavailable track".to_string()
-            } else { format!("Track {}", index + 1) };
+            } else {
+                format!("Track {}", index + 1)
+            };
             assert_eq!(title, &expected);
         }
     }
@@ -313,17 +324,30 @@ mod tests {
     fn supplied_playlist_metadata_uses_production_deadline() {
         let raw = std::env::var("KYOUKO_PLAYLIST_TEST_URL").expect("KYOUKO_PLAYLIST_TEST_URL");
         let source = crate::broker::Source::from_raw(&raw);
-        assert!(matches!(source, crate::broker::Source::Youtube { playlist_index: Some(1), .. }));
+        assert!(matches!(
+            source,
+            crate::broker::Source::Youtube {
+                playlist_index: Some(1),
+                ..
+            }
+        ));
         let (notify, events) = bounded(1);
         let started = std::time::Instant::now();
         let job = PlaylistJob::start(source.raw().to_string(), 1, notify).unwrap();
-        events.recv_timeout(METADATA_DEADLINE + Duration::from_secs(10)).unwrap();
+        events
+            .recv_timeout(METADATA_DEADLINE + Duration::from_secs(10))
+            .unwrap();
         let result = job.take_result().unwrap();
         let titles = result.titles.unwrap();
         assert_eq!(result.url, source.raw());
         assert!(!titles.is_empty());
-        println!("playlist metadata: {} entries in {:.3}s, deadline {}s, url {}",
-            titles.len(), started.elapsed().as_secs_f64(), METADATA_DEADLINE.as_secs(), source.raw());
+        println!(
+            "playlist metadata: {} entries in {:.3}s, deadline {}s, url {}",
+            titles.len(),
+            started.elapsed().as_secs_f64(),
+            METADATA_DEADLINE.as_secs(),
+            source.raw()
+        );
     }
 
     #[test]

@@ -17,26 +17,43 @@ impl SourceChild {
             use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::JobObjects::*;
-            let group = unsafe { (|| -> windows::core::Result<OwnedHandle> {
-                let handle = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
-                let group = OwnedHandle::from_raw_handle(handle.0);
-                let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                SetInformationJobObject(handle, JobObjectExtendedLimitInformation,
-                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(), std::mem::size_of_val(&limits) as u32)?;
-                if let Err(error) = AssignProcessToJobObject(handle, HANDLE(child.as_raw_handle())) {
-                    // A short-lived fixture/tool may exit before assignment.
-                    if child.try_wait().ok().flatten().is_none() { return Err(error); }
-                }
-                Ok(group)
-            })() };
+            let group = unsafe {
+                (|| -> windows::core::Result<OwnedHandle> {
+                    let handle = CreateJobObjectW(None, windows::core::PCWSTR::null())?;
+                    let group = OwnedHandle::from_raw_handle(handle.0);
+                    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                    SetInformationJobObject(
+                        handle,
+                        JobObjectExtendedLimitInformation,
+                        (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                        std::mem::size_of_val(&limits) as u32,
+                    )?;
+                    if let Err(error) =
+                        AssignProcessToJobObject(handle, HANDLE(child.as_raw_handle()))
+                    {
+                        // A short-lived fixture/tool may exit before assignment.
+                        if child.try_wait().ok().flatten().is_none() {
+                            return Err(error);
+                        }
+                    }
+                    Ok(group)
+                })()
+            };
             match group {
                 Ok(group) => Ok(Self { child, group }),
-                Err(error) => { let _ = child.kill(); let _ = child.wait(); Err(std::io::Error::other(error)) }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Err(std::io::Error::other(error))
+                }
             }
         }
         #[cfg(not(windows))]
-        { let _ = &mut child; Ok(Self { child }) }
+        {
+            let _ = &mut child;
+            Ok(Self { child })
+        }
     }
 
     pub fn kill(&mut self) -> std::io::Result<()> {
@@ -44,7 +61,9 @@ impl SourceChild {
         unsafe {
             use std::os::windows::io::AsRawHandle;
             let _ = windows::Win32::System::JobObjects::TerminateJobObject(
-                windows::Win32::Foundation::HANDLE(self.group.as_raw_handle()), 1);
+                windows::Win32::Foundation::HANDLE(self.group.as_raw_handle()),
+                1,
+            );
         }
         self.child.kill()
     }
@@ -52,14 +71,21 @@ impl SourceChild {
 
 impl std::ops::Deref for SourceChild {
     type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target { &self.child }
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
 }
 impl std::ops::DerefMut for SourceChild {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.child }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
 }
 
 impl Drop for SourceChild {
-    fn drop(&mut self) { let _ = self.kill(); let _ = self.child.wait(); }
+    fn drop(&mut self) {
+        let _ = self.kill();
+        let _ = self.child.wait();
+    }
 }
 
 pub fn command(program: &str) -> Command {
@@ -85,17 +111,30 @@ mod tests {
         use std::io::{BufRead, BufReader};
         for line in BufReader::new(stdout).lines() {
             if let Some((_, pid)) = line?.split_once(HELPER_READY) {
-                return pid.trim().parse().map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+                return pid
+                    .trim()
+                    .parse()
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
             }
         }
-        Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "fixture exited before helper readiness"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "fixture exited before helper readiness",
+        ))
     }
 
     fn fixture_command(role: &str) -> Command {
         use std::os::windows::process::CommandExt;
         let mut fixture = Command::new(std::env::current_exe().unwrap());
-        fixture.args(["--exact", "process::tests::source_tree_fixture", "--ignored", "--nocapture"])
-            .env("KYOUKO_PROCESS_FIXTURE_ROLE", role).creation_flags(0x0800_0000)
+        fixture
+            .args([
+                "--exact",
+                "process::tests::source_tree_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("KYOUKO_PROCESS_FIXTURE_ROLE", role)
+            .creation_flags(0x0800_0000)
             .stdin(Stdio::null());
         fixture
     }
@@ -104,7 +143,9 @@ mod tests {
     #[ignore = "native process-only fixture launched by the source-tree test"]
     fn source_tree_fixture() {
         use std::io::{Read, Write};
-        let Ok(role) = std::env::var("KYOUKO_PROCESS_FIXTURE_ROLE") else { return; };
+        let Ok(role) = std::env::var("KYOUKO_PROCESS_FIXTURE_ROLE") else {
+            return;
+        };
         let pid = match role.as_str() {
             "parent" => {
                 // The test sends this permit only after assigning us to its
@@ -112,8 +153,11 @@ mod tests {
                 let mut permit = [0];
                 std::io::stdin().read_exact(&mut permit).unwrap();
                 assert_eq!(permit, [b'G']);
-                let mut helper = fixture_command("helper").stdout(Stdio::piped())
-                    .stderr(Stdio::null()).spawn().unwrap();
+                let mut helper = fixture_command("helper")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap();
                 // Use a separate pipe so killing this parent always releases
                 // the test's stdout reader, even if helper cleanup regresses.
                 let pid = helper_pid(helper.stdout.take().unwrap()).unwrap();
@@ -128,7 +172,9 @@ mod tests {
         };
         println!("{HELPER_READY}{pid}");
         std::io::stdout().flush().unwrap();
-        loop { std::thread::park(); }
+        loop {
+            std::thread::park();
+        }
     }
 
     #[test]
@@ -136,10 +182,20 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject};
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+            WaitForSingleObject,
+        };
         // Process-only fixture: no keyboard, mouse or desktop input is injected.
-        let mut child = SourceChild::track(fixture_command("parent").stdin(Stdio::piped())
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap()).unwrap();
+        let mut child = SourceChild::track(
+            fixture_command("parent")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        )
+        .unwrap();
         child.stdin.take().unwrap().write_all(b"G").unwrap();
         let stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
@@ -155,14 +211,18 @@ mod tests {
         let result = rx.recv_timeout(std::time::Duration::from_secs(30));
         // Retain a helper handle before killing the tree so PID reuse cannot
         // confuse verification. Always clean up before an assertion can panic.
-        let helper = result.as_ref().ok().and_then(|result| result.as_ref().ok())
+        let helper = result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.as_ref().ok())
             .and_then(|pid| unsafe {
-                OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, *pid).ok()
+                OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, *pid)
+                    .ok()
                     .map(|handle| OwnedHandle::from_raw_handle(handle.0))
             });
-        let helper_before_cleanup = helper.as_ref().map(|helper| unsafe {
-            WaitForSingleObject(HANDLE(helper.as_raw_handle()), 0)
-        });
+        let helper_before_cleanup = helper
+            .as_ref()
+            .map(|helper| unsafe { WaitForSingleObject(HANDLE(helper.as_raw_handle()), 0) });
         let _ = child.kill();
         let waited = child.wait();
         let read_joined = reader.join();
@@ -180,10 +240,21 @@ mod tests {
         });
         waited.unwrap();
         read_joined.unwrap();
-        assert!(matches!(result, Ok(Ok(_))), "helper fixture must signal readiness: {result:?}; stderr: {stderr}");
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "helper fixture must signal readiness: {result:?}; stderr: {stderr}"
+        );
         let helper = helper.expect("helper must be running before cleanup");
-        assert_eq!(helper_before_cleanup, Some(WAIT_TIMEOUT), "helper must still be alive before job cleanup");
-        assert_eq!(helper_status, Some(WAIT_OBJECT_0), "the inherited helper must terminate with its job");
+        assert_eq!(
+            helper_before_cleanup,
+            Some(WAIT_TIMEOUT),
+            "helper must still be alive before job cleanup"
+        );
+        assert_eq!(
+            helper_status,
+            Some(WAIT_OBJECT_0),
+            "the inherited helper must terminate with its job"
+        );
         drop(helper);
     }
 
@@ -191,7 +262,8 @@ mod tests {
     fn source_process_has_eof_stdin_and_working_output_pipes() {
         let output = command("cmd.exe")
             .args(["/D", "/C", "set /p input= & echo pipe-ready"])
-            .output().unwrap();
+            .output()
+            .unwrap();
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("pipe-ready"));
     }

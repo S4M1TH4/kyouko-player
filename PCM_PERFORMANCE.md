@@ -1,3 +1,600 @@
+# Diagnostic memory-retention controls — 2026-10-16
+
+The preceding 31-minute BT run showed private-commit first/last-window means of
+3.46 → 3.67 MiB. Its diagnostic controller retained every full observation as a
+heap-allocated JSON value until exit. This follow-up tests that measurement
+effect before attributing the drift to ordinary playback.
+
+## Matched paused controls
+
+Three adjacent matched pairs, **six fresh processes**, alternate retained/streamed
+order. Both modes use the **same release binary**, identical isolated state and
+480-second low-level 440 Hz FLAC (48 kHz stereo), saved EQ gains/volume, EQ enabled
+and repeat off. Each process stays Paused, warms for eight seconds and takes
+60 observations separated by the controller's existing two-second settle.
+Observation duration is zero: these are memory sampling points, **not CPU windows**.
+No CPU saving or idle-CPU claim is derived from them. The predeclared comparison
+is last-ten minus first-ten mean private commit, then retained minus streamed
+growth within each pair. Three pairs support a descriptive local comparison;
+no population confidence interval or universal leak claim is made.
+
+Native output is unchanged BT SPEAKER at 48 kHz/stereo/F32, endpoint
+`{0.0.0.00000000}.{16409415-e7e2-4e08-9290-b04bc91d5f2e}`.
+Every paused sample kept the same generation, primed PCM watermark and rendered
+frame counter, with zero underruns/recorder overflow and the same 608 KiB PCM pool.
+All processes used normal process priority and verified MMCSS output priority 13.
+Builds, tests and fixture generation finished before observation runs began.
+
+| Pair | Storage mode | Private commit first → last means (MiB) | Growth (KiB) | Working-set growth (KiB) |
+|---|---|---:|---:|---:|
+| 1 | retained | 3.585 → 4.061 | +487.6 | +538.4 |
+| 1 | streamed | 3.596 → 3.500 | -98.4 | -91.6 |
+| 2 | retained | 3.625 → 4.125 | +512.4 | +566.4 |
+| 2 | streamed | 3.584 → 3.492 | -94.4 | -32.0 |
+| 3 | retained | 3.727 → 4.210 | +494.8 | +550.4 |
+| 3 | streamed | 3.580 → 3.484 | -98.0 | -36.8 |
+
+Mean private-commit growth: retained
+**+498.3 KiB**, streamed
+**-96.9 KiB**.
+Paired retained-minus-streamed growth contrasts were
++586.0, +606.8, +592.8 KiB;
+their mean was **+595.2 KiB**.
+
+All three paired private-commit contrasts are positive. With playback paused
+and no PCM delivered, retaining diagnostic observations produced more memory
+growth than streaming them from the same binary under the same inspection plan.
+This implicates the controller's retained JSON values in the measured drift.
+It does **not** establish that every byte of the earlier 31-minute playback drift
+had this cause, or exclude slower production, decoder, GDI, driver or device-related
+growth. The new mode removes this specific accumulation of observation rows;
+startup/command rows and the finite input plan still remain in memory.
+
+Sampling is accelerated relative to the earlier one-observation-per-minute run.
+Row count, elapsed time, allocator behavior and Windows residency all matter;
+these results must not be extrapolated into an hourly leak rate. GetProcessMemoryInfo
+private commit describes process allocation commitment; working set describes
+resident pages. Neither is an exact sum of JSON object payload bytes.
+
+## Streamed playback validation
+
+One fresh process played continuously across **six 60-second observations**, with
+the existing two-second settles between them and eight seconds of initial warm-up.
+All six rows were flushed to JSONL, while the main result retained startup/command
+rows and the streamed path/count. Endpoint/generation/pool stayed fixed, PCM
+delivery was approximately 1× and PCM underruns/recorder overflow were zero.
+No source repeat or output replacement was observed. This checks the export
+protocol under real playback; it is not a multi-hour endurance test.
+
+Private commit at the six observation ends ranged
+**3.410–3.566 MiB**,
+with first-to-last change **+28.0 KiB**.
+Working set ranged
+**15.004–15.238 MiB**,
+with first-to-last change **+220.0 KiB**.
+These remain instrumented-process boundary measurements, not a proof of flat
+production memory or glitch-free audible output.
+
+## Diagnostic change, checks and retained evidence
+
+`KYOUKO_APP_OBSERVATIONS` optionally names a new JSONL destination. A bounded
+buffered writer on the finite controller serializes and flushes each observation
+after its measured boundary, then releases that row. No callback/decoder I/O,
+production polling or normal playback-policy change is introduced. Without the
+variable, observations remain in the result JSON as before. Creation uses
+create-new semantics; a failure requests production Quit and reports a diagnostic
+error. Unit coverage checks independent JSON lines, embedded newlines/non-ASCII
+titles and write/flush errors. An actual existing-file launch confirmed graceful
+failure without overwriting evidence.
+
+Required checks passed: normal check/clippy/test/release build (191 tests),
+diagnostic clippy/test/release build (196 tests), ten environment-dependent tests
+ignored in each configuration. The final default release executable was rebuilt
+without diagnostics before measurements. No speculative production memory fix
+was made. The source/binary hashes, finite design, schedule, generated-source
+recipe/hash, plans, launch/priority logs, raw JSON/JSONL, initial/final isolated
+state, validated values and offline analysis are under ignored
+`target/bt-memory-20261016/`. Local Python helpers reuse the retained isolated
+runner from `target/device-bt-20261016/measure.py`; no Python is versioned.
+
+Real state, current saved Ogg selection and source music were preserved. Generated
+fixture and task-owned isolated state/processes were cleaned up after verification;
+raw evidence and the diagnostic binary remain local. No commit or push was made.
+Other machines, multi-hour playback, physical audible-output
+latency/device glitches and compositor/input timing remain unverified. A longer
+memory study should use streamed observations to avoid this retention confound.
+
+
+---
+
+# Longer EQ-bypass CPU comparison — 2026-10-16
+
+This study follows the earlier BT SPEAKER bypass-control increase of +0.182
+percentage points of one logical core. It reuses the **exact original two release
+binaries**, rather than comparing one old binary against the newer callback-timing
+diagnostic build. Baseline/candidate hashes are checked for every launch and match
+target/cpu-eval/variant-hashes.json. The EQ is disabled in both variants, so the
+changed EQ loop is bypassed. The source of any whole-binary CPU difference cannot
+be inferred merely from the source location of that loop.
+
+## Predeclared procedure
+
+Eight adjacent matched pairs, **16 fresh processes**, each with ten seconds of
+warm-up and a **120-second CPU window**. Build order alternates AB/BA by pair.
+The earlier windows lasted twenty seconds. Longer windows reduce the percentage
+effect of coarse process-time accounting; they do not eliminate background or
+CPU-frequency variation. Every run uses the actual visible overlay, UI pump,
+decoder, output, logger and state writer. Callback timestamps and decoder-stage
+profiling are disabled, and the finite controller sleeps throughout each window.
+No compilation, fixture generation, tests or statistical analysis overlapped
+these observations. Native output is frozen to **BT SPEAKER, 48 kHz stereo F32**,
+endpoint `{0.0.0.00000000}.{16409415-e7e2-4e08-9290-b04bc91d5f2e}`.
+
+The source is a generated low-level 440 Hz, PCM16/48 kHz stereo WAV. Its recipe
+matches the preceding bypass fixture except duration is extended from 80 to 180
+seconds, so each process can finish its warm-up/window before EOF without loops.
+Both variants use the identical file bytes and isolated initial-state bytes.
+Volume 100% and saved band gains are frozen; only isolated state disables EQ.
+Repeat is off. The user's current saved track is a different local Ogg selection;
+that selection and all real state were preserved, rather than restored to an
+older assessment's saved MP3. No generated fixtures enter the user's library.
+
+CPU uses GetProcessTimes kernel+user time divided by QPC wall time. **100% means
+one logical core**; divide by 16 for this computer's total capacity. Process CPU
+excludes Windows audio-engine/Bluetooth-service/driver work outside the player.
+All tools/player runs are unelevated and process priority is NORMAL=32. Native
+MMCSS registration and output-worker priority 13 are verified from startup logs.
+No power plan, affinity, format, driver, registry, scheduling or keepalive changed.
+The ten-second warm-up precedes each window and includes output wake-up; this is
+steady playback CPU, not resume latency or acoustic latency.
+
+The primary contrast is candidate minus baseline CPU percentage points, paired
+by adjacent process launches. Positive means more CPU. The practical positive
+bound **+0.10 points** was recorded before the first playback observation.
+Material reproduction requires mean ≥0.10, paired-bootstrap lower endpoint >0,
+and exact two-sided sign-flip p<0.05. An interval wholly below +0.10 is reported as
+below that declared bound, without asserting exact equality. Otherwise the result
+is inconclusive at that bound. This local bound is not a universal definition of
+an acceptable regression.
+
+## Results
+
+| Matched pair | Order | Baseline CPU % | Candidate CPU % | Candidate − baseline, percentage points |
+| --- | --- | ---: | ---: | ---: |
+| 1 | AB | 0.7943 | 0.7682 | -0.0260 |
+| 2 | BA | 0.6380 | 0.6901 | +0.0521 |
+| 3 | AB | 0.6250 | 0.7682 | +0.1432 |
+| 4 | BA | 0.5859 | 0.6380 | +0.0521 |
+| 5 | AB | 0.6901 | 0.6250 | -0.0651 |
+| 6 | BA | 0.6510 | 0.7031 | +0.0521 |
+| 7 | AB | 0.5859 | 0.6901 | +0.1042 |
+| 8 | BA | 0.6120 | 0.6120 | +0.0000 |
+
+- Baseline mean CPU: **0.6478%** of one core,
+  range **0.5859–0.7943%**.
+- Candidate mean CPU: **0.6868%** of one core,
+  range **0.6120–0.7682%**.
+- Mean paired absolute change: **+0.0391 percentage points**.
+- Descriptive paired-bootstrap 95% interval:
+  **-0.0049 to +0.0830 points**.
+- Exact paired sign-flip, two-sided p: **0.1484375**
+  (256 sign assignments; no multiple workload contrasts).
+
+Bootstrap resamples all eight whole pairs, 20000 resamples, fixed seed 20261015.
+The small sample and uncontrolled system activity limit uncertainty estimates.
+The contrast uses absolute points because relative changes can exaggerate small,
+coarsely measured control CPU readings.
+
+**Interpretation:** The earlier +0.182-percentage-point increase was not reproduced at the predeclared +0.10-point practical bound in this longer-window study. The descriptive interval's upper endpoint is below that bound. This does not prove exact CPU equality or the absence of a smaller effect.
+
+The table includes every predefined valid observation, with no selected reruns
+or omitted unfavorable pairs. This is a new local paired experiment, not a direct
+controlled test proving why the earlier short-window samples were higher. Changed
+window duration, elapsed position, longer source and different test time are
+documented; the older raw measurements and conclusions remain below. No compiler,
+binary-code layout, counter-accounting, frequency or background-load cause is
+established from CPU totals alone.
+
+## Delivery and memory verification
+
+Every window retained the same native endpoint/format, Playing phase and seek
+generation, approximately 1× PCM delivery, NORMAL process priority and **zero PCM
+underrun frames**. There was no output replacement or logged playback error.
+PCM sample storage stayed at **622592 bytes / 608 KiB**, separate from process RAM.
+The 1.5-second capacity, 500 ms priming and 60 MiB compressed-cache cap are unchanged.
+
+| Variant | Boundary working set MiB | Boundary private commit MiB | Peak working set / process commit through observation MiB |
+| --- | ---: | ---: | ---: |
+| baseline | 14.75–14.87 | 3.29–3.45 | 14.88 / 3.49 |
+| candidate | 14.77–14.89 | 3.31–3.48 | 14.90 / 3.52 |
+
+These are process-memory boundaries/lifetime peaks through the observation, not
+PCM-only counters or process-exit peaks. No memory-saving or leak-free claim is
+made. Zero PCM underruns does not establish glitch-free Bluetooth/device output.
+
+## Verification, reproduction and limits
+
+Two offline calculation tests passed: 120-second CPU scaling/delivery with
+underrun rejection, and the predeclared decision-boundary cases. Existing paired
+analysis is reused from target/cpu-eval/runner.py, whose calculation tests remain
+documented in the earlier report. The application code and retained binaries were
+not modified for this comparison; the preceding normal/diagnostic Rust check
+results remain documented below. No speculative code fix was made.
+
+Raw design, schedule, frozen settings, fixture recipe/hash, copied binary hashes,
+plans/results, application logs, validated measurements, initial/final isolated
+state, launch records and analysis are retained under
+`C:\Users\rei\Documents\repo\kyouko-player\target\bt-bypass-20261016\`.
+Local-only measure.py reuses the finite isolated helper from
+target/device-bt-20261016/measure.py and the exact binaries in target/cpu-eval/;
+report.py reuses its paired-analysis helper. Those retained dependencies are
+required for reproduction. Use a fresh output directory and revalidate the active
+default endpoint, settings and hashes. Python tools and raw artifacts are ignored.
+
+The real state and source selection were preserved; isolated state, generated
+fixture and task-owned processes were cleaned up. No commit, push or packaging
+was performed. This covers one host, native device format and bypass workload.
+Other sources/settings/hardware, system-wide CPU, physical output
+latency, device glitches and multi-hour memory behavior remain unverified.
+
+
+---
+
+# BT SPEAKER resume-delay investigation — 2026-10-16
+
+This follow-up separates command handling, first application render-callback
+entry and first copied PCM. It tests the user's observation that longer pauses
+can be followed by Bluetooth wake-up lag, without treating that observation as
+an application defect or assuming it identifies the cause of an individual delay.
+
+## Reproduction
+
+Six fresh processes used the same saved local 113.894-second MP3 and frozen EQ,
+volume and repeat settings as the preceding study. Before each launch, the
+task-owned player/output was closed for sixty seconds. Other applications'
+audio and actual radio/device sleep state were uncontrolled; that gap does not
+prove the entire endpoint or Bluetooth hardware was idle. Three processes
+resumed as soon as restored Paused was observed; three held Paused for one extra
+second first. Every process then resumed after nominal 1/15/60/120-second pauses,
+with pause order rotated by round and two-second Playing settles between pauses.
+This gives **30 resumes: six initial resumes and 24 resumes of an existing stream**.
+The source remained well before EOF; no load/seek or generation change occurred
+between each pre-resume snapshot and its matching delivery.
+
+All launches verified the native BT SPEAKER endpoint
+`{0.0.0.00000000}.{16409415-e7e2-4e08-9290-b04bc91d5f2e}` at **48 kHz stereo F32**.
+The real state file was hashed before/after each process and remained unchanged.
+The finite controller used production commands and isolated state; no mouse or
+keyboard was injected. Player/tools ran unelevated at normal process priority,
+with successful native MMCSS registration and output priority 13 in every log.
+No power plan, device format, scheduling policy, affinity, driver, registry,
+hotkey, PCM/cache capacity or downloader/recovery behavior changed. No keepalive,
+silent playback, permanent sampler, polling loop or idle timer was added.
+
+## Diagnostic boundaries
+
+The opt-in release-diagnostics feature now has an independent fixed 2048-slot
+first-callback recorder alongside the existing 2048-slot first-PCM recorder.
+Each arena records at most one QPC timestamp per armed command/generation;
+slots are never reused, wrong generations and later events read no clock, and
+overflow is counted. The callback marker observes generation at render entry;
+these resume samples require unchanged generation across the request. A separate
+owner-thread snapshot reads the generation's existing priming watermark before
+resume. It is a latched readiness flag, not an exact queue-depth measurement.
+
+Each result distinguishes request → broker handled, request → first UI sync/draw,
+request → first callback entry, callback entry → first copied PCM, and total
+request → copied PCM. The output-worker's native IAudioClient::Start completion
+is **not** separately timestamped: CPAL play queues a command for its WASAPI
+worker. Broker-handled therefore does not mean native Start has completed.
+UI draw completion is not compositor presentation. First application PCM is
+neither Bluetooth transport latency nor physical audible-output latency.
+
+The render callback reads at most two independent boundary clocks per armed command,
+outside normal builds, with no callback allocation, I/O, lock, blocking channel,
+sorting or unbounded recording. When timing capture is disabled it reads no
+boundary clocks. This instrumented build is for latency diagnosis, not new CPU
+comparison evidence. Source snapshots and binary hashes are retained.
+The final source differs from the measured snapshot only by a corrected module
+documentation comment describing the two recorders; the audit records that edit.
+
+## Results
+
+Cells are **median / nearest-rank p95 (min–max), milliseconds**. With n=3 or n=6,
+p95 is the sample maximum and is not a well-resolved population tail estimate.
+
+| Condition | n | Primed before resume | Broker handled | First callback | Callback → PCM | Total to PCM | PCM ≥1 s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fresh, immediate | 3 | 3/3 | 0.051 / 0.060 (0.042–0.060) | 980.087 / 1833.658 (573.527–1833.658) | 0.002 / 0.004 (0.002–0.004) | 980.089 / 1833.662 (573.529–1833.662) | 1 |
+| Fresh, 1 s held paused | 3 | 3/3 | 0.078 / 0.208 (0.069–0.208) | 1508.711 / 1807.278 (794.489–1807.278) | 0.002 / 0.002 (0.002–0.002) | 1508.713 / 1807.280 (794.491–1807.280) | 2 |
+| Pause 1 s | 6 | 6/6 | 0.077 / 0.109 (0.050–0.109) | 290.083 / 308.978 (270.968–308.978) | 0.001 / 0.003 (0.001–0.003) | 290.086 / 308.980 (270.969–308.980) | 0 |
+| Pause 15 s | 6 | 6/6 | 0.104 / 0.341 (0.047–0.341) | 1059.314 / 1226.658 (795.606–1226.658) | 0.001 / 0.003 (0.001–0.003) | 1059.316 / 1226.660 (795.607–1226.660) | 3 |
+| Pause 60 s | 6 | 6/6 | 0.058 / 0.582 (0.041–0.582) | 940.915 / 1496.450 (744.068–1496.450) | 0.001 / 0.003 (0.001–0.003) | 940.916 / 1496.450 (744.071–1496.450) | 2 |
+| Pause 120 s | 6 | 6/6 | 0.065 / 0.083 (0.044–0.083) | 982.806 / 1472.299 (778.251–1472.299) | 0.002 / 0.003 (0.001–0.003) | 982.807 / 1472.301 (778.252–1472.301) | 2 |
+
+| Nominal pause | Actual broker-pause → resume-request range, seconds |
+| --- | ---: |
+| 1 s | 1.001–1.005 |
+| 15 s | 15.002–15.011 |
+| 60 s | 60.002–60.033 |
+| 120 s | 120.002–120.042 |
+
+Priming was already marked ready before every resume: **True**.
+Maximum broker-handled and first UI sync/draw latencies were
+**0.582 ms** and **46.722 ms**.
+The maximum callback-entry → first copied PCM interval was
+**0.004 ms**. Raw per-round pairs remain in analysis.json.
+
+All six processes retained the same native output key, PCM storage of 608 KiB,
+and matching generation across each resume. There were **zero PCM underruns,
+zero first-delivery recorder overflow and zero first-callback recorder overflow**,
+with no unplanned output replacement or logged playback error.
+
+## Interpretation and limits
+
+The table localizes the observed request-to-PCM delay. For resumes with a ready
+priming watermark and a negligible callback-to-PCM interval, most elapsed time
+precedes invocation of the application's rendering callback. That does not point
+to EQ/decoding, the 500 ms priming policy or UI command handling as the dominant
+delay in those samples. It is consistent with output/backend/device resumption;
+this study does not separate CPAL command scheduling, native Start, Windows audio
+engine, driver, Bluetooth transport or hardware wake-up time.
+
+No product fix is justified merely by a long request-to-PCM reading, and no fix
+or universal latency improvement is claimed here. Existing paused behavior still
+stops WASAPI and permits workers to park. Keeping Bluetooth awake with silence
+would change that behavior and was not used. Audible lag may extend beyond the
+first application PCM; it was not measured or ruled out. These are six local
+processes on one endpoint/machine, not an estimate for all Bluetooth hardware.
+Physical sound capture, radio/power-state tracing and native Start timing remain
+unverified. External playback and system scheduling were not controlled.
+
+## Verification and retained evidence
+
+Normal checks passed: cargo check, Clippy with warnings denied, 191 tests (10
+ignored), and the normal release build. Diagnostic Clippy, 195 tests (10 ignored)
+and the instrumented release build passed. A focused regression verifies that
+first callback and first PCM are independent, while the existing generation,
+one-shot, stale-entry and bounded-overflow regression remains in place. Two
+offline calculation tests verify stage separation and reject stale/reversed
+timestamps. No compilation overlapped playback observations.
+
+```text
+cargo check --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked --release
+cargo clippy --locked --all-targets --features release-diagnostics -- -D warnings
+cargo test --locked --features release-diagnostics
+cargo build --locked --release --features release-diagnostics
+python -m unittest discover -s target/bt-resume-20261016 -p resume.py
+```
+
+Local-only tools and evidence are retained under
+`C:\Users\rei\Documents\repo\kyouko-player\target\bt-resume-20261016\`:
+design/manifest, exact source snapshots, binary hashes and diagnostic executable,
+build/test logs, runs/round-*/ plans/results/initial-final state/application logs,
+prelaunch-gap QPC boundaries, validated samples, analysis.json and report.py.
+resume.py reuses the isolated-run helper in target/device-bt-20261016/measure.py.
+All Python tools remain ignored. The source music was read only; no generated
+media was needed. Task-owned processes and isolated state were cleaned up.
+Existing assessment edits and the untracked audio_cpu_profile.rs were preserved.
+No commit, push or packaging was performed.
+
+
+---
+
+# Second audio device: BT SPEAKER — 2026-10-16
+
+The second-device study uses **Headphones (BT SPEAKER)** on the same computer.
+The player directly reported endpoint
+`{0.0.0.00000000}.{16409415-e7e2-4e08-9290-b04bc91d5f2e}`,
+**48 kHz, stereo, F32**. This is the WASAPI application format, not the Bluetooth
+transport codec. Windows endpoint inventory and every run's output key are
+retained. An initial paused probe still selected Realtek; it was excluded before
+any playback measurement. The user then selected BT SPEAKER as Windows output,
+and two subsequent paused probes confirmed the intended endpoint.
+
+## Procedure and boundaries
+
+The original and optimized EQ release binaries are byte-identical to those in
+the Realtek CPU study below, with the same locked compiler/dependencies/default
+MMCSS policy and common diagnostic hooks. No application source changed for this
+device study. Binary hashes are checked for every launch. The same saved MP3,
+volume 100%, active EQ gains `1,5,4,2,3,3,-2,-3,-4,-5` dB, repeat-off settings
+and fixture recipes were frozen. Generated fixtures were recreated with the same
+FFmpeg: WAV, AAC and FLAC hashes match the previous fixtures; regenerated Ogg
+Vorbis container bytes differ. Both builds use the identical frozen new Vorbis
+file within this study. Its new/previous hashes and encoding recipe are retained.
+
+Six complete rounds cover six EQ-on workloads, plus bypass and paused controls:
+**96 fresh full-application processes and 96 CPU windows**, each with five seconds
+of warm-up and twenty seconds of observation. Case order rotates by round and
+paired build order alternates. Native endpoint/format, source bytes/settings,
+steady phase/generation, priority class, PCM delivery and underruns are checked.
+No replacement stream was accepted. The visible production overlay, UI command
+path, decoder, output, logging and persistence workers ran normally. Stage timing
+and callback timestamps were disabled; the finite controller slept in CPU windows.
+No build, fixture generation or statistical analysis overlapped those windows.
+
+CPU is process kernel+user time divided by QPC wall time. **100% is one logical
+core**; divide by 16 for this host's total CPU capacity. Measurements include
+ordinary background/clock-frequency variation and process-time quantization.
+OS audio-engine and Bluetooth service/driver CPU outside the player is excluded.
+Player and tools ran unelevated, NORMAL_PRIORITY_CLASS=32; output startup logs
+reported successful MMCSS registration and GetThreadPriority=13. No power plan,
+affinity, driver, registry or audio-format setting changed. The real state file
+was read only; every process used its own isolated state and production commands.
+
+## Matched CPU results
+
+Each row summarizes six adjacent matched pairs. Relative savings are calculated
+per pair before averaging; percentage-point changes are candidate minus baseline.
+Ranges retain all observations. Per-case statistics are exploratory.
+
+| Workload | Original CPU % mean (range) | Optimized CPU % mean (range) | Change, percentage points | Mean paired relative saving |
+| --- | ---: | ---: | ---: | ---: |
+| saved_mp3 | 2.0832 (1.7187–2.4218) | 1.3541 (0.9375–1.6405) | -0.7291 | 34.9% |
+| aac48 | 2.2135 (2.1093–2.4999) | 1.2500 (0.7031–2.1093) | -0.9635 | 42.6% |
+| vorbis48 | 2.3302 (1.9505–2.8124) | 0.9244 (0.8593–1.0937) | -1.4058 | 59.6% |
+| flac96_51 | 9.2183 (8.5935–9.6874) | 3.1639 (2.6561–3.7499) | -6.0544 | 65.6% |
+| wav48 | 2.1744 (2.0312–2.2656) | 1.0286 (0.7031–1.4843) | -1.1458 | 52.5% |
+| wav192 | 6.6665 (6.1715–7.1093) | 2.4348 (2.0312–2.8124) | -4.2317 | 63.3% |
+| eq_off | 0.5338 (0.3125–0.7031) | 0.7161 (0.3906–1.0156) | +0.1823 | — (control) |
+| paused | 0.0000 (0.0000–0.0000) | 0.0000 (0.0000–0.0000) | +0.0000 | — (control) |
+
+Process-memory counters across the 96 CPU windows (not PCM-only storage):
+
+| Build | Boundary working set MiB | Boundary private commit MiB | Peak working set / process commit through observation MiB |
+| --- | ---: | ---: | ---: |
+| baseline | 14.71–15.76 | 3.34–4.14 | 15.76 / 4.17 |
+| candidate | 14.71–15.79 | 3.33–4.18 | 15.79 / 4.18 |
+
+The predefined primary contrast equally weights the six EQ-on workloads within
+each complete round, then compares the six round-level reductions. Mean relative
+CPU reduction: **53.07%**; descriptive paired-bootstrap
+95% interval: **50.04–55.45%**;
+exact two-sided paired sign-flip p: **0.03125** (64 assignments).
+All EQ-on workload means improved: **True**.
+The predefined 5%/interval/p/consistency criterion passed: **True**.
+Bootstrap resamples complete rounds, 20000 samples, seed 20261015. Six rounds
+limit uncertainty resolution and do not represent a population of hardware/users.
+Round reductions: 51.62 / 56.46 / 46.28 / 53.34 / 54.66 / 56.05%.
+
+Bypass control mean change: **+0.1823 percentage points**,
+paired-bootstrap interval **+0.0521 to
++0.3125 points**, exploratory sign-flip
+p **0.06250**. No paused/bypass benefit is
+assumed, and small control readings should not be interpreted using relative
+percentages. All raw pairs and the control uncertainty are retained in analysis.json.
+Five of the six bypass pairs increased. The positive bootstrap interval and
+exploratory exact p of 0.0625 leave a possible small bypass cost unresolved;
+this is a focused follow-up item, not evidence that bypass behavior is cost-free.
+
+This comparison estimates the EQ change on BT SPEAKER. Differences from the older
+Realtek tables cannot isolate the cost of Bluetooth: the studies occurred at
+different times, and system load/cache/frequency/thermal state were uncontrolled.
+
+## Continuous playback soak
+
+The optimized build played a generated 32-minute, low-level 440 Hz FLAC source
+(48 kHz stereo) continuously, with the same EQ/volume settings and repeat off.
+Thirty sixty-second windows cover **30.001 measured minutes**;
+two-second inter-window settles plus warm-up make playback run about 31 minutes.
+The longer source avoids EOF/repeat confounds. This is one bounded continuous
+run on this endpoint, not a multi-hour endurance study or a long-run comparison
+against the original build.
+
+- CPU % of one core: mean **1.1267**,
+  range **0.8854–1.5104**.
+- Boundary working set: **15.01–15.56 MiB**;
+  private commit: **3.40–3.74 MiB**.
+- First five / last five window-end working-set means:
+  **15.06 / 15.50 MiB**;
+  private-commit means **3.46 / 3.67 MiB**.
+- Peak working set / process commit through final observation:
+  **15.56 / 3.75 MiB**.
+- All thirty windows retained one native output key and one generation, phase
+  Playing, approximately 1× PCM delivery and **zero PCM underrun frames**.
+
+The first/last-five means increased by about 0.44 MiB working set and 0.21 MiB
+private commit. This bounded observation does not establish flat memory use or
+exclude a slower leak; the cause of that drift was not profiled here.
+
+All 96 CPU windows also passed endpoint/format, phase/generation, PCM storage and
+delivery checks with zero PCM underruns. Paused windows rendered no frames.
+PCM sample storage remained **622592 bytes / 608 KiB**, separate from process RAM.
+The 1.5-second capacity, 500 ms priming and 60 MiB compressed-cache cap are unchanged.
+No physical output capture, listening validation or device-glitch trace was run;
+zero PCM underruns does not establish glitch-free Bluetooth or audible latency.
+
+## Separate startup and command timing
+
+Three further warm processes used the saved MP3, with callback timestamp capture
+enabled only for this separate check. Each performed twelve pause/resume and
+forward/backward seek cycles, then Stop, restart and Quit. All three passes had
+zero PCM underruns and recorder overflow. Next/previous, large lists and network
+command timing were not repeated on this endpoint.
+The first resume in each process is separated from subsequent warm resumes.
+
+Startup begins immediately before process creation. Window-ready is the UI's
+ready marker, usable UI is completion of the first production-thread inspection,
+and restored-ready is observation of the restored Paused phase. These are warm
+launches.
+
+Command latency begins before the finite controller sends the production command.
+Dequeue, completed broker handling, first UI sync/draw, matching decoder status,
+sync after that status and first copied application PCM are distinct boundaries.
+UI draw completion is not compositor presentation; application PCM is not
+physical sound. Quit exit ends when the parent observes process termination.
+Unarmed/stale timestamps before a request are omitted rather than called zero.
+Cells are p50 / nearest-rank p95 (min–max; sample count), in milliseconds.
+
+| Startup boundary | Distribution, ms |
+| --- | ---: |
+| window_ready | 486.951 / 499.459 (131.783–499.459; n=3) |
+| ui_usable | 501.445 / 515.766 (152.299–515.766; n=3) |
+| restored_observed | 502.044 / 516.507 (153.072–516.507; n=3) |
+
+| Command | Dequeue | Broker handled | UI sync/draw | Decoder status | UI after status | First application PCM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| initial_resume | 0.031 / 0.037 (0.027–0.037; n=3) | 0.049 / 0.057 (0.045–0.057; n=3) | 0.464 / 0.526 (0.404–0.526; n=3) | — | — | 46.265 / 1524.820 (32.751–1524.820; n=3) |
+| pause | 0.036 / 0.100 (0.017–11.255; n=36) | 0.058 / 0.184 (0.030–11.279; n=36) | 0.637 / 1.262 (0.359–11.853; n=36) | — | — | — |
+| resume | 0.068 / 0.207 (0.022–0.681; n=36) | 0.085 / 0.234 (0.036–0.693; n=36) | 0.542 / 1.002 (0.330–2.008; n=36) | — | — | 5.643 / 9.315 (0.860–9.405; n=36) |
+| seek_forward | 0.055 / 18.643 (0.019–20.932; n=36) | 0.091 / 18.688 (0.043–20.966; n=36) | 0.119 / 27.881 (0.044–29.646; n=36) | 1.213 / 27.919 (0.222–29.834; n=36) | 1.542 / 30.106 (0.592–30.746; n=36) | 9.787 / 29.211 (3.967–32.261; n=36) |
+| seek_backward | 0.072 / 11.500 (0.019–12.242; n=36) | 0.146 / 11.532 (0.039–12.351; n=36) | 0.148 / 11.533 (0.040–12.353; n=36) | 0.353 / 11.706 (0.161–12.515; n=36) | 0.905 / 12.306 (0.476–12.929; n=36) | 11.002 / 22.524 (5.328–22.607; n=36) |
+| stop | 0.028 / 0.049 (0.020–0.049; n=3) | 0.053 / 0.092 (0.047–0.092; n=3) | 0.616 / 0.662 (0.484–0.662; n=3) | — | — | — |
+| restart | 0.123 / 0.135 (0.033–0.135; n=3) | 0.185 / 0.188 (0.062–0.188; n=3) | 0.655 / 0.686 (0.435–0.686; n=3) | 1.092 / 1.121 (0.971–1.121; n=3) | 1.422 / 1.445 (1.396–1.445; n=3) | 6.303 / 6.876 (5.469–6.876; n=3) |
+| quit | 0.037 / 0.044 (0.021–0.044; n=3) | 3.097 / 4.410 (2.903–4.410; n=3) | — | — | — | — |
+
+Quit → observed process exit: **202.779 / 236.736 (156.602–236.736; n=3) ms**. The startup/Stop/restart/Quit samples have n=3, so their p95 is the maximum, not a well-resolved tail estimate.
+
+
+Initial resume → first application PCM was **1524.820 / 46.265 / 32.751 ms** by process. The single 1.525-second initial-resume outlier is retained separately from the 36 warm resumes (0.860–9.405 ms). Its cause was not established; these observations do not identify Bluetooth transport latency or a reproducible application correctness defect.
+
+
+## Reproduction, verification and remaining limits
+
+Raw plans/results, initial/final isolated state, player logs, validated counters,
+binary hashes, source recipes, native endpoint inventory, frozen settings,
+schedule/design and local-only tools are retained under
+`C:\Users\rei\Documents\repo\kyouko-player\target\device-bt-20261016\`.
+`measure.py` uses the retained binaries from `target/cpu-eval/`; `report.py` uses
+that study's paired-analysis helper and the tested percentile helper from
+`target/release-assessment/`. All Python tools and raw media remain ignored.
+Reproduction requires those local artifacts, Python, FFmpeg and the same active
+default endpoint; use a fresh output directory and revalidate hashes/settings.
+Two offline calculation tests cover native rate/layout parsing, one-core CPU
+scaling, PCM delivery at 16/44.1/48 kHz and endpoint mismatch rejection. Required
+Cargo checks/build/tests were run after the measurements, with 191 tests passed
+and 10 ignored. Three existing offline analysis tests also passed for the reused
+percentile/CPU/evidence helpers. Local logs record the following checks:
+
+```text
+cargo check --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --locked --release
+python -m unittest discover -s target/device-bt-20261016 -p measure.py
+python -m unittest discover -s target/release-assessment -p release_assessment.py
+```
+
+The original bit-identical EQ reference regression and previous check results
+remain documented below. There was no new production-code optimization or fix.
+
+The real state hash was unchanged, task-owned processes and isolated state were
+cleaned up, and generated fixtures were removed after their hashes were checked.
+No commit, push or packaging was performed.
+
+Coverage now includes two audio endpoints on one computer and this bounded
+continuous playback run. Other computers, multi-hour playback,
+physical audible-output latency, Bluetooth transport/device glitches, compositor
+and hardware-input timing, network playback and deferred codecs/platforms remain
+unverified. Do not generalize these local EQ results to all settings or hardware.
+
+
+---
+
 # Measured EQ CPU optimization — 2026-10-16
 
 The EQ decoder path now keeps each band's channel history in local f64 variables
@@ -323,9 +920,8 @@ when the UI pump services its first inspection after initial command drain/sync.
 Restored-ready is the matching Opened status that stages the saved source paused;
 the separately reported observed-ready includes controller delivery. It does not
 promise that the PCM pool has already filled its entire capacity.
-The first final-binary launch is separated from later warm launches; no cache
-flush, cache manipulation or power-setting change was made, so no cold-cache
-claim is justified.
+The first final-binary launch is separated from later warm launches. No
+power-setting change was made.
 
 All distribution cells below are **p50 / p95 / p99 / maximum**, nearest rank.
 For three samples p95/p99 equal maximum; these are descriptive repetitions,
@@ -587,8 +1183,8 @@ These counters cover startup priming rules, playback and command transitions
 within the recorded runs; generation changes are not silently counted as EOF.
 Zero PCM underruns does not prove glitch-free device output. Callback gaps were
 not used as audible-glitch evidence. No physical waveform/listening validation,
-compositor timing, hardware input delivery, output-glitch tracing, alternate hardware, cold-cache study,
-long-duration playback, Linux/Wayland, Opus, ALAC or full HE-AAC reconstruction
+compositor timing, hardware input delivery, output-glitch tracing, alternate
+hardware, long-duration playback, Linux/Wayland, Opus, ALAC or full HE-AAC reconstruction
 was assessed. Child-process CPU/memory is outside the process tables.
 
 No reproducible product correctness defect requiring a fix was found in the

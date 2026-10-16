@@ -519,15 +519,32 @@ The recorder distinguishes command dequeue, completed broker handling, first
 UI sync/draw completion, matching decoder Opened/Seeked/SeekFailed status,
 sync after that status, and first PCM copied into an application output slice.
 Draw completion is an API-side boundary, not compositor presentation. A static
-2048-slot atomic recorder captures at most one QPC timestamp per armed command;
-slots are never reused, so a racing older callback cannot fill a newer slot.
-Wrong generations and later deliveries read no clock; overflow is counted.
+2048-slot atomic recorder captures first PCM delivery, and an independent
+2048-slot recorder captures first callback entry observing the armed generation.
+Each captures at most one QPC timestamp per armed command; slots are never
+reused, so a racing older callback cannot fill a newer slot. Wrong generations
+and later events read no clock; each recorder counts overflow separately.
+Callback entry and copied PCM are separate boundaries: silence during priming
+may produce a callback without PCM. Resume analyses require unchanged generation
+across the request. UI inspection also exposes the existing generation's latched
+priming watermark; this is not an exact queue-depth measurement. These diagnostics
+do not measure native IAudioClient::Start completion or physical audible output.
 No callback allocation, lock, I/O, formatting, retry loop or analysis is added.
 
 Only the finite controller may inspect repeatedly while awaiting a bounded
 milestone. During low-overhead CPU windows, timestamp capture is disabled and
 the controller sleeps; there is no application polling thread or idle timer.
 GetProcessTimes and process-memory counters are read at window boundaries.
+By default, the finite controller retains full observation JSON values until
+exit; their growing storage can contaminate memory-drift measurements. An optional
+`KYOUKO_APP_OBSERVATIONS` path streams only observation rows as JSON Lines,
+using a bounded buffered writer flushed after each row, then drops that row.
+The destination must not already exist. Creation, serialization and flushing
+occur on the controller thread after UI readiness, outside callback and measured
+window boundaries. Errors fail the diagnostic and request normal Quit. Command
+and startup rows remain in `KYOUKO_APP_RESULT`, which also records the observation
+path and successfully streamed count. With the variable unset, observation rows
+remain in the result as before. This option is absent from ordinary builds.
 The generated 5000-entry list uses production parsing and presentation, with
 source output deferred via the existing unavailable-output path. Its selection
 timings are explicitly separate from network/PCM timings. The real metadata
@@ -905,8 +922,9 @@ Failure removes its staging file and preserves the previous configuration.
 Interrupted processes may leave staging files, which restoration never reads.
 Shutdown waits for the final requested revision; worker exit/panic wakes any
 barrier instead of stranding it. The OS file lock excludes writers from other
-player processes without polling or stale PID detection. Rust 1.89+ provides
-the locking API; CI pins the locally tested Rust 1.99 toolchain. `last_track` stores
+player processes without polling or stale PID detection. The locking API was
+introduced in Rust 1.89; this package declares Rust 1.99.0 as its minimum supported
+version, matching the tested CI toolchain. `last_track` stores
 `Source::raw()` so a restored URL re-parses through `from_raw` and
 re-derives the correct per-site format.
 GUI jumps persist immediately, including the selected streaming
@@ -953,9 +971,9 @@ Recovery seeks waiting for fresh bytes unblock on the same terminal error.
 
 ## 3. Data Flow & Command Pipelines
 
-Windows CI (`.github/workflows/windows.yml`) runs check, Clippy with denied
+Windows CI (`.github/workflows/windows.yml`) runs rustfmt verification, check, Clippy with denied
 warnings, offline tests, release compilation, native icon loading, release
-logging and duplicate-release-launch verification on Windows 2025/Rust 1.99.
+logging and duplicate-release-launch verification on Windows 2025/Rust 1.99.0.
 Checkout is pinned to a verified commit with read-only repository permission;
 there are no upload, packaging or publication steps. WAV and AAC/MP4 samples
 are generated in Rust test helpers, without fixture files or external encoders.
@@ -1103,11 +1121,17 @@ WM_MOUSEWHEEL (screen lParam) → client coords → renderer.eq_band_at
 ### Strict compilation gate (mandatory for every change)
 
 ```
+cargo fmt --package kyouko-player -- --check
 cargo check --locked              # zero errors AND zero warnings
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked               # offline regressions; environment diagnostics are opt-in
 cargo build --locked --release    # zero warnings, clean release binary
 ```
+
+`Cargo.toml` declares Rust 1.99.0 as the minimum supported version. CI installs
+that exact toolchain with Clippy and rustfmt. Apply the standard formatter with
+`cargo +1.99.0 fmt --package kyouko-player`; the package selector excludes
+vendored path dependencies. Check formatting before the compilation gates.
 
 Zero warnings is a hard rule, not a goal. Win32 type conversions in
 particular (`LPARAM` halves, `WPARAM` high words, handle null checks) must

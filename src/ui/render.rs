@@ -15,18 +15,18 @@
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
-use windows::core::{w, Error, HRESULT, Result};
-use windows::Win32::Foundation::{GetLastError, COLORREF, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect,
-    GdiFlush, GetDC, GetStockObject,
-    GetTextExtentPoint32W, GetTextMetricsW, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER,
-    BLENDFUNCTION, BI_RGB, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, FF_MODERN,
-    FIXED_PITCH, HBITMAP, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, TEXTMETRICW, TRANSPARENT,
-    WHITE_BRUSH, BACKGROUND_MODE, DEFAULT_PITCH, FF_SWISS, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BACKGROUND_MODE, BI_RGB, BITMAPINFO,
+    BITMAPINFOHEADER, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection,
+    CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS,
+    DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_MODERN, FF_SWISS,
+    FIXED_PITCH, FillRect, GdiFlush, GetDC, GetStockObject, GetTextExtentPoint32W, GetTextMetricsW,
+    HBITMAP, HBRUSH, HDC, HFONT, OUT_TT_PRECIS, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+    TEXTMETRICW, TRANSPARENT, TextOutW, WHITE_BRUSH,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, UpdateLayeredWindow, ULW_ALPHA};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, ULW_ALPHA, UpdateLayeredWindow};
+use windows::core::{Error, HRESULT, Result, w};
 
 use crate::broker::{EQ_BANDS, EQ_MAX_GAIN_DB, Phase, TrackList};
 use crate::{log_debug, log_error, log_warn};
@@ -50,8 +50,12 @@ const FONT_HEIGHT: i32 = -9;
 const QUIT_BUTTON_W: i32 = 8;
 
 fn quit_button_rect(line_h: i32) -> RECT {
-    RECT { left: WINDOW_W - PAD - QUIT_BUTTON_W, top: PAD,
-        right: WINDOW_W - PAD, bottom: PAD + line_h }
+    RECT {
+        left: WINDOW_W - PAD - QUIT_BUTTON_W,
+        top: PAD,
+        right: WINDOW_W - PAD,
+        bottom: PAD + line_h,
+    }
 }
 
 pub fn quit_button_at(x: i32, y: i32, line_h: i32) -> bool {
@@ -60,8 +64,7 @@ pub fn quit_button_at(x: i32, y: i32, line_h: i32) -> bool {
 }
 
 pub fn track_info_at(x: i32, y: i32, line_h: i32) -> bool {
-    line_h > 0 && (0..WINDOW_W).contains(&x)
-        && (PAD + 2 * line_h..PAD + 3 * line_h).contains(&y)
+    line_h > 0 && (0..WINDOW_W).contains(&x) && (PAD + 2 * line_h..PAD + 3 * line_h).contains(&y)
 }
 
 pub const TRACKLIST_WIDTH: i32 = 420;
@@ -87,7 +90,10 @@ pub enum TrackListClick {
 impl TrackListLayout {
     pub fn new(count: usize, work_width: i32, work_height: i32) -> Self {
         let available = ((work_height - TRACKLIST_HEADER_H) / TRACKLIST_ROW_H).max(1) as usize;
-        Self { width: TRACKLIST_WIDTH.min(work_width.max(1)), rows: count.max(1).min(available).min(TRACKLIST_MAX_ROWS) }
+        Self {
+            width: TRACKLIST_WIDTH.min(work_width.max(1)),
+            rows: count.max(1).min(available).min(TRACKLIST_MAX_ROWS),
+        }
     }
 
     pub fn height(self) -> i32 {
@@ -95,7 +101,10 @@ impl TrackListLayout {
     }
 
     pub fn first(self, count: usize, current: Option<usize>) -> usize {
-        current.unwrap_or(0).saturating_sub(self.rows / 2).min(count.saturating_sub(self.rows))
+        current
+            .unwrap_or(0)
+            .saturating_sub(self.rows / 2)
+            .min(count.saturating_sub(self.rows))
     }
 
     pub fn scroll(self, first: usize, delta: i32, count: usize) -> usize {
@@ -120,9 +129,15 @@ impl TrackListLayout {
 pub fn tracklist_position(anchor: RECT, work: RECT, layout: TrackListLayout) -> (i32, i32) {
     let preferred = if anchor.left - layout.width - 4 >= work.left {
         anchor.left - layout.width - 4
-    } else { anchor.right + 4 };
-    (preferred.clamp(work.left, (work.right - layout.width).max(work.left)),
-        anchor.top.clamp(work.top, (work.bottom - layout.height()).max(work.top)))
+    } else {
+        anchor.right + 4
+    };
+    (
+        preferred.clamp(work.left, (work.right - layout.width).max(work.left)),
+        anchor
+            .top
+            .clamp(work.top, (work.bottom - layout.height()).max(work.top)),
+    )
 }
 
 /// Ordinary GDI surface for the temporary opaque, frameless track drawer.
@@ -136,13 +151,29 @@ impl TrackListRenderer {
     pub fn new() -> Result<Self> {
         unsafe {
             let renderer = Self {
-                font: CreateFontW(-14, 0, 0, 0, 400, 0, 0, 0, DEFAULT_CHARSET,
-                    OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-                    (DEFAULT_PITCH.0 | FF_SWISS.0) as u32, w!("Segoe UI")),
+                font: CreateFontW(
+                    -14,
+                    0,
+                    0,
+                    0,
+                    400,
+                    0,
+                    0,
+                    0,
+                    DEFAULT_CHARSET,
+                    OUT_TT_PRECIS,
+                    CLIP_DEFAULT_PRECIS,
+                    ANTIALIASED_QUALITY,
+                    (DEFAULT_PITCH.0 | FF_SWISS.0) as u32,
+                    w!("Segoe UI"),
+                ),
                 background: CreateSolidBrush(TRACKLIST_BG),
                 selected: CreateSolidBrush(TRACKLIST_SELECTED),
             };
-            if renderer.font.is_invalid() || renderer.background.is_invalid() || renderer.selected.is_invalid() {
+            if renderer.font.is_invalid()
+                || renderer.background.is_invalid()
+                || renderer.selected.is_invalid()
+            {
                 return Err(last_error());
             }
             Ok(renderer)
@@ -151,26 +182,72 @@ impl TrackListRenderer {
 
     pub fn draw(&self, dc: HDC, view: &TrackList, layout: TrackListLayout, first: usize) {
         unsafe {
-            FillRect(dc, &RECT { left: 0, top: 0, right: layout.width, bottom: layout.height() }, self.background);
+            FillRect(
+                dc,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: layout.width,
+                    bottom: layout.height(),
+                },
+                self.background,
+            );
             let old_font = SelectObject(dc, self.font.into());
             let old_mode = SetBkMode(dc, TRANSPARENT);
             let old_color = SetTextColor(dc, COLORREF(0x00F0F0F0));
             let text = |label: &str, top: i32, height: i32| {
-                let mut wide = label.chars().map(|c| if c.is_control() { ' ' } else { c })
-                    .collect::<String>().encode_utf16().collect::<Vec<u16>>();
-                let mut rect = RECT { left: 10, top, right: layout.width - 10, bottom: top + height };
-                DrawTextW(dc, &mut wide, &mut rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                let mut wide = label
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>()
+                    .encode_utf16()
+                    .collect::<Vec<u16>>();
+                let mut rect = RECT {
+                    left: 10,
+                    top,
+                    right: layout.width - 10,
+                    bottom: top + height,
+                };
+                DrawTextW(
+                    dc,
+                    &mut wide,
+                    &mut rect,
+                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
             };
-            text(&format!("Tracks ({})", view.titles.len()), 0, TRACKLIST_HEADER_H);
+            text(
+                &format!("Tracks ({})", view.titles.len()),
+                0,
+                TRACKLIST_HEADER_H,
+            );
             if view.titles.is_empty() {
-                text(if view.loading { "Loading playlist…" } else { "No tracks loaded" }, TRACKLIST_HEADER_H, TRACKLIST_ROW_H);
+                text(
+                    if view.loading {
+                        "Loading playlist…"
+                    } else {
+                        "No tracks loaded"
+                    },
+                    TRACKLIST_HEADER_H,
+                    TRACKLIST_ROW_H,
+                );
             }
             for row in 0..layout.rows {
                 let index = first + row;
-                let Some(title) = view.titles.get(index) else { break; };
+                let Some(title) = view.titles.get(index) else {
+                    break;
+                };
                 let top = TRACKLIST_HEADER_H + row as i32 * TRACKLIST_ROW_H;
                 if view.current == Some(index) {
-                    FillRect(dc, &RECT { left: 0, top, right: layout.width, bottom: top + TRACKLIST_ROW_H }, self.selected);
+                    FillRect(
+                        dc,
+                        &RECT {
+                            left: 0,
+                            top,
+                            right: layout.width,
+                            bottom: top + TRACKLIST_ROW_H,
+                        },
+                        self.selected,
+                    );
                 }
                 text(&format!("{}. {title}", index + 1), top, TRACKLIST_ROW_H);
             }
@@ -249,7 +326,10 @@ fn eq_strip_glyph(level: i32, strip_row: usize) -> &'static str {
 /// physical row index always increases Y by exactly one text line.
 fn eq_strip_row(gain_db: f32, strip_row: usize, eq_top: i32, line_h: i32) -> (i32, &'static str) {
     let level = gain_db.clamp(-EQ_MAX_GAIN_DB, EQ_MAX_GAIN_DB) as i32;
-    (eq_top + strip_row as i32 * line_h, eq_strip_glyph(level, strip_row))
+    (
+        eq_top + strip_row as i32 * line_h,
+        eq_strip_glyph(level, strip_row),
+    )
 }
 
 /// Rasterize the six Unicode Braille bits as separate dots, rather than
@@ -270,11 +350,14 @@ fn braille_dot_rect(glyph: &str, dot: usize, cell: RECT) -> Option<RECT> {
     if dot_size < 1 {
         return None;
     }
-    let left = cell.left + (width - (2 * dot_size + 1)) / 2
-        + (dot / 3) as i32 * (dot_size + 1);
-    let top = cell.top + (height - (3 * dot_size + 2)) / 2
-        + (dot % 3) as i32 * (dot_size + 1);
-    Some(RECT { left, top, right: left + dot_size, bottom: top + dot_size })
+    let left = cell.left + (width - (2 * dot_size + 1)) / 2 + (dot / 3) as i32 * (dot_size + 1);
+    let top = cell.top + (height - (3 * dot_size + 2)) / 2 + (dot % 3) as i32 * (dot_size + 1);
+    Some(RECT {
+        left,
+        top,
+        right: left + dot_size,
+        bottom: top + dot_size,
+    })
 }
 
 /// Which of the 10 equalizer columns does a client x fall in? Pure mapping
@@ -429,7 +512,10 @@ impl Renderer {
     /// Only the four Braille rows accept EQ wheel input; the column split
     /// is exact tenths of the window width.
     pub fn eq_band_at(&self, x: i32, y: i32) -> Option<usize> {
-        if !(0..self.width).contains(&x) || y < self.eq_top || y >= self.eq_top + EQ_ROWS as i32 * self.line_h {
+        if !(0..self.width).contains(&x)
+            || y < self.eq_top
+            || y >= self.eq_top + EQ_ROWS as i32 * self.line_h
+        {
             return None;
         }
         Some(eq_band_index(x, self.width))
@@ -459,10 +545,21 @@ impl Renderer {
                 if i == 0 {
                     // Branding and compact state share the existing header
                     // row, leaving the quit button pinned on the right.
-                    let mut wide: Vec<u16> = format!("KYOUKO {}", status_token(phase)).encode_utf16().collect();
-                    let mut rect = RECT { left: PAD, top: PAD,
-                        right: quit_button_rect(self.line_h).left, bottom: PAD + self.line_h };
-                    DrawTextW(self.mem_dc, &mut wide, &mut rect, DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+                    let mut wide: Vec<u16> = format!("KYOUKO {}", status_token(phase))
+                        .encode_utf16()
+                        .collect();
+                    let mut rect = RECT {
+                        left: PAD,
+                        top: PAD,
+                        right: quit_button_rect(self.line_h).left,
+                        bottom: PAD + self.line_h,
+                    };
+                    DrawTextW(
+                        self.mem_dc,
+                        &mut wide,
+                        &mut rect,
+                        DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                    );
                 } else {
                     let wide: Vec<u16> = line.encode_utf16().collect();
                     let _ = TextOutW(self.mem_dc, PAD, PAD + i as i32 * self.line_h, &wide);
@@ -474,8 +571,12 @@ impl Renderer {
     fn draw_quit_button(&self) {
         unsafe {
             let mut rect = quit_button_rect(self.line_h);
-            DrawTextW(self.mem_dc, &mut ['X' as u16], &mut rect,
-                windows::Win32::Graphics::Gdi::DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            DrawTextW(
+                self.mem_dc,
+                &mut ['X' as u16],
+                &mut rect,
+                windows::Win32::Graphics::Gdi::DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
         }
     }
 
@@ -514,8 +615,11 @@ impl Renderer {
     /// a full repaint through the persistent memory DC when content changes.
     /// Layered presentation is atomic; unchanged snapshots do no GDI work.
     pub fn draw(&mut self, hwnd: HWND, panel: &str, phase: Phase, eq: &[f32; EQ_BANDS]) {
-        if self.last_frame.as_ref().is_some_and(|frame|
-            frame.panel == panel && frame.phase == phase && frame.eq == *eq) {
+        if self
+            .last_frame
+            .as_ref()
+            .is_some_and(|frame| frame.panel == panel && frame.phase == phase && frame.eq == *eq)
+        {
             return;
         }
         unsafe {
@@ -548,7 +652,10 @@ impl Renderer {
             // the glyph pixels themselves. Alpha 1 (~0.4% of premultiplied
             // black) is imperceptible but keeps the full rect hit-testable.
             let color = accent(phase);
-            for px in std::slice::from_raw_parts_mut(self.bits, len).as_chunks_mut::<4>().0 {
+            for px in std::slice::from_raw_parts_mut(self.bits, len)
+                .as_chunks_mut::<4>()
+                .0
+            {
                 let lum = px[0].max(px[1]).max(px[2]);
                 if lum == 0 {
                     px[3] = 1;
@@ -568,7 +675,9 @@ impl Renderer {
             };
             if crate::logging::enabled(crate::logging::LVL_DEBUG) {
                 let lit = std::slice::from_raw_parts(self.bits, len)
-                    .as_chunks::<4>().0.iter()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .filter(|p| p[3] > 0)
                     .count();
                 log_debug!("RENDER", "draw: {lit}/{} px lit", len / 4);
@@ -577,8 +686,14 @@ impl Renderer {
             // NULL/NULL (keep-current) ULW, leaving the surface transparent.
             let mut rc = RECT::default();
             let _ = GetWindowRect(hwnd, &mut rc);
-            let pt_dst = POINT { x: rc.left, y: rc.top };
-            let size = SIZE { cx: self.width, cy: self.height };
+            let pt_dst = POINT {
+                x: rc.left,
+                y: rc.top,
+            };
+            let size = SIZE {
+                cx: self.width,
+                cy: self.height,
+            };
             if let Err(e) = UpdateLayeredWindow(
                 hwnd,
                 Some(self.screen_dc),
@@ -599,10 +714,16 @@ impl Renderer {
                     frame.phase = phase;
                     frame.eq = *eq;
                 } else {
-                    self.last_frame = Some(OverlayFrame { panel: panel.into(), phase, eq: *eq });
+                    self.last_frame = Some(OverlayFrame {
+                        panel: panel.into(),
+                        phase,
+                        eq: *eq,
+                    });
                 }
                 #[cfg(test)]
-                { self.presentations += 1; }
+                {
+                    self.presentations += 1;
+                }
             }
         }
     }
@@ -635,20 +756,45 @@ mod tests {
         unsafe {
             // A hidden native surface exercises real layered presentation;
             // there is no injected mouse input or desktop interaction.
-            let hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, w!("STATIC"), w!(""),
-                WS_POPUP, -32000, -32000, width, height, None, None,
-                Some(GetModuleHandleW(None).unwrap().into()), None).unwrap();
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW,
+                w!("STATIC"),
+                w!(""),
+                WS_POPUP,
+                -32000,
+                -32000,
+                width,
+                height,
+                None,
+                None,
+                Some(GetModuleHandleW(None).unwrap().into()),
+                None,
+            )
+            .unwrap();
             let mut gains = [0.0; EQ_BANDS];
             renderer.draw(hwnd, panel, Phase::Playing, &gains);
             assert_eq!(renderer.presentations, 1);
-            for _ in 0..3 { renderer.draw(hwnd, panel, Phase::Playing, &gains); }
-            assert_eq!(renderer.presentations, 1, "unchanged events do no presentation work");
+            for _ in 0..3 {
+                renderer.draw(hwnd, panel, Phase::Playing, &gains);
+            }
+            assert_eq!(
+                renderer.presentations, 1,
+                "unchanged events do no presentation work"
+            );
             gains[2] = 5.0;
             renderer.draw(hwnd, panel, Phase::Playing, &gains);
-            assert_eq!(renderer.presentations, 2, "EQ is not part of the text panel");
+            assert_eq!(
+                renderer.presentations, 2,
+                "EQ is not part of the text panel"
+            );
             renderer.draw(hwnd, panel, Phase::Paused, &gains);
             assert_eq!(renderer.presentations, 3, "phase changes header and accent");
-            renderer.draw(hwnd, "header\nnew time\ntrack\nvolume\neq repeat", Phase::Paused, &gains);
+            renderer.draw(
+                hwnd,
+                "header\nnew time\ntrack\nvolume\neq repeat",
+                Phase::Paused,
+                &gains,
+            );
             assert_eq!(renderer.presentations, 4);
             assert_eq!(renderer.size(), (width, height));
             DestroyWindow(hwnd).unwrap();
@@ -671,17 +817,43 @@ mod tests {
         assert_eq!(layout.rows, 12);
         let first = layout.first(3100, Some(3099));
         assert_eq!(first, 3088);
-        assert_eq!(layout.click(10, TRACKLIST_HEADER_H + 11 * TRACKLIST_ROW_H + 1, first, 3100), TrackListClick::Jump(3100));
+        assert_eq!(
+            layout.click(
+                10,
+                TRACKLIST_HEADER_H + 11 * TRACKLIST_ROW_H + 1,
+                first,
+                3100
+            ),
+            TrackListClick::Jump(3100)
+        );
         assert_eq!(layout.scroll(0, -3, 3100), 0);
         assert_eq!(layout.scroll(first, 3, 3100), first);
-        for (x, y) in [(-1, 10), (layout.width, 10), (10, -1), (10, layout.height())] {
+        for (x, y) in [
+            (-1, 10),
+            (layout.width, 10),
+            (10, -1),
+            (10, layout.height()),
+        ] {
             assert_eq!(layout.click(x, y, first, 3100), TrackListClick::Dismiss);
         }
         assert_eq!(layout.click(10, 0, 0, 3100), TrackListClick::None);
         let empty = TrackListLayout::new(0, 1920, 1080);
-        assert_eq!(empty.click(10, TRACKLIST_HEADER_H, 0, 0), TrackListClick::None);
-        let work = RECT { left: -1920, top: -300, right: 0, bottom: 780 };
-        let anchor = RECT { left: -84, top: 740, right: -4, bottom: 780 };
+        assert_eq!(
+            empty.click(10, TRACKLIST_HEADER_H, 0, 0),
+            TrackListClick::None
+        );
+        let work = RECT {
+            left: -1920,
+            top: -300,
+            right: 0,
+            bottom: 780,
+        };
+        let anchor = RECT {
+            left: -84,
+            top: 740,
+            right: -4,
+            bottom: 780,
+        };
         let (x, y) = tracklist_position(anchor, work, layout);
         assert!(x >= work.left && x + layout.width <= work.right);
         assert!(y >= work.top && y + layout.height() <= work.bottom);
@@ -691,14 +863,27 @@ mod tests {
     fn gdi_tracklist_highlights_only_the_selected_row() {
         let canvas = Renderer::new("header\ntime\ntrack\nvolume\neq repeat").unwrap();
         let renderer = TrackListRenderer::new().unwrap();
-        let layout = TrackListLayout { width: WINDOW_W, rows: 2 };
-        let view = TrackList { titles: vec!["音楽 A".into(), "Song B".into()], current: Some(1), loading: false };
+        let layout = TrackListLayout {
+            width: WINDOW_W,
+            rows: 2,
+        };
+        let view = TrackList {
+            titles: vec!["音楽 A".into(), "Song B".into()],
+            current: Some(1),
+            loading: false,
+        };
         renderer.draw(canvas.mem_dc, &view, layout, 0);
         unsafe {
             let _ = GdiFlush();
             use windows::Win32::Graphics::Gdi::GetPixel;
-            assert_eq!(GetPixel(canvas.mem_dc, 2, TRACKLIST_HEADER_H + 2), TRACKLIST_BG);
-            assert_eq!(GetPixel(canvas.mem_dc, 2, TRACKLIST_HEADER_H + TRACKLIST_ROW_H + 2), TRACKLIST_SELECTED);
+            assert_eq!(
+                GetPixel(canvas.mem_dc, 2, TRACKLIST_HEADER_H + 2),
+                TRACKLIST_BG
+            );
+            assert_eq!(
+                GetPixel(canvas.mem_dc, 2, TRACKLIST_HEADER_H + TRACKLIST_ROW_H + 2),
+                TRACKLIST_SELECTED
+            );
         }
     }
 
@@ -710,7 +895,11 @@ mod tests {
             assert_eq!(braille_glyph(levels as i32), *glyph, "levels={levels}");
         }
         assert_eq!(braille_glyph(7), "⠿", "beyond 6 saturates the cell");
-        assert_eq!(braille_glyph(-3), " ", "negative levels never reach a cell directly");
+        assert_eq!(
+            braille_glyph(-3),
+            " ",
+            "negative levels never reach a cell directly"
+        );
     }
 
     #[test]
@@ -737,10 +926,26 @@ mod tests {
             (7.0, ["⠠", "⠿", " ", " "]),
             (12.0, ["⠿", "⠿", " ", " "]),
         ] {
-            assert_eq!(eq_strip_row(gain_db, 0, 58, 11), (58, glyphs[0]), "gain {gain_db}, physical row 0");
-            assert_eq!(eq_strip_row(gain_db, 1, 58, 11), (69, glyphs[1]), "gain {gain_db}, physical row 1");
-            assert_eq!(eq_strip_row(gain_db, 2, 58, 11), (80, glyphs[2]), "gain {gain_db}, physical row 2");
-            assert_eq!(eq_strip_row(gain_db, 3, 58, 11), (91, glyphs[3]), "gain {gain_db}, physical row 3");
+            assert_eq!(
+                eq_strip_row(gain_db, 0, 58, 11),
+                (58, glyphs[0]),
+                "gain {gain_db}, physical row 0"
+            );
+            assert_eq!(
+                eq_strip_row(gain_db, 1, 58, 11),
+                (69, glyphs[1]),
+                "gain {gain_db}, physical row 1"
+            );
+            assert_eq!(
+                eq_strip_row(gain_db, 2, 58, 11),
+                (80, glyphs[2]),
+                "gain {gain_db}, physical row 2"
+            );
+            assert_eq!(
+                eq_strip_row(gain_db, 3, 58, 11),
+                (91, glyphs[3]),
+                "gain {gain_db}, physical row 3"
+            );
         }
     }
 
@@ -762,7 +967,9 @@ mod tests {
     fn gdi_eq_pixels_stay_in_their_physical_cells_after_gain_changes() {
         // Render into a real top-down GDI DIB without creating a window or
         // injecting input. Exercise the same strip drawing as the live UI.
-        let renderer = Renderer::new("KYOUKO STOPPED\n00:00/--:--\n(none)\nvol ||||-  80%\neq:ON  rep:OFF").unwrap();
+        let renderer =
+            Renderer::new("KYOUKO STOPPED\n00:00/--:--\n(none)\nvol ||||-  80%\neq:ON  rep:OFF")
+                .unwrap();
         let len = (renderer.width * renderer.height) as usize * 4;
         let band = 3;
         let col_w = renderer.width / EQ_BANDS as i32;
@@ -788,10 +995,15 @@ mod tests {
                     }
                     let x = pixel_index as i32 % renderer.width;
                     let y = pixel_index as i32 / renderer.width;
-                    assert!(x >= band as i32 * col_w && x < (band as i32 + 1) * col_w,
-                        "gain {gain_db} spilled into another band at ({x}, {y})");
-                    assert!(y >= renderer.eq_top && y < renderer.eq_top + EQ_ROWS as i32 * renderer.line_h,
-                        "gain {gain_db} spilled outside the strip at ({x}, {y})");
+                    assert!(
+                        x >= band as i32 * col_w && x < (band as i32 + 1) * col_w,
+                        "gain {gain_db} spilled into another band at ({x}, {y})"
+                    );
+                    assert!(
+                        y >= renderer.eq_top
+                            && y < renderer.eq_top + EQ_ROWS as i32 * renderer.line_h,
+                        "gain {gain_db} spilled outside the strip at ({x}, {y})"
+                    );
                     let physical_row = ((y - renderer.eq_top) / renderer.line_h) as usize;
                     lit_rows[physical_row] = true;
                 }
@@ -828,7 +1040,9 @@ mod tests {
                 let mut unseen = mask.clone();
                 let mut dots = 0;
                 for start in 0..unseen.len() {
-                    if !unseen[start] { continue; }
+                    if !unseen[start] {
+                        continue;
+                    }
                     dots += 1;
                     let mut pending = vec![start];
                     unseen[start] = false;
@@ -836,7 +1050,9 @@ mod tests {
                         let x = pixel as i32 % col_w;
                         let y = pixel as i32 / col_w;
                         for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
-                            if nx < 0 || nx >= col_w || ny < 0 || ny >= renderer.line_h { continue; }
+                            if nx < 0 || nx >= col_w || ny < 0 || ny >= renderer.line_h {
+                                continue;
+                            }
                             let next = (ny * col_w + nx) as usize;
                             if unseen[next] {
                                 unseen[next] = false;
@@ -850,7 +1066,12 @@ mod tests {
             }
         }
         for level in 1..6 {
-            assert_ne!(masks[level - 1], masks[level], "GDI renders levels {level} and {} identically", level + 1);
+            assert_ne!(
+                masks[level - 1],
+                masks[level],
+                "GDI renders levels {level} and {} identically",
+                level + 1
+            );
         }
     }
 
@@ -872,14 +1093,23 @@ mod tests {
                 renderer.draw_eq_strip(&gains);
                 assert!(GdiFlush().as_bool());
                 let pixels = std::slice::from_raw_parts(renderer.bits, len);
-                let actual: Vec<_> = pixels.as_chunks::<4>().0.iter().enumerate()
+                let actual: Vec<_> = pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .enumerate()
                     .filter(|(_, pixel)| pixel[..3].iter().any(|channel| *channel != 0))
-                    .map(|(index, _)| (index as i32 % renderer.width, index as i32 / renderer.width))
+                    .map(|(index, _)| {
+                        (index as i32 % renderer.width, index as i32 / renderer.width)
+                    })
                     .collect();
                 let mut expected = Vec::new();
-                for (physical_row, steps) in [(2, magnitude.min(6)), (3, magnitude.saturating_sub(6))] {
+                for (physical_row, steps) in
+                    [(2, magnitude.min(6)), (3, magnitude.saturating_sub(6))]
+                {
                     let origin_x = 3 * col_w + (col_w - 5) / 2;
-                    let origin_y = renderer.eq_top + physical_row * renderer.line_h
+                    let origin_y = renderer.eq_top
+                        + physical_row * renderer.line_h
                         + (renderer.line_h - 8) / 2;
                     for &(dot_x, dot_y) in dot_order.iter().take(steps) {
                         for dy in 0..2 {
@@ -899,11 +1129,19 @@ mod tests {
     fn eq_strip_sides_are_mutually_exclusive() {
         // Positive gains light only the rows above the baseline.
         for strip_row in 2..EQ_ROWS {
-            assert_eq!(eq_strip_glyph(5, strip_row), " ", "+5 lower row {strip_row}");
+            assert_eq!(
+                eq_strip_glyph(5, strip_row),
+                " ",
+                "+5 lower row {strip_row}"
+            );
         }
         // Negative gains light only the rows below the baseline.
         for strip_row in 0..2 {
-            assert_eq!(eq_strip_glyph(-5, strip_row), " ", "-5 upper row {strip_row}");
+            assert_eq!(
+                eq_strip_glyph(-5, strip_row),
+                " ",
+                "-5 upper row {strip_row}"
+            );
         }
         // Zero leaves the whole strip blank (4/4 rows are the space cell).
         for strip_row in 0..EQ_ROWS {
@@ -915,13 +1153,33 @@ mod tests {
     fn eq_strip_positive_fills_inner_row_first() {
         // Inner upper row (strip row 1) runs the 6-dot progression for +1..+6.
         for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
-            assert_eq!(eq_strip_glyph(lvl as i32 + 1, 1), *glyph, "level +{}", lvl + 1);
-            assert_eq!(eq_strip_glyph(lvl as i32 + 1, 0), " ", "outer row must stay blank at +{}", lvl + 1);
+            assert_eq!(
+                eq_strip_glyph(lvl as i32 + 1, 1),
+                *glyph,
+                "level +{}",
+                lvl + 1
+            );
+            assert_eq!(
+                eq_strip_glyph(lvl as i32 + 1, 0),
+                " ",
+                "outer row must stay blank at +{}",
+                lvl + 1
+            );
         }
         // +7..+12: inner row saturates, outer row runs the progression.
         for (lvl, glyph) in ["⠠", "⠤", "⠴", "⠶", "⠾", "⠿"].iter().enumerate() {
-            assert_eq!(eq_strip_glyph(lvl as i32 + 7, 1), "⠿", "inner saturated at +{}", lvl + 7);
-            assert_eq!(eq_strip_glyph(lvl as i32 + 7, 0), *glyph, "outer row at +{}", lvl + 7);
+            assert_eq!(
+                eq_strip_glyph(lvl as i32 + 7, 1),
+                "⠿",
+                "inner saturated at +{}",
+                lvl + 7
+            );
+            assert_eq!(
+                eq_strip_glyph(lvl as i32 + 7, 0),
+                *glyph,
+                "outer row at +{}",
+                lvl + 7
+            );
         }
     }
 
@@ -929,13 +1187,33 @@ mod tests {
     fn eq_strip_negative_fills_inner_row_first() {
         // Inner lower row (strip row 2) runs the 6-dot progression for -1..-6.
         for (lvl, glyph) in ["⠈", "⠉", "⠙", "⠛", "⠻", "⠿"].iter().enumerate() {
-            assert_eq!(eq_strip_glyph(-(lvl as i32) - 1, 2), *glyph, "level -{}", lvl + 1);
-            assert_eq!(eq_strip_glyph(-(lvl as i32) - 1, 3), " ", "outer row must stay blank at -{}", lvl + 1);
+            assert_eq!(
+                eq_strip_glyph(-(lvl as i32) - 1, 2),
+                *glyph,
+                "level -{}",
+                lvl + 1
+            );
+            assert_eq!(
+                eq_strip_glyph(-(lvl as i32) - 1, 3),
+                " ",
+                "outer row must stay blank at -{}",
+                lvl + 1
+            );
         }
         // -7..-12: inner row saturates, outer (bottom-most) row fills next.
         for (lvl, glyph) in ["⠈", "⠉", "⠙", "⠛", "⠻", "⠿"].iter().enumerate() {
-            assert_eq!(eq_strip_glyph(-(lvl as i32) - 7, 2), "⠿", "inner saturated at -{}", lvl + 7);
-            assert_eq!(eq_strip_glyph(-(lvl as i32) - 7, 3), *glyph, "outer row at -{}", lvl + 7);
+            assert_eq!(
+                eq_strip_glyph(-(lvl as i32) - 7, 2),
+                "⠿",
+                "inner saturated at -{}",
+                lvl + 7
+            );
+            assert_eq!(
+                eq_strip_glyph(-(lvl as i32) - 7, 3),
+                *glyph,
+                "outer row at -{}",
+                lvl + 7
+            );
         }
     }
 
@@ -944,7 +1222,11 @@ mod tests {
         // Level 1-6: only the row adjacent to the baseline fills.
         assert_eq!(braille_row_glyph(1, 0), "⠠");
         assert_eq!(braille_row_glyph(5, 0), "⠾");
-        assert_eq!(braille_row_glyph(5, 1), " ", "outer row untouched below level 7");
+        assert_eq!(
+            braille_row_glyph(5, 1),
+            " ",
+            "outer row untouched below level 7"
+        );
         // Level 7-12: inner row saturated (⠿), outer row runs the progression.
         assert_eq!(braille_row_glyph(7, 0), "⠿");
         assert_eq!(braille_row_glyph(7, 1), "⠠");
@@ -966,15 +1248,26 @@ mod tests {
         let renderer = Renderer::new(&panel).unwrap();
         assert_eq!(panel.lines().count(), 5);
         assert_eq!(renderer.size(), (WINDOW_W, 2 * PAD + 9 * renderer.line_h));
-        assert_eq!(renderer.height, renderer.eq_top + EQ_ROWS as i32 * renderer.line_h + PAD);
+        assert_eq!(
+            renderer.height,
+            renderer.eq_top + EQ_ROWS as i32 * renderer.line_h + PAD
+        );
         for y in 0..renderer.height {
             for x in 0..renderer.width {
                 let track = (PAD + 2 * renderer.line_h..PAD + 3 * renderer.line_h).contains(&y);
                 let eq = (renderer.eq_top..renderer.height - PAD).contains(&y);
                 let quit = (WINDOW_W - PAD - 8..WINDOW_W - PAD).contains(&x)
                     && (PAD..PAD + renderer.line_h).contains(&y);
-                assert_eq!(renderer.client_input_at(x, y), quit || track || eq, "client region ({x}, {y})");
-                assert_eq!(renderer.eq_band_at(x, y), eq.then_some((x / 8) as usize), "wheel region ({x}, {y})");
+                assert_eq!(
+                    renderer.client_input_at(x, y),
+                    quit || track || eq,
+                    "client region ({x}, {y})"
+                );
+                assert_eq!(
+                    renderer.eq_band_at(x, y),
+                    eq.then_some((x / 8) as usize),
+                    "wheel region ({x}, {y})"
+                );
             }
         }
         for x in [-1, renderer.width] {
@@ -993,13 +1286,21 @@ mod tests {
         let rect = quit_button_rect(renderer.line_h);
         assert_eq!(renderer.width, 80);
         assert_eq!(renderer.height, 2 * PAD + 9 * renderer.line_h);
-        for (x, y) in [(rect.left, rect.top), (rect.right - 1, rect.top),
-            (rect.left, rect.bottom - 1), (rect.right - 1, rect.bottom - 1)] {
+        for (x, y) in [
+            (rect.left, rect.top),
+            (rect.right - 1, rect.top),
+            (rect.left, rect.bottom - 1),
+            (rect.right - 1, rect.bottom - 1),
+        ] {
             assert!(renderer.quit_button_at(x, y));
             assert!(renderer.client_input_at(x, y));
         }
-        for (x, y) in [(rect.left - 1, rect.top), (rect.right, rect.top),
-            (rect.left, rect.top - 1), (rect.left, rect.bottom)] {
+        for (x, y) in [
+            (rect.left - 1, rect.top),
+            (rect.right, rect.top),
+            (rect.left, rect.top - 1),
+            (rect.left, rect.bottom),
+        ] {
             assert!(!renderer.quit_button_at(x, y));
         }
         assert!(!quit_button_at(72, PAD, 0));
@@ -1007,26 +1308,43 @@ mod tests {
             let len = (renderer.width * renderer.height) as usize * 4;
             std::ptr::write_bytes(renderer.bits, 0, len);
             SetTextColor(renderer.mem_dc, COLORREF(0x00FF_FFFF));
-            renderer.draw_panel_text("KYOUKO PLAYING WITH A VERY LONG HEADER\ntime\ntrack\nvolume\neq/repeat", Phase::Playing);
+            renderer.draw_panel_text(
+                "KYOUKO PLAYING WITH A VERY LONG HEADER\ntime\ntrack\nvolume\neq/repeat",
+                Phase::Playing,
+            );
             assert!(GdiFlush().as_bool());
             let lit_in_button = || {
                 let pixels = std::slice::from_raw_parts(renderer.bits, len);
-                (rect.top..rect.bottom).flat_map(|y| (rect.left..rect.right).map(move |x| (y * renderer.width + x) as usize))
-                    .filter(|&index| pixels[index * 4..index * 4 + 3].iter().any(|&value| value != 0)).count()
+                (rect.top..rect.bottom)
+                    .flat_map(|y| {
+                        (rect.left..rect.right).map(move |x| (y * renderer.width + x) as usize)
+                    })
+                    .filter(|&index| {
+                        pixels[index * 4..index * 4 + 3]
+                            .iter()
+                            .any(|&value| value != 0)
+                    })
+                    .count()
             };
             assert_eq!(lit_in_button(), 0, "header must not overlap the quit glyph");
             renderer.draw_quit_button();
             assert!(GdiFlush().as_bool());
-            assert!(lit_in_button() > 0, "X must be visibly painted inside its hit box");
+            assert!(
+                lit_in_button() > 0,
+                "X must be visibly painted inside its hit box"
+            );
         }
     }
 
     #[test]
     fn branding_and_compact_tokens_render_fully_before_pinned_quit() {
         let shared = crate::broker::SharedState::new();
-        for (phase, token, header) in [(Phase::Playing, "PLY", "KYOUKO PLY"),
-            (Phase::Paused, "PSD", "KYOUKO PSD"), (Phase::Stopped, "STP", "KYOUKO STP"),
-            (Phase::Loading, "LDG", "KYOUKO LDG")] {
+        for (phase, token, header) in [
+            (Phase::Playing, "PLY", "KYOUKO PLY"),
+            (Phase::Paused, "PSD", "KYOUKO PSD"),
+            (Phase::Stopped, "STP", "KYOUKO STP"),
+            (Phase::Loading, "LDG", "KYOUKO LDG"),
+        ] {
             assert_eq!(status_token(phase), token);
             assert!(token.is_ascii());
             shared.set_phase(phase);
@@ -1044,7 +1362,10 @@ mod tests {
                 let wide: Vec<u16> = header.encode_utf16().collect();
                 let mut extent = SIZE::default();
                 GetTextExtentPoint32W(renderer.mem_dc, &wide, &mut extent).unwrap();
-                assert!(PAD + extent.cx < quit.left, "{header} needs no ellipsis and cannot overlap X");
+                assert!(
+                    PAD + extent.cx < quit.left,
+                    "{header} needs no ellipsis and cannot overlap X"
+                );
                 renderer.draw_panel_text(&panel, phase);
                 // Reference paints the full brand and token without clipping
                 // or ellipsis; pixel equality proves no letters are lost.
@@ -1052,15 +1373,21 @@ mod tests {
                 assert!(GdiFlush().as_bool());
                 let first_row = (PAD * renderer.width) as usize * 4;
                 let after_row = ((PAD + renderer.line_h) * renderer.width) as usize * 4;
-                assert_eq!(&std::slice::from_raw_parts(renderer.bits, len)[first_row..after_row],
-                    &std::slice::from_raw_parts(reference.bits, len)[first_row..after_row], "full {header} pixels");
+                assert_eq!(
+                    &std::slice::from_raw_parts(renderer.bits, len)[first_row..after_row],
+                    &std::slice::from_raw_parts(reference.bits, len)[first_row..after_row],
+                    "full {header} pixels"
+                );
                 renderer.draw_quit_button();
                 assert!(GdiFlush().as_bool());
                 let pixels = std::slice::from_raw_parts(renderer.bits, len);
-                assert!((quit.top..quit.bottom).any(|y| (quit.left..quit.right).any(|x| {
-                    let index = (y * renderer.width + x) as usize * 4;
-                    pixels[index..index + 3].iter().any(|&value| value != 0)
-                })), "X stays painted at the right edge");
+                assert!(
+                    (quit.top..quit.bottom).any(|y| (quit.left..quit.right).any(|x| {
+                        let index = (y * renderer.width + x) as usize * 4;
+                        pixels[index..index + 3].iter().any(|&value| value != 0)
+                    })),
+                    "X stays painted at the right edge"
+                );
             }
         }
     }

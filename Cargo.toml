@@ -2,6 +2,7 @@
 name = "kyouko-player"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99.0"
 description = "The mountain echo; only heard, never seen. A zero-resource, event-driven audio player."
 
 # ── Dependency policy ────────────────────────────────────────────────────────

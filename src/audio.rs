@@ -27,27 +27,27 @@
 //! the one case the decoder can't handle itself: a network-stalled pipe read
 //! that would otherwise defer the next command indefinitely.
 
+use crate::process::SourceChild as Child;
 use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::{ErrorKind, Read};
-use std::process::Stdio;
-use crate::process::SourceChild as Child;
 #[cfg(test)]
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam_channel::{Sender, TryRecvError};
-#[cfg(test)]
-use crossbeam_channel::{bounded, Receiver};
-use crate::decoder_wake::{CommandReceiver, DecoderWake, COMMAND, CAPACITY, DRAIN};
 #[cfg(test)]
 use crate::decoder_wake::command_channel;
+use crate::decoder_wake::{CAPACITY, COMMAND, CommandReceiver, DRAIN, DecoderWake};
+use crate::pcm_queue::{PcmQueue, PopError};
 #[cfg(test)]
 use crossbeam_channel::select;
-use crate::pcm_queue::{PcmQueue, PopError};
+#[cfg(test)]
+use crossbeam_channel::{Receiver, bounded};
+use crossbeam_channel::{Sender, TryRecvError};
 
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, Decoder};
@@ -60,19 +60,18 @@ use symphonia::core::units::{Time, TimeBase};
 use symphonia::default::get_probe;
 
 use crate::broker::{
-    Broker, DecoderCmd, SharedState, Source, Status, CHUNK_FRAMES, EQ_BANDS,
-    EQ_BAND_HZ,
+    Broker, CHUNK_FRAMES, DecoderCmd, EQ_BAND_HZ, EQ_BANDS, SharedState, Source, Status,
 };
 use crate::log_error;
 use crate::stream_buffer::StreamBuffer;
-use crate::{log_info, log_warn, log_debug};
+use crate::{log_debug, log_info, log_warn};
 
-#[cfg(test)]
-#[path = "audio_performance.rs"]
-mod performance;
 #[cfg(all(windows, feature = "release-diagnostics"))]
 #[path = "audio_cpu_profile.rs"]
 mod cpu_profile;
+#[cfg(test)]
+#[path = "audio_performance.rs"]
+mod performance;
 
 /// One decoded, EQ'd, volume-applied, resampled block of interleaved f32
 /// samples at the DEVICE rate. Allocated once in the pool, then recycled.
@@ -86,14 +85,18 @@ pub struct AudioChunk {
 }
 
 impl AudioChunk {
-    fn samples(&self) -> &[f32] { &self.data[..self.len] }
+    fn samples(&self) -> &[f32] {
+        &self.data[..self.len]
+    }
 }
 
 const BUFFER_MILLIS: usize = 1500;
 const PREFILL_MILLIS: usize = 500;
 
 fn buffer_depth(rate: u32) -> usize {
-    (rate as usize * BUFFER_MILLIS / 1000).div_ceil(CHUNK_FRAMES).max(2)
+    (rate as usize * BUFFER_MILLIS / 1000)
+        .div_ceil(CHUNK_FRAMES)
+        .max(2)
 }
 
 struct BufferState {
@@ -130,16 +133,21 @@ pub struct ChunkReceiver {
 impl Clone for ChunkReceiver {
     fn clone(&self) -> Self {
         self.state.sinks.fetch_add(1, Ordering::Relaxed);
-        Self { queue: self.queue.clone(), recycle: self.recycle.clone(), state: self.state.clone() }
+        Self {
+            queue: self.queue.clone(),
+            recycle: self.recycle.clone(),
+            state: self.state.clone(),
+        }
     }
 }
 
 impl Drop for ChunkReceiver {
     fn drop(&mut self) {
         if self.state.sinks.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(wake) = self.state.wake.get() {
-                wake.notify(COMMAND | CAPACITY | DRAIN);
-            }
+            && let Some(wake) = self.state.wake.get()
+        {
+            wake.notify(COMMAND | CAPACITY | DRAIN);
+        }
     }
 }
 
@@ -149,30 +157,45 @@ fn chunk_channel(rate: u32, channels: usize, depth: usize) -> (ChunkSender, Chun
     for _ in 0..=depth {
         free.try_send(AudioChunk {
             data: vec![0.0; CHUNK_FRAMES * channels].into_boxed_slice(),
-            len: 0, generation: u64::MAX,
-        }).unwrap_or_else(|_| unreachable!("pool initialization"));
+            len: 0,
+            generation: u64::MAX,
+        })
+        .unwrap_or_else(|_| unreachable!("pool initialization"));
     }
     let state = Arc::new(BufferState {
         ready_generation: AtomicU64::new(u64::MAX),
         eof_generation: AtomicU64::new(u64::MAX),
         underrun_frames: AtomicU64::new(0),
         rendered_frames: AtomicU64::new(0),
-        sinks: AtomicUsize::new(1), rendering: AtomicBool::new(false), wake: OnceLock::new(),
+        sinks: AtomicUsize::new(1),
+        rendering: AtomicBool::new(false),
+        wake: OnceLock::new(),
         #[cfg(test)]
         timing: performance::CallbackRecords::new(),
     });
-    (ChunkSender {
-        ready: ready.clone(), free: free.clone(), reserve: RefCell::new(Vec::with_capacity(depth + 1)),
-        state: state.clone(),
-        prefill_samples: (rate as usize * PREFILL_MILLIS / 1000 * channels)
-            .min(depth * CHUNK_FRAMES * channels),
-        priming: Cell::new((u64::MAX, 0)),
-    }, ChunkReceiver { queue: ready, recycle: free, state })
+    (
+        ChunkSender {
+            ready: ready.clone(),
+            free: free.clone(),
+            reserve: RefCell::new(Vec::with_capacity(depth + 1)),
+            state: state.clone(),
+            prefill_samples: (rate as usize * PREFILL_MILLIS / 1000 * channels)
+                .min(depth * CHUNK_FRAMES * channels),
+            priming: Cell::new((u64::MAX, 0)),
+        },
+        ChunkReceiver {
+            queue: ready,
+            recycle: free,
+            state,
+        },
+    )
 }
 
 impl ChunkSender {
     fn begin(&self, generation: u64) {
-        self.state.ready_generation.store(u64::MAX, Ordering::Release);
+        self.state
+            .ready_generation
+            .store(u64::MAX, Ordering::Release);
         self.state.eof_generation.store(u64::MAX, Ordering::Release);
         self.priming.set((generation, 0));
         // The single producer calls this before publishing a new generation.
@@ -190,37 +213,62 @@ impl ChunkSender {
 
     fn published(&self, generation: u64, samples: usize) {
         let (previous, count) = self.priming.get();
-        let count = if previous == generation { count + samples } else { samples };
-        self.priming.set((generation, count.min(self.prefill_samples)));
+        let count = if previous == generation {
+            count + samples
+        } else {
+            samples
+        };
+        self.priming
+            .set((generation, count.min(self.prefill_samples)));
         if count >= self.prefill_samples {
-            self.state.ready_generation.store(generation, Ordering::Release);
+            self.state
+                .ready_generation
+                .store(generation, Ordering::Release);
         }
     }
 
     fn finish(&self, generation: u64) {
-        self.state.eof_generation.store(generation, Ordering::Release);
+        self.state
+            .eof_generation
+            .store(generation, Ordering::Release);
         // Short tracks must start even when they cannot fill the watermark.
-        self.state.ready_generation.store(generation, Ordering::Release);
+        self.state
+            .ready_generation
+            .store(generation, Ordering::Release);
     }
 
     fn bind(&self, wake: &Arc<DecoderWake>) {
         let installed = self.state.wake.get_or_init(|| wake.clone());
-        assert!(Arc::ptr_eq(installed, wake), "each pool belongs to exactly one decoder");
+        assert!(
+            Arc::ptr_eq(installed, wake),
+            "each pool belongs to exactly one decoder"
+        );
     }
     fn take_free(&self) -> Option<AudioChunk> {
-        self.reserve.borrow_mut().pop().or_else(|| self.free.try_recv().ok())
+        self.reserve
+            .borrow_mut()
+            .pop()
+            .or_else(|| self.free.try_recv().ok())
     }
-    fn keep(&self, chunk: AudioChunk) { self.reserve.borrow_mut().push(chunk); }
-    fn sink_gone(&self) -> bool { self.state.sinks.load(Ordering::Acquire) == 0 }
+    fn keep(&self, chunk: AudioChunk) {
+        self.reserve.borrow_mut().push(chunk);
+    }
+    fn sink_gone(&self) -> bool {
+        self.state.sinks.load(Ordering::Acquire) == 0
+    }
     #[cfg(test)]
-    fn free_count(&self) -> usize { self.free.len() + self.reserve.borrow().len() }
+    fn free_count(&self) -> usize {
+        self.free.len() + self.reserve.borrow().len()
+    }
 }
 
 fn recycle(sender: &PcmQueue<AudioChunk>, chunk: AudioChunk) {
     // Exactly depth+1 blocks and recycle slots; owning a block proves there
     // is a slot. The sole rendering owner is the sole recycle writer. Its Arc
     // keeps the queue connected after decoder shutdown. No allocation/free.
-    sender.try_send(chunk).unwrap_or_else(|_| unreachable!("PCM pool invariant"));
+    sender
+        .try_send(chunk)
+        .unwrap_or_else(|_| unreachable!("PCM pool invariant"));
 }
 
 /// EOF is a generation-qualified atomic mailbox, with no channel waiter lock.
@@ -231,13 +279,18 @@ pub struct DrainSignal {
 }
 
 fn drain_channel(wake: &Arc<DecoderWake>) -> (DrainSignal, DrainSignal) {
-    let signal = DrainSignal { generation: Arc::new(AtomicU64::new(u64::MAX)), wake: wake.clone() };
+    let signal = DrainSignal {
+        generation: Arc::new(AtomicU64::new(u64::MAX)),
+        wake: wake.clone(),
+    };
     (signal.clone(), signal)
 }
 
 impl DrainSignal {
     #[cfg(test)]
-    fn send(&self, generation: u64) -> Result<(), ()> { self.try_send(generation) }
+    fn send(&self, generation: u64) -> Result<(), ()> {
+        self.try_send(generation)
+    }
     #[cfg(test)]
     fn try_send(&self, generation: u64) -> Result<(), ()> {
         self.generation.store(generation, Ordering::Release);
@@ -246,7 +299,11 @@ impl DrainSignal {
     }
     fn try_recv(&self) -> Result<u64, ()> {
         let generation = self.generation.swap(u64::MAX, Ordering::AcqRel);
-        if generation == u64::MAX { Err(()) } else { Ok(generation) }
+        if generation == u64::MAX {
+            Err(())
+        } else {
+            Ok(generation)
+        }
     }
 }
 
@@ -274,7 +331,10 @@ struct OutputReplacement {
 impl AudioControls {
     fn replace_output(&self, mut replacement: OutputReplacement) {
         let previous = {
-            let mut slot = self.output_slot.lock().unwrap_or_else(|error| error.into_inner());
+            let mut slot = self
+                .output_slot
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let mut previous = slot.take();
             if let Some(previous) = &mut previous {
                 // Keep the oldest consumer while coalescing to the latest pool.
@@ -289,17 +349,26 @@ impl AudioControls {
     /// Kill the active yt-dlp child, if any. Safe to call any time; it is a
     /// no-op while playing local files. Idempotent.
     pub fn interrupt(&self) {
-        let buffer = self.buffer_slot.lock().unwrap_or_else(|e| e.into_inner())
-            .as_ref().and_then(Weak::upgrade);
+        let buffer = self
+            .buffer_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
         if let Some(buffer) = buffer {
             buffer.cancel();
         }
         let interrupted = if let Ok(mut slot) = self.child_slot.lock()
-            && let Some(child) = slot.as_mut() {
-                let _ = child.kill();
-                true
-            } else { false };
-        if interrupted { log_warn!("AUDIO", "interrupt: killed external source process"); }
+            && let Some(child) = slot.as_mut()
+        {
+            let _ = child.kill();
+            true
+        } else {
+            false
+        };
+        if interrupted {
+            log_warn!("AUDIO", "interrupt: killed external source process");
+        }
     }
 
     pub fn hook(self) -> Arc<dyn Fn() + Send + Sync> {
@@ -308,9 +377,15 @@ impl AudioControls {
 
     pub fn suspend_hook(self) -> Arc<dyn Fn() + Send + Sync> {
         Arc::new(move || {
-            let buffer = self.buffer_slot.lock().unwrap_or_else(|e| e.into_inner())
-                .as_ref().and_then(Weak::upgrade);
-            if let Some(buffer) = buffer { buffer.retire_readers(); }
+            let buffer = self
+                .buffer_slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(Weak::upgrade);
+            if let Some(buffer) = buffer {
+                buffer.retire_readers();
+            }
         })
     }
 }
@@ -329,8 +404,14 @@ pub fn spawn(
     cmds: CommandReceiver,
     status_tx: Sender<Status>,
 ) -> AudioHandles {
-    let rate = match shared.sample_rate() { 0 => 48_000, n => n };
-    let channels = match shared.device_channels() { 0 => 2, n => n as usize };
+    let rate = match shared.sample_rate() {
+        0 => 48_000,
+        n => n,
+    };
+    let channels = match shared.device_channels() {
+        0 => 2,
+        n => n as usize,
+    };
     let (chunk_tx, chunk_rx) = chunk_channel(rate, channels, buffer_depth(rate));
     let (drained_tx, drained_rx) = drain_channel(&cmds.wake);
     let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -342,11 +423,32 @@ pub fn spawn(
             let child_slot = Arc::clone(&child_slot);
             let buffer_slot = buffer_slot.clone();
             let output_slot = output_slot.clone();
-            move || run_decoder(shared, cmds, status_tx, chunk_tx, drained_rx,
-                AudioControls { child_slot, buffer_slot, output_slot })
+            move || {
+                run_decoder(
+                    shared,
+                    cmds,
+                    status_tx,
+                    chunk_tx,
+                    drained_rx,
+                    AudioControls {
+                        child_slot,
+                        buffer_slot,
+                        output_slot,
+                    },
+                )
+            }
         })
         .expect("spawn decoder thread");
-    AudioHandles { chunk_rx, drained_tx, decoder, controls: AudioControls { child_slot, buffer_slot, output_slot } }
+    AudioHandles {
+        chunk_rx,
+        drained_tx,
+        decoder,
+        controls: AudioControls {
+            child_slot,
+            buffer_slot,
+            output_slot,
+        },
+    }
 }
 
 // ── Output stream (owned by the main thread; WASAPI event-driven) ───────────
@@ -382,17 +484,27 @@ pub(crate) struct OutputSignals {
 
 impl OutputSignals {
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self { stream_state: AtomicU64::new(4), consumed_failure: AtomicU64::new(0), reported_startup: AtomicU64::new(0),
-            changed: AtomicBool::new(false), endpoint_changed: AtomicBool::new(false),
-            endpoint_hash: AtomicU64::new(0), pending: AtomicBool::new(false) })
+        Arc::new(Self {
+            stream_state: AtomicU64::new(4),
+            consumed_failure: AtomicU64::new(0),
+            reported_startup: AtomicU64::new(0),
+            changed: AtomicBool::new(false),
+            endpoint_changed: AtomicBool::new(false),
+            endpoint_hash: AtomicU64::new(0),
+            pending: AtomicBool::new(false),
+        })
     }
 
     fn notify(&self) {
-        if !self.pending.swap(true, Ordering::AcqRel) { crate::ui::wake_output(); }
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            crate::ui::wake_output();
+        }
     }
 
     pub(crate) fn device_changed(&self) {
-        if !self.changed.swap(true, Ordering::AcqRel) { self.notify(); }
+        if !self.changed.swap(true, Ordering::AcqRel) {
+            self.notify();
+        }
     }
 
     pub(crate) fn endpoint_changed(&self) {
@@ -401,7 +513,8 @@ impl OutputSignals {
     }
 
     pub(crate) fn set_endpoint(&self, endpoint: &str) {
-        self.endpoint_hash.store(endpoint_hash(endpoint.encode_utf16()), Ordering::Release);
+        self.endpoint_hash
+            .store(endpoint_hash(endpoint.encode_utf16()), Ordering::Release);
     }
 
     pub(crate) fn is_current_endpoint(&self, hash: u64) -> bool {
@@ -410,7 +523,9 @@ impl OutputSignals {
 
     fn stream_error(&self, epoch: u64, error: &cpal::Error) {
         let state = self.stream_state.load(Ordering::Acquire);
-        if state & !3 != epoch { return; }
+        if state & !3 != epoch {
+            return;
+        }
         let flag = match error.kind() {
             cpal::ErrorKind::DeviceChanged => 2,
             cpal::ErrorKind::Xrun | cpal::ErrorKind::RealtimeDenied => return,
@@ -418,7 +533,12 @@ impl OutputSignals {
         };
         // Epoch and flags share one CAS: a retirement racing an error or
         // advisory cannot latch that event onto the replacement's epoch.
-        if state & flag == 0 && self.stream_state.compare_exchange(state, state | flag, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        if state & flag == 0
+            && self
+                .stream_state
+                .compare_exchange(state, state | flag, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
             self.notify();
         }
     }
@@ -426,21 +546,44 @@ impl OutputSignals {
     // Synchronously initialized on the output worker, published on its owner.
     // A retired worker cannot publish scheduling results for a replacement.
     #[cfg(windows)]
-    fn publish_startup(&self, epoch: u64, result: Option<&cpal::platform::OutputWorkerStartup>) -> bool {
+    fn publish_startup(
+        &self,
+        epoch: u64,
+        result: Option<&cpal::platform::OutputWorkerStartup>,
+    ) -> bool {
         if self.stream_state.load(Ordering::Acquire) & !3 != epoch
-            || self.reported_startup.swap(epoch, Ordering::AcqRel) == epoch { return false; }
+            || self.reported_startup.swap(epoch, Ordering::AcqRel) == epoch
+        {
+            return false;
+        }
         match result {
-            Some(result) => log_info!("AUDIO", "output worker epoch={epoch} requested={} tid={} verified_thread_priority={:?} promotion={:?}",
-                if cfg!(feature = "output-realtime") { "CPAL realtime (MMCSS, TIME_CRITICAL fallback)" } else { "disabled" },
-                result.thread_id, result.thread_priority, result.promotion),
-            None => log_warn!("AUDIO", "output worker epoch={epoch}: startup result unavailable; priority and MMCSS unverified"),
+            Some(result) => log_info!(
+                "AUDIO",
+                "output worker epoch={epoch} requested={} tid={} verified_thread_priority={:?} promotion={:?}",
+                if cfg!(feature = "output-realtime") {
+                    "CPAL realtime (MMCSS, TIME_CRITICAL fallback)"
+                } else {
+                    "disabled"
+                },
+                result.thread_id,
+                result.thread_priority,
+                result.promotion
+            ),
+            None => log_warn!(
+                "AUDIO",
+                "output worker epoch={epoch}: startup result unavailable; priority and MMCSS unverified"
+            ),
         }
         true
     }
 
     fn next_epoch(&self) -> u64 {
-        let previous = self.stream_state.try_update(Ordering::AcqRel, Ordering::Relaxed,
-            |state| Some((state & !3).wrapping_add(4))).unwrap();
+        let previous = self
+            .stream_state
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |state| {
+                Some((state & !3).wrapping_add(4))
+            })
+            .unwrap();
         (previous & !3).wrapping_add(4)
     }
 
@@ -448,16 +591,28 @@ impl OutputSignals {
         self.pending.store(false, Ordering::Release);
         let mut changed = self.changed.swap(false, Ordering::AcqRel);
         let state = self.stream_state.load(Ordering::Acquire);
-        if state & 2 != 0 && self.stream_state.compare_exchange(state, state & !2, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        if state & 2 != 0
+            && self
+                .stream_state
+                .compare_exchange(state, state & !2, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
             changed = true;
         }
-        let failed = state & 1 != 0 && self.consumed_failure.swap(state & !3, Ordering::AcqRel) != state & !3;
-        (changed, failed, self.endpoint_changed.swap(false, Ordering::AcqRel))
+        let failed = state & 1 != 0
+            && self.consumed_failure.swap(state & !3, Ordering::AcqRel) != state & !3;
+        (
+            changed,
+            failed,
+            self.endpoint_changed.swap(false, Ordering::AcqRel),
+        )
     }
 }
 
 pub(crate) fn endpoint_hash(id: impl Iterator<Item = u16>) -> u64 {
-    id.fold(0xcbf29ce484222325, |hash, code| (hash ^ code as u64).wrapping_mul(0x100000001b3))
+    id.fold(0xcbf29ce484222325, |hash, code| {
+        (hash ^ code as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -475,44 +630,98 @@ impl OutputKey {
         let endpoint = crate::audio_device::default_device_id().ok();
         #[cfg(not(windows))]
         let endpoint: Option<String> = None;
-        Self { endpoint: endpoint.unwrap_or_else(|| device.description().map(|description| description.name().to_owned()).unwrap_or_default()),
-            rate: config.sample_rate(), channels: config.channels(), format: config.sample_format() }
+        Self {
+            endpoint: endpoint.unwrap_or_else(|| {
+                device
+                    .description()
+                    .map(|description| description.name().to_owned())
+                    .unwrap_or_default()
+            }),
+            rate: config.sample_rate(),
+            channels: config.channels(),
+            format: config.sample_format(),
+        }
     }
 }
 
 impl AudioOut {
+    #[cfg(feature = "release-diagnostics")]
+    pub(crate) fn diagnostic_pcm_primed(&self, generation: u64) -> bool {
+        self.receiver
+            .as_ref()
+            .is_some_and(|r| r.state.ready_generation.load(Ordering::Acquire) == generation)
+    }
     #[cfg(feature = "release-diagnostics")]
     pub(crate) fn diagnostic_output_key(&self) -> Option<String> {
         self.key.as_ref().map(|key| format!("{key:?}"))
     }
     #[cfg(feature = "release-diagnostics")]
     pub(crate) fn diagnostic_counters(&self) -> (u64, u64, usize) {
-        self.receiver.as_ref().map_or((0, 0, 0), |r| (
-            r.state.underrun_frames.load(Ordering::Relaxed),
-            r.state.rendered_frames.load(Ordering::Relaxed),
-            (r.queue.capacity() + 1) * CHUNK_FRAMES * self.shared.as_ref().map_or(0, |s| s.device_channels() as usize) * size_of::<f32>(),
-        ))
+        self.receiver.as_ref().map_or((0, 0, 0), |r| {
+            (
+                r.state.underrun_frames.load(Ordering::Relaxed),
+                r.state.rendered_frames.load(Ordering::Relaxed),
+                (r.queue.capacity() + 1)
+                    * CHUNK_FRAMES
+                    * self
+                        .shared
+                        .as_ref()
+                        .map_or(0, |s| s.device_channels() as usize)
+                    * size_of::<f32>(),
+            )
+        })
     }
     pub fn new(stream: Option<cpal::Stream>) -> Self {
-        Self { stream, playing: false, signals: OutputSignals::new(), receiver: None, drained: None,
-            shared: None, controls: None, key: None, error_recovery_used: false,
-            #[cfg(windows)] notifications: None }
+        Self {
+            stream,
+            playing: false,
+            signals: OutputSignals::new(),
+            receiver: None,
+            drained: None,
+            shared: None,
+            controls: None,
+            key: None,
+            error_recovery_used: false,
+            #[cfg(windows)]
+            notifications: None,
+        }
     }
 
-    pub fn managed(device: Result<(cpal::Device, cpal::SupportedStreamConfig), String>,
-        receiver: ChunkReceiver, drained: DrainSignal, shared: Arc<SharedState>, controls: AudioControls) -> Self {
+    pub fn managed(
+        device: Result<(cpal::Device, cpal::SupportedStreamConfig), String>,
+        receiver: ChunkReceiver,
+        drained: DrainSignal,
+        shared: Arc<SharedState>,
+        controls: AudioControls,
+    ) -> Self {
         let mut output = Self::new(None);
         let epoch = output.signals.stream_state.load(Ordering::Relaxed);
         let stream = device.and_then(|(device, config)| {
             output.key = Some(OutputKey::new(&device, &config));
-            output.signals.set_endpoint(&output.key.as_ref().unwrap().endpoint);
-            build_output_stream(device, config, receiver.clone(), drained.clone(), shared.clone(), output.signals.clone(), epoch)
+            output
+                .signals
+                .set_endpoint(&output.key.as_ref().unwrap().endpoint);
+            build_output_stream(
+                device,
+                config,
+                receiver.clone(),
+                drained.clone(),
+                shared.clone(),
+                output.signals.clone(),
+                epoch,
+            )
         });
         match stream {
             Ok(stream) => output.stream = Some(stream),
             Err(error) => {
-                log_warn!("AUDIO", "output unavailable: {error}; awaiting device recovery");
-                output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
+                log_warn!(
+                    "AUDIO",
+                    "output unavailable: {error}; awaiting device recovery"
+                );
+                output.signals.stream_error(
+                    epoch,
+                    &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+                );
             }
         }
         output.receiver = Some(receiver);
@@ -523,7 +732,9 @@ impl AudioOut {
     }
 
     pub fn start_notifications(&mut self) {
-        if self.controls.is_none() { return; }
+        if self.controls.is_none() {
+            return;
+        }
         #[cfg(windows)]
         match crate::audio_device::DeviceNotifications::new(self.signals.clone()) {
             Ok(notifications) => self.notifications = Some(notifications),
@@ -536,52 +747,107 @@ impl AudioOut {
     /// Always invoked on the output's owning/UI thread, never from a callback.
     pub fn handle_device_events(&mut self, broker: &mut Broker) {
         let (changed, failed, endpoint_changed) = self.signals.take();
-        if (!changed && !failed) || self.controls.is_none() { return; }
-        if failed { log_warn!("AUDIO", "output stream invalidated; recovering on owner thread"); }
-        if changed { self.error_recovery_used = false; }
+        if (!changed && !failed) || self.controls.is_none() {
+            return;
+        }
+        if failed {
+            log_warn!(
+                "AUDIO",
+                "output stream invalidated; recovering on owner thread"
+            );
+        }
+        if changed {
+            self.error_recovery_used = false;
+        }
         // A replacement that has rendered at least half a second is healthy.
         // Another later disconnect gets a fresh retry; an immediately failing
         // replacement waits for notifications instead of rebuilding in a loop.
-        if failed && self.receiver.as_ref().is_some_and(|receiver|
-            receiver.state.rendered_frames.load(Ordering::Relaxed) >= self.key.as_ref().map_or(24_000, |key| key.rate as u64 / 2)) {
+        if failed
+            && self.receiver.as_ref().is_some_and(|receiver| {
+                receiver.state.rendered_frames.load(Ordering::Relaxed)
+                    >= self.key.as_ref().map_or(24_000, |key| key.rate as u64 / 2)
+            })
+        {
             self.error_recovery_used = false;
         }
         let candidate = query_output_device();
-        if !failed && !endpoint_changed && self.stream.is_some() && candidate.as_ref().is_ok_and(|(device, config)|
-            self.key.as_ref() == Some(&OutputKey::new(device, config))) { return; }
+        if !failed
+            && !endpoint_changed
+            && self.stream.is_some()
+            && candidate.as_ref().is_ok_and(|(device, config)| {
+                self.key.as_ref() == Some(&OutputKey::new(device, config))
+            })
+        {
+            return;
+        }
         broker.audio_output_lost();
         self.playing = false;
         let epoch = self.signals.next_epoch(); // reject errors from the stream being dropped
         self.stream = None; // CPAL joins the retired worker before reopening
         if failed && self.error_recovery_used && !changed {
-            log_warn!("AUDIO", "recovery stream failed; waiting for the next endpoint notification");
+            log_warn!(
+                "AUDIO",
+                "recovery stream failed; waiting for the next endpoint notification"
+            );
             return;
         }
-        if failed { self.error_recovery_used = true; }
+        if failed {
+            self.error_recovery_used = true;
+        }
         let (device, config) = match candidate {
             Ok(candidate) => candidate,
-            Err(error) => { log_warn!("AUDIO", "{error}; playback suspended until a device returns"); return; }
+            Err(error) => {
+                log_warn!(
+                    "AUDIO",
+                    "{error}; playback suspended until a device returns"
+                );
+                return;
+            }
         };
         let key = OutputKey::new(&device, &config);
         let rate = config.sample_rate();
         let channels = config.channels().max(1) as usize;
         let (sender, receiver) = chunk_channel(rate, channels, buffer_depth(rate));
         let shared = self.shared.as_ref().unwrap();
-        let stream = match build_output_stream(device, config, receiver.clone(), self.drained.as_ref().unwrap().clone(),
-            shared.clone(), self.signals.clone(), epoch) {
+        let stream = match build_output_stream(
+            device,
+            config,
+            receiver.clone(),
+            self.drained.as_ref().unwrap().clone(),
+            shared.clone(),
+            self.signals.clone(),
+            epoch,
+        ) {
             Ok(stream) => stream,
-            Err(error) => { log_warn!("AUDIO", "device rebuild failed: {error}; awaiting another device event"); return; }
+            Err(error) => {
+                log_warn!(
+                    "AUDIO",
+                    "device rebuild failed: {error}; awaiting another device event"
+                );
+                return;
+            }
         };
         // The old stream has stopped, so only now may the device clock/layout change.
         shared.set_sample_rate(rate);
         shared.set_device_channels(channels as u32);
         let retired = self.receiver.replace(receiver).unwrap();
-        self.controls.as_ref().unwrap().replace_output(OutputReplacement { sender, retired, epoch });
+        self.controls
+            .as_ref()
+            .unwrap()
+            .replace_output(OutputReplacement {
+                sender,
+                retired,
+                epoch,
+            });
         self.key = Some(key);
-        self.signals.set_endpoint(&self.key.as_ref().unwrap().endpoint);
+        self.signals
+            .set_endpoint(&self.key.as_ref().unwrap().endpoint);
         self.stream = Some(stream);
         broker.audio_output_prepared(epoch); // Stop wakes the one decoder to install the pool
-        log_info!("AUDIO", "replacement output ready: {rate} Hz, {channels} ch; awaiting decoder acknowledgement");
+        log_info!(
+            "AUDIO",
+            "replacement output ready: {rate} Hz, {channels} ch; awaiting decoder acknowledgement"
+        );
     }
 
     pub fn set_playing(&mut self, on: bool) {
@@ -611,7 +877,11 @@ impl AudioOut {
         log_info!(
             "AUDIO",
             "output {}",
-            if on { "running" } else { "paused — zero CPU until resumed" }
+            if on {
+                "running"
+            } else {
+                "paused — zero CPU until resumed"
+            }
         );
     }
 }
@@ -620,21 +890,28 @@ impl Drop for AudioOut {
     fn drop(&mut self) {
         self.signals.next_epoch();
         #[cfg(windows)]
-        { self.notifications = None; } // unregister before OLE/COM apartment teardown
+        {
+            self.notifications = None;
+        } // unregister before OLE/COM apartment teardown
         self.stream = None;
     }
 }
 
 /// Select the native device layout before the decoder/pool starts. The UI
 /// later plays/pauses its stream with AudioOut on phase transitions.
-pub fn output_device(shared: &SharedState) -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
+pub fn output_device(
+    shared: &SharedState,
+) -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
     let (device, supported) = query_output_device()?;
     use cpal::traits::DeviceTrait;
     let device_rate = supported.sample_rate();
     let device_channels = supported.channels().max(1);
     shared.set_sample_rate(device_rate);
     shared.set_device_channels(device_channels as u32);
-    let name = device.description().map(|description| description.name().to_owned()).unwrap_or_else(|_| "<unnamed>".into());
+    let name = device
+        .description()
+        .map(|description| description.name().to_owned())
+        .unwrap_or_else(|_| "<unnamed>".into());
     log_info!(
         "AUDIO",
         "output: {name} — {device_rate} Hz, {device_channels} ch, {:?}",
@@ -646,13 +923,21 @@ pub fn output_device(shared: &SharedState) -> Result<(cpal::Device, cpal::Suppor
 fn query_output_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig), String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let host = cpal::default_host();
-    let default = host.default_output_device().ok_or("no default output device")?;
+    let default = host
+        .default_output_device()
+        .ok_or("no default output device")?;
     // Resolve a concrete endpoint before activation. The app owns default-device
     // changes via IMMNotificationClient; CPAL's auto-follow activation can move
     // a UI STA into a neutral apartment and break subsequent OLE/COM calls.
-    let id = default.id().map_err(|error| format!("default endpoint ID: {error}"))?;
-    let device = host.device_by_id(&id).ok_or("default endpoint disappeared during enumeration")?;
-    let supported = device.default_output_config().map_err(|error| format!("default output config: {error}"))?;
+    let id = default
+        .id()
+        .map_err(|error| format!("default endpoint ID: {error}"))?;
+    let device = host
+        .device_by_id(&id)
+        .ok_or("default endpoint disappeared during enumeration")?;
+    let supported = device
+        .default_output_config()
+        .map_err(|error| format!("default output config: {error}"))?;
     Ok((device, supported))
 }
 
@@ -666,12 +951,20 @@ pub fn open_output_stream(
 ) -> Result<cpal::Stream, String> {
     let signals = OutputSignals::new();
     let epoch = signals.stream_state.load(Ordering::Relaxed);
-    build_output_stream(device, supported, chunk_rx, drained_tx, shared, signals, epoch)
+    build_output_stream(
+        device, supported, chunk_rx, drained_tx, shared, signals, epoch,
+    )
 }
 
-fn build_output_stream(device: cpal::Device, supported: cpal::SupportedStreamConfig,
-    chunk_rx: ChunkReceiver, drained_tx: DrainSignal, shared: Arc<SharedState>,
-    signals: Arc<OutputSignals>, epoch: u64) -> Result<cpal::Stream, String> {
+fn build_output_stream(
+    device: cpal::Device,
+    supported: cpal::SupportedStreamConfig,
+    chunk_rx: ChunkReceiver,
+    drained_tx: DrainSignal,
+    shared: Arc<SharedState>,
+    signals: Arc<OutputSignals>,
+    epoch: u64,
+) -> Result<cpal::Stream, String> {
     use cpal::traits::DeviceTrait;
     let device_channels = supported.channels().max(1);
 
@@ -726,13 +1019,19 @@ trait OutputSample: Copy + Send + 'static {
     fn from_pcm(sample: f32) -> Self;
 }
 impl OutputSample for f32 {
-    fn from_pcm(sample: f32) -> Self { sample }
+    fn from_pcm(sample: f32) -> Self {
+        sample
+    }
 }
 impl OutputSample for i16 {
-    fn from_pcm(sample: f32) -> Self { (sample.clamp(-1.0, 1.0) * 32767.0) as i16 }
+    fn from_pcm(sample: f32) -> Self {
+        (sample.clamp(-1.0, 1.0) * 32767.0) as i16
+    }
 }
 impl OutputSample for u16 {
-    fn from_pcm(sample: f32) -> Self { ((sample.clamp(-1.0, 1.0) + 1.0) * 32767.5).round() as u16 }
+    fn from_pcm(sample: f32) -> Self {
+        ((sample.clamp(-1.0, 1.0) + 1.0) * 32767.5).round() as u16
+    }
 }
 
 struct PcmOutput {
@@ -745,18 +1044,37 @@ struct PcmOutput {
 
 impl PcmOutput {
     fn new(chunks: ChunkReceiver) -> Self {
-        assert!(chunks.state.rendering.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok(),
-            "a PCM pool has exactly one rendering/recycling owner");
-        Self { chunks, current: None, pos: 0, started: u64::MAX, notified_eof: u64::MAX }
+        assert!(
+            chunks
+                .state
+                .rendering
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "a PCM pool has exactly one rendering/recycling owner"
+        );
+        Self {
+            chunks,
+            current: None,
+            pos: 0,
+            started: u64::MAX,
+            notified_eof: u64::MAX,
+        }
     }
 
     #[cfg(test)]
     fn render<T: OutputSample>(&mut self, data: &mut [T], shared: &SharedState, channels: usize) {
         let events = self.render_inner(data, shared, channels);
-        if let Some(wake) = self.chunks.state.wake.get() { wake.notify(events); }
+        if let Some(wake) = self.chunks.state.wake.get() {
+            wake.notify(events);
+        }
     }
 
-    fn render_inner<T: OutputSample>(&mut self, data: &mut [T], shared: &SharedState, channels: usize) -> u32 {
+    fn render_inner<T: OutputSample>(
+        &mut self,
+        data: &mut [T],
+        shared: &SharedState,
+        channels: usize,
+    ) -> u32 {
         let generation = shared.generation();
         let mut written = 0;
         let mut events = 0;
@@ -768,47 +1086,76 @@ impl PcmOutput {
             // A load/seek may race this callback. Leave freshly queued audio
             // for the next invocation instead of discarding its new generation
             // using this invocation's older snapshot.
-            if shared.generation() != generation { break; }
-            if self.current.as_ref().is_some_and(|chunk| chunk.generation != generation || self.pos >= chunk.len) {
+            if shared.generation() != generation {
+                break;
+            }
+            if self
+                .current
+                .as_ref()
+                .is_some_and(|chunk| chunk.generation != generation || self.pos >= chunk.len)
+            {
                 recycle(&self.chunks.recycle, self.current.take().unwrap());
                 events |= CAPACITY;
                 self.pos = 0;
             }
             if self.current.is_none() {
                 match self.chunks.queue.try_recv() {
-                    Ok(chunk) => { self.current = Some(chunk); claims += 1; events |= CAPACITY; continue; }
+                    Ok(chunk) => {
+                        self.current = Some(chunk);
+                        claims += 1;
+                        events |= CAPACITY;
+                        continue;
+                    }
                     Err(_) => break,
                 }
             }
             // Consume stale generations above even during priming, so a full
             // old queue cannot prevent a newly loaded/seeked source filling.
-            if self.chunks.state.ready_generation.load(Ordering::Acquire) != generation { break; }
+            if self.chunks.state.ready_generation.load(Ordering::Acquire) != generation {
+                break;
+            }
             self.started = generation;
             let chunk = self.current.as_ref().unwrap();
             let n = (chunk.len - self.pos).min(data.len() - written);
-            for (dst, &src) in data[written..written + n].iter_mut().zip(&chunk.samples()[self.pos..self.pos + n]) {
+            for (dst, &src) in data[written..written + n]
+                .iter_mut()
+                .zip(&chunk.samples()[self.pos..self.pos + n])
+            {
                 *dst = T::from_pcm(src);
             }
             self.pos += n;
             written += n;
         }
         data[written..].fill(T::from_pcm(0.0));
-        if shared.generation() != generation { return events; }
+        if shared.generation() != generation {
+            return events;
+        }
         // Silence while priming or starved must not move the track playhead.
         shared.add_frames_played((written / channels) as u64);
         #[cfg(all(windows, feature = "release-diagnostics"))]
-        if written > 0 { crate::ui::performance::pcm_delivered(generation); }
-        self.chunks.state.rendered_frames.fetch_add((written / channels) as u64, Ordering::Relaxed);
+        if written > 0 {
+            crate::ui::performance::pcm_delivered(generation);
+        }
+        self.chunks
+            .state
+            .rendered_frames
+            .fetch_add((written / channels) as u64, Ordering::Relaxed);
         let eof = self.chunks.state.eof_generation.load(Ordering::Acquire) == generation;
         if written < data.len() && self.started == generation && !eof {
-            self.chunks.state.underrun_frames.fetch_add(((data.len() - written) / channels) as u64, Ordering::Relaxed);
+            self.chunks.state.underrun_frames.fetch_add(
+                ((data.len() - written) / channels) as u64,
+                Ordering::Relaxed,
+            );
         }
         events
     }
 
     fn drained(&self, generation: u64) -> bool {
         self.chunks.state.eof_generation.load(Ordering::Acquire) == generation
-            && self.current.as_ref().is_none_or(|chunk| chunk.generation != generation || self.pos >= chunk.len)
+            && self
+                .current
+                .as_ref()
+                .is_none_or(|chunk| chunk.generation != generation || self.pos >= chunk.len)
             && self.chunks.queue.is_empty()
     }
 }
@@ -818,8 +1165,12 @@ impl PcmOutput {
 /// conversion and atomic playhead/diagnostic updates occur here.
 impl Drop for PcmOutput {
     fn drop(&mut self) {
-        if let Some(chunk) = self.current.take() { recycle(&self.chunks.recycle, chunk); }
-        if let Some(wake) = self.chunks.state.wake.get() { wake.notify(CAPACITY); }
+        if let Some(chunk) = self.current.take() {
+            recycle(&self.chunks.recycle, chunk);
+        }
+        if let Some(wake) = self.chunks.state.wake.get() {
+            wake.notify(CAPACITY);
+        }
         self.chunks.state.rendering.store(false, Ordering::Release);
     }
 }
@@ -832,8 +1183,14 @@ fn popper<T: OutputSample>(
 ) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) + Send + 'static {
     let mut output = PcmOutput::new(chunk_rx);
     move |data, _info| {
+        #[cfg(all(windows, feature = "release-diagnostics"))]
+        crate::ui::performance::callback_entered(shared.generation());
         #[cfg(test)]
-        let timing = output.chunks.state.timing.start(_info, data.len() / channels as usize);
+        let timing = output
+            .chunks
+            .state
+            .timing
+            .start(_info, data.len() / channels as usize);
         let mut events = output.render_inner(data, &shared, channels as usize);
         let generation = shared.generation();
         if output.notified_eof != generation && output.drained(generation) {
@@ -873,12 +1230,22 @@ struct SuspendedTrack {
     title: Option<String>,
 }
 
-fn install_output(controls: &AudioControls, chunk_tx: &mut ChunkSender, status_tx: &Sender<Status>) {
-    let replacement = controls.output_slot.lock().unwrap_or_else(|error| error.into_inner()).take();
+fn install_output(
+    controls: &AudioControls,
+    chunk_tx: &mut ChunkSender,
+    status_tx: &Sender<Status>,
+) {
+    let replacement = controls
+        .output_slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
     if let Some(replacement) = replacement {
         *chunk_tx = replacement.sender;
         drop(replacement.retired);
-        let _ = status_tx.send(Status::OutputReady { epoch: replacement.epoch });
+        let _ = status_tx.send(Status::OutputReady {
+            epoch: replacement.epoch,
+        });
         crate::ui::wake_status();
     }
 }
@@ -891,7 +1258,14 @@ fn run_decoder(
     drained_rx: DrainSignal,
     controls: AudioControls,
 ) {
-    run_decoder_with_output(shared, cmds, status_tx, chunk_tx, drained_rx, (controls, None));
+    run_decoder_with_output(
+        shared,
+        cmds,
+        status_tx,
+        chunk_tx,
+        drained_rx,
+        (controls, None),
+    );
 }
 
 fn run_decoder_with_output(
@@ -907,7 +1281,8 @@ fn run_decoder_with_output(
     let mut cache: Option<StreamCache> = None;
     while let Ok(cmd) = cmds.recv() {
         if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown) {
-            cache = None; suspended = None;
+            cache = None;
+            suspended = None;
             chunk_tx.begin(shared.generation());
         }
         install_output(&controls, &mut chunk_tx, &status_tx);
@@ -918,20 +1293,42 @@ fn run_decoder_with_output(
             DecoderCmd::SuspendOutput | DecoderCmd::RefreshOutput => continue,
             // Nothing is open — a seek has nothing to move.
             DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_) => continue,
-            DecoderCmd::Stop => { cache = None; suspended = None; continue; }
+            DecoderCmd::Stop => {
+                cache = None;
+                suspended = None;
+                continue;
+            }
             DecoderCmd::Shutdown => break,
         };
         let mut next = Some(first);
         'tracks: while let Some((source, load_id, recovering)) = next.take() {
-            if load_id != shared.load_id() { break 'tracks; }
+            if load_id != shared.load_id() {
+                break 'tracks;
+            }
             select_stream_cache(&mut cache, &source, shared.loop_enabled());
-            let exit = play_source_with_output(&PlaybackContext {
-                shared: &shared, cmds: &cmds, status_tx: &status_tx,
-                chunk_tx: &chunk_tx, drained_rx: &drained_rx,
-                child_slot: &controls.child_slot, buffer_slot: &controls.buffer_slot,
-            }, &mut cache, &mut suspended, source, load_id, recovering);
-            if !matches!(exit, PlayExit::Eof) { chunk_tx.begin(shared.generation()); }
-            if matches!(exit, PlayExit::Stopped | PlayExit::Failed) { cache = None; suspended = None; }
+            let exit = play_source_with_output(
+                &PlaybackContext {
+                    shared: &shared,
+                    cmds: &cmds,
+                    status_tx: &status_tx,
+                    chunk_tx: &chunk_tx,
+                    drained_rx: &drained_rx,
+                    child_slot: &controls.child_slot,
+                    buffer_slot: &controls.buffer_slot,
+                },
+                &mut cache,
+                &mut suspended,
+                source,
+                load_id,
+                recovering,
+            );
+            if !matches!(exit, PlayExit::Eof) {
+                chunk_tx.begin(shared.generation());
+            }
+            if matches!(exit, PlayExit::Stopped | PlayExit::Failed) {
+                cache = None;
+                suspended = None;
+            }
             // RefreshOutput can be consumed while parked on the old PCM pool.
             // Acknowledge here too; otherwise the broker would wait forever.
             install_output(&controls, &mut chunk_tx, &status_tx);
@@ -940,10 +1337,16 @@ fn run_decoder_with_output(
                 PlayExit::RecoverOutput(s, load_id) => next = Some((s, load_id, true)),
                 PlayExit::Suspended => break 'tracks,
                 PlayExit::Eof => {
-                    if !shared.loop_enabled() { cache = None; }
+                    if !shared.loop_enabled() {
+                        cache = None;
+                    }
                     break 'tracks;
                 }
-                PlayExit::Stopped | PlayExit::Failed => { cache = None; suspended = None; break 'tracks; }
+                PlayExit::Stopped | PlayExit::Failed => {
+                    cache = None;
+                    suspended = None;
+                    break 'tracks;
+                }
                 PlayExit::Shutdown | PlayExit::SinkGone => {
                     log_info!("DECODER", "offline");
                     drop(status_tx);
@@ -968,7 +1371,11 @@ struct StreamCache {
 /// Release the previous allocation before starting another source. Reuse
 /// only a completed, successful buffer for the exact looping track.
 fn select_stream_cache(cache: &mut Option<StreamCache>, source: &Source, looping: bool) {
-    if !looping || cache.as_ref().is_some_and(|cached| cached.source != *source || !cached.buffer.complete()) {
+    if !looping
+        || cache
+            .as_ref()
+            .is_some_and(|cached| cached.source != *source || !cached.buffer.complete())
+    {
         *cache = None;
     }
 }
@@ -985,53 +1392,89 @@ impl DownloadWorker {
         Self::start_inner(input, slot, None)
     }
 
-    fn start_source(input: impl Read + Send + 'static, slot: &BufferSlot,
-        child_slot: &Arc<Mutex<Option<Child>>>, pid: u32) -> Result<Self, String> {
+    fn start_source(
+        input: impl Read + Send + 'static,
+        slot: &BufferSlot,
+        child_slot: &Arc<Mutex<Option<Child>>>,
+        pid: u32,
+    ) -> Result<Self, String> {
         Self::start_inner(input, slot, Some((child_slot.clone(), pid)))
     }
 
-    fn start_inner(mut input: impl Read + Send + 'static, slot: &BufferSlot,
-        source: Option<(Arc<Mutex<Option<Child>>>, u32)>) -> Result<Self, String> {
+    fn start_inner(
+        mut input: impl Read + Send + 'static,
+        slot: &BufferSlot,
+        source: Option<(Arc<Mutex<Option<Child>>>, u32)>,
+    ) -> Result<Self, String> {
         let buffer = StreamBuffer::new();
         *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&buffer));
-        let deadline = source.map(|(child_slot, pid)| source_deadline(&child_slot, pid,
-            Some(buffer.clone()), Duration::from_secs(60), "stream download stalled"))
-            .transpose().map_err(|error| {
+        let deadline = source
+            .map(|(child_slot, pid)| {
+                source_deadline(
+                    &child_slot,
+                    pid,
+                    Some(buffer.clone()),
+                    Duration::from_secs(60),
+                    "stream download stalled",
+                )
+            })
+            .transpose()
+            .map_err(|error| {
                 *slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
                 error.to_string()
             })?;
         let producer = buffer.clone();
-        let worker = thread::Builder::new().name("kyouko-buffer".into()).spawn(move || {
-            let result = (|| {
-                let mut chunk = [0u8; 32 * 1024];
-                loop {
-                    let count = input.read(&mut chunk)?;
-                    if count == 0 { return Ok(()); }
-                    producer.append(&chunk[..count])?;
-                    if let Some(deadline) = &deadline { deadline.progress(Duration::from_secs(30)); }
-                }
-            })();
-            producer.finish(result);
-            drop(deadline); // a fully downloaded/paused track has no watchdog
-        }).map_err(|e| {
-            *slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
-            format!("cannot start stream buffer: {e}")
-        })?;
-        Ok(Self { buffer, worker: Some(worker), slot: slot.clone() })
+        let worker = thread::Builder::new()
+            .name("kyouko-buffer".into())
+            .spawn(move || {
+                let result = (|| {
+                    let mut chunk = [0u8; 32 * 1024];
+                    loop {
+                        let count = input.read(&mut chunk)?;
+                        if count == 0 {
+                            return Ok(());
+                        }
+                        producer.append(&chunk[..count])?;
+                        if let Some(deadline) = &deadline {
+                            deadline.progress(Duration::from_secs(30));
+                        }
+                    }
+                })();
+                producer.finish(result);
+                drop(deadline); // a fully downloaded/paused track has no watchdog
+            })
+            .map_err(|e| {
+                *slot.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                format!("cannot start stream buffer: {e}")
+            })?;
+        Ok(Self {
+            buffer,
+            worker: Some(worker),
+            slot: slot.clone(),
+        })
     }
 }
 
-fn source_deadline(slot: &Arc<Mutex<Option<Child>>>, pid: u32,
-    buffer: Option<Arc<StreamBuffer>>, timeout: Duration, reason: &'static str) -> std::io::Result<crate::deadline::Deadline> {
+fn source_deadline(
+    slot: &Arc<Mutex<Option<Child>>>,
+    pid: u32,
+    buffer: Option<Arc<StreamBuffer>>,
+    timeout: Duration,
+    reason: &'static str,
+) -> std::io::Result<crate::deadline::Deadline> {
     let slot = slot.clone();
     crate::deadline::Deadline::start(timeout, move || {
         if let Some(buffer) = &buffer {
-            if buffer.complete() { return; }
+            if buffer.complete() {
+                return;
+            }
             buffer.finish(Err(std::io::Error::new(ErrorKind::TimedOut, reason)));
         }
         {
             let mut source = slot.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(child) = source.as_mut().filter(|child| child.id() == pid) { let _ = child.kill(); }
+            if let Some(child) = source.as_mut().filter(|child| child.id() == pid) {
+                let _ = child.kill();
+            }
         }
         log_warn!("DECODER", "{reason}; source process terminated");
     })
@@ -1042,7 +1485,9 @@ impl Drop for DownloadWorker {
         self.buffer.cancel();
         // ActiveTrack declares ChildGuard before this worker: the pipe's
         // process is killed/reaped before joining a blocked producer.
-        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
         *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
@@ -1076,7 +1521,9 @@ struct ActiveTrack {
 impl ActiveTrack {
     fn seek_failed(&self) -> bool {
         if let Some(status) = &self.seek_status {
-            let _ = status.send(Status::SeekFailed { load_id: self.load_id });
+            let _ = status.send(Status::SeekFailed {
+                load_id: self.load_id,
+            });
             crate::ui::wake_status();
         }
         false
@@ -1122,7 +1569,20 @@ impl Drop for ChildGuard {
 fn yt_dlp_args(format: &str, playlist_index: Option<usize>, url: &str) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
     let mut a: Vec<OsString> = Vec::new();
-    a.extend(["--socket-timeout", "15", "--retries", "1", "--fragment-retries", "1", "--no-progress", "--encoding", "utf-8"].map(OsString::from));
+    a.extend(
+        [
+            "--socket-timeout",
+            "15",
+            "--retries",
+            "1",
+            "--fragment-retries",
+            "1",
+            "--no-progress",
+            "--encoding",
+            "utf-8",
+        ]
+        .map(OsString::from),
+    );
     match playlist_index {
         // Advancing playlist entry n: the list is the source of truth.
         Some(n) => {
@@ -1146,8 +1606,10 @@ fn yt_dlp_args(format: &str, playlist_index: Option<usize>, url: &str) -> Vec<st
 }
 
 fn open_track(
-    source: &Source, child_slot: &Arc<Mutex<Option<Child>>>,
-    buffer_slot: &BufferSlot, cached: Option<Arc<StreamBuffer>>,
+    source: &Source,
+    child_slot: &Arc<Mutex<Option<Child>>>,
+    buffer_slot: &BufferSlot,
+    cached: Option<Arc<StreamBuffer>>,
 ) -> Result<ActiveTrack, String> {
     let mut err_tail: Option<Arc<Mutex<Vec<u8>>>> = None;
     match open_track_inner(source, child_slot, buffer_slot, cached, &mut err_tail) {
@@ -1193,23 +1655,35 @@ fn open_track_inner(
         }
         Source::Youtube { .. } if stream_buffer.is_some() => {
             let reader = stream_buffer.as_ref().unwrap().reader();
-            log_info!("DECODER", "replay from RAM — no title resolution or network download");
-            (MediaSourceStream::new(Box::new(reader), Default::default()), None)
+            log_info!(
+                "DECODER",
+                "replay from RAM — no title resolution or network download"
+            );
+            (
+                MediaSourceStream::new(Box::new(reader), Default::default()),
+                None,
+            )
         }
-        Source::Youtube { url, format, playlist_index } => {
+        Source::Youtube {
+            url,
+            format,
+            playlist_index,
+        } => {
             log_info!(
                 "DECODER",
                 "spawning yt-dlp -f {format} (playlist entry {:?})",
                 playlist_index
             );
-            let mut child = Child::track(crate::process::command("yt-dlp")
-                .args(yt_dlp_args(format, *playlist_index, url))
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("yt-dlp spawn failed ({e}) — is yt-dlp in PATH?"))?)
-                .map_err(|e| format!("source process tracking: {e}"))?;
+            let mut child = Child::track(
+                crate::process::command("yt-dlp")
+                    .args(yt_dlp_args(format, *playlist_index, url))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| format!("yt-dlp spawn failed ({e}) — is yt-dlp in PATH?"))?,
+            )
+            .map_err(|e| format!("source process tracking: {e}"))?;
             let pid = child.id();
             let stdout = child.stdout.take().expect("yt-dlp stdout piped");
             let stderr = child.stderr.take().expect("yt-dlp stderr piped");
@@ -1225,8 +1699,7 @@ fn open_track_inner(
                         match reader.read(&mut chunk) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
-                                let mut buf =
-                                    err_tail.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut buf = err_tail.lock().unwrap_or_else(|e| e.into_inner());
                                 if buf.len() < 8192 {
                                     buf.extend_from_slice(&chunk[..n]);
                                 }
@@ -1235,11 +1708,14 @@ fn open_track_inner(
                     }
                 });
             }
-            let guard = ChildGuard { slot: Arc::clone(child_slot) };
+            let guard = ChildGuard {
+                slot: Arc::clone(child_slot),
+            };
             *child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
             *err_tail_out = Some(err_tail);
             let producer = DownloadWorker::start_source(stdout, buffer_slot, child_slot, pid)?;
-            let mss = MediaSourceStream::new(Box::new(producer.buffer.reader()), Default::default());
+            let mss =
+                MediaSourceStream::new(Box::new(producer.buffer.reader()), Default::default());
             stream_buffer = Some(producer.buffer.clone());
             download = Some(producer);
             (mss, Some(guard))
@@ -1248,9 +1724,10 @@ fn open_track_inner(
 
     let mut hint = Hint::new();
     if let Source::File(path) = source
-        && let Some(ext) = path.rsplit(['.', '/', '\\']).next() {
-            hint.with_extension(ext);
-        }
+        && let Some(ext) = path.rsplit(['.', '/', '\\']).next()
+    {
+        hint.with_extension(ext);
+    }
     let seekable = mss.is_seekable() || stream_buffer.is_some();
     let probed = get_probe()
         .format(&hint, mss, &Default::default(), &MetadataOptions::default())
@@ -1276,20 +1753,18 @@ fn open_track_inner(
         .map(|(n, tb)| {
             let t = tb.calc_time(n);
             Duration::from_secs_f64(t.seconds as f64 + t.frac)
-        }).filter(|duration| !duration.is_zero());
+        })
+        .filter(|duration| !duration.is_zero());
     let decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &Default::default())
         .map_err(|e| format!("decoder: {e}"))?;
     // `track`'s borrow of `format` ended with the decoder construction above.
-    let title = format
-        .metadata()
-        .current()
-        .and_then(|rev| {
-            rev.tags()
-                .iter()
-                .find(|t| t.key.eq_ignore_ascii_case("title"))
-                .map(|t| t.value.to_string())
-        });
+    let title = format.metadata().current().and_then(|rev| {
+        rev.tags()
+            .iter()
+            .find(|t| t.key.eq_ignore_ascii_case("title"))
+            .map(|t| t.value.to_string())
+    });
 
     Ok(ActiveTrack {
         format,
@@ -1309,7 +1784,8 @@ fn open_track_inner(
         stream_buffer,
         seek_packet: None,
         next_ts: 0,
-        seek_status: None, load_id: 0,
+        seek_status: None,
+        load_id: 0,
     })
 }
 
@@ -1320,7 +1796,9 @@ enum DecoderSeek {
 }
 
 impl From<f64> for DecoderSeek {
-    fn from(delta: f64) -> Self { Self::Relative(delta) }
+    fn from(delta: f64) -> Self {
+        Self::Relative(delta)
+    }
 }
 
 impl DecoderSeek {
@@ -1365,30 +1843,52 @@ fn send_chunk(
         // over capacity, even when output is paused or has been disconnected.
         cmds.wake.register(interest);
         match cmds.try_recv() {
-            Ok(command) => { cmds.wake.cancel(); return send_command(Ok(command)); }
-            Err(TryRecvError::Disconnected) => { cmds.wake.cancel(); return SendOutcome::Shutdown; }
+            Ok(command) => {
+                cmds.wake.cancel();
+                return send_command(Ok(command));
+            }
+            Err(TryRecvError::Disconnected) => {
+                cmds.wake.cancel();
+                return SendOutcome::Shutdown;
+            }
             Err(TryRecvError::Empty) => {}
         }
-        if chunk_tx.sink_gone() { cmds.wake.cancel(); return SendOutcome::SinkGone; }
-        if chunk_tx.ready.has_capacity() && let Some(mut chunk) = chunk_tx.take_free() {
+        if chunk_tx.sink_gone() {
+            cmds.wake.cancel();
+            return SendOutcome::SinkGone;
+        }
+        if chunk_tx.ready.has_capacity()
+            && let Some(mut chunk) = chunk_tx.take_free()
+        {
             cmds.wake.cancel();
             chunk.data[..samples.len()].copy_from_slice(samples);
             chunk.len = samples.len();
             chunk.generation = generation;
             #[cfg(test)]
-            if let Some(interrupt) = PUBLICATION_INTERRUPT.with(|hook| hook.borrow_mut().take()) { interrupt(); }
+            if let Some(interrupt) = PUBLICATION_INTERRUPT.with(|hook| hook.borrow_mut().take()) {
+                interrupt();
+            }
             // An interruption during the copy retains the unpublished block
             // on the decoder. It must never become a second recycle writer.
             match cmds.try_recv() {
-                Ok(command) => { chunk_tx.keep(chunk); return send_command(Ok(command)); }
-                Err(TryRecvError::Disconnected) => { chunk_tx.keep(chunk); return SendOutcome::Shutdown; }
+                Ok(command) => {
+                    chunk_tx.keep(chunk);
+                    return send_command(Ok(command));
+                }
+                Err(TryRecvError::Disconnected) => {
+                    chunk_tx.keep(chunk);
+                    return SendOutcome::Shutdown;
+                }
                 Err(TryRecvError::Empty) => {}
             }
             // The only ready writer owns this free slot. Consumers can only
             // increase capacity. Stale PCM is fenced by its generation even
             // when a command races publication after the check above.
             match chunk_tx.ready.try_send(chunk) {
-                Ok(()) => { chunk_tx.published(generation, samples.len()); return SendOutcome::Sent; }
+                Ok(()) => {
+                    chunk_tx.published(generation, samples.len());
+                    return SendOutcome::Sent;
+                }
                 Err(chunk) => {
                     chunk_tx.keep(chunk);
                     unreachable!("single PCM writer retains the capacity it observed");
@@ -1406,8 +1906,9 @@ fn send_command(msg: Result<DecoderCmd, crossbeam_channel::RecvError>) -> SendOu
         Ok(DecoderCmd::Shutdown) | Err(_) => SendOutcome::Shutdown,
         Ok(DecoderCmd::Load(source, id)) => SendOutcome::NewSource(source, id),
         Ok(DecoderCmd::RecoverOutput(source, id)) => SendOutcome::RecoverOutput(source, id),
-        Ok(command @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))) =>
-            SendOutcome::Seek(DecoderSeek::from_command(command)),
+        Ok(command @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))) => {
+            SendOutcome::Seek(DecoderSeek::from_command(command))
+        }
     }
 }
 
@@ -1434,10 +1935,18 @@ fn fetch_title_blocking(
     // YouTube's, and resolving against the same format the audio child will
     // use keeps the metadata pass honest about playability (the request
     // never downloads; it only prints).
-    let mut args: Vec<std::ffi::OsString> =
-        vec!["--socket-timeout".into(), "15".into(), "--retries".into(), "1".into(),
-            "--encoding".into(), "utf-8".into(),
-            "--print".into(), "title".into(), "-f".into(), format.into()];
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--socket-timeout".into(),
+        "15".into(),
+        "--retries".into(),
+        "1".into(),
+        "--encoding".into(),
+        "utf-8".into(),
+        "--print".into(),
+        "title".into(),
+        "-f".into(),
+        format.into(),
+    ];
     match playlist_index {
         Some(n) => {
             args.push("--playlist-items".into());
@@ -1446,29 +1955,43 @@ fn fetch_title_blocking(
         None => args.push("--no-playlist".into()),
     }
     args.push(url.into());
-    let mut child = Child::track(crate::process::command("yt-dlp")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?).ok()?;
+    let mut child = Child::track(
+        crate::process::command("yt-dlp")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?,
+    )
+    .ok()?;
     let pid = child.id();
     let stdout = child.stdout.take()?;
     if let Ok(mut slot) = child_slot.lock() {
         *slot = Some(child);
     }
-    let deadline = match source_deadline(child_slot, pid, None, Duration::from_secs(45), "title extraction deadline exceeded") {
+    let deadline = match source_deadline(
+        child_slot,
+        pid,
+        None,
+        Duration::from_secs(45),
+        "title extraction deadline exceeded",
+    ) {
         Ok(deadline) => deadline,
         Err(error) => {
             log_warn!("DECODER", "cannot arm extraction deadline: {error}");
-            drop(ChildGuard { slot: child_slot.clone() });
+            drop(ChildGuard {
+                slot: child_slot.clone(),
+            });
             return None;
         }
     };
     log_info!("DECODER", "resolving title (single-shot, tracked)");
     let mut raw = String::new();
-    let read_ok = std::io::BufReader::new(stdout).take(32 * 1024).read_to_string(&mut raw).is_ok();
+    let read_ok = std::io::BufReader::new(stdout)
+        .take(32 * 1024)
+        .read_to_string(&mut raw)
+        .is_ok();
     drop(deadline);
     // Reap regardless of how the read ended (natural exit or kill).
     let child = child_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1476,7 +1999,11 @@ fn fetch_title_blocking(
         let _ = c.kill(); // no-op after natural exit
         let _ = c.wait();
     }
-    let title = if read_ok { clean_title(&raw) } else { String::new() };
+    let title = if read_ok {
+        clean_title(&raw)
+    } else {
+        String::new()
+    };
     if title.is_empty() {
         log_warn!("DECODER", "title fetch failed — keeping URL");
         return None;
@@ -1501,7 +2028,9 @@ fn seek_relative(
     resampler: &mut Option<LinearResampler>,
     generation: &mut u64,
 ) -> bool {
-    if track.seek_status.is_some() && track.load_id != shared.load_id() { return false; }
+    if track.seek_status.is_some() && track.load_id != shared.load_id() {
+        return false;
+    }
     if !track.seekable {
         log_info!("DECODER", "container does not support seeking");
         return track.seek_failed();
@@ -1512,16 +2041,23 @@ fn seek_relative(
         DecoderSeek::Relative(delta) => delta,
         DecoderSeek::Restore(position) => position - previous,
     };
-    if !delta.is_finite() { return track.seek_failed(); }
+    if !delta.is_finite() {
+        return track.seek_failed();
+    }
     let mut target = (previous + delta).max(0.0);
-    if let Some(duration) = track.duration { target = target.min(duration.as_secs_f64()); }
+    if let Some(duration) = track.duration {
+        target = target.min(duration.as_secs_f64());
+    }
     let buffer = track.stream_buffer.clone();
     let _downloaded_seek = buffer.as_ref().map(|buffer| match seek {
         DecoderSeek::Relative(_) => buffer.downloaded_seek(),
         DecoderSeek::Restore(_) => buffer.recovery_seek(),
     });
     let to = SeekTo::Time {
-        time: Time { seconds: target as u64, frac: target.fract() },
+        time: Time {
+            seconds: target as u64,
+            frac: target.fract(),
+        },
         track_id: Some(track.track_id),
     };
     let device_rate = shared.sample_rate().max(1);
@@ -1533,19 +2069,28 @@ fn seek_relative(
         Ok((seeked, packet))
     });
     if seek_result.is_err() {
-        let _ = track.format.seek(SeekMode::Coarse, SeekTo::TimeStamp {
-            ts: track.next_ts, track_id: track.track_id,
-        });
+        let _ = track.format.seek(
+            SeekMode::Coarse,
+            SeekTo::TimeStamp {
+                ts: track.next_ts,
+                track_id: track.track_id,
+            },
+        );
     }
     match seek_result {
         Ok((seeked, packet)) => {
-            if track.seek_status.is_some() && track.load_id != shared.load_id() { return false; }
+            if track.seek_status.is_some() && track.load_id != shared.load_id() {
+                return false;
+            }
             track.next_ts = packet.ts().saturating_add(packet.dur());
             track.seek_packet = Some(packet);
-            let actual = track.time_base.map(|base| {
-                let time = base.calc_time(seeked.actual_ts);
-                time.seconds as f64 + time.frac
-            }).unwrap_or(target);
+            let actual = track
+                .time_base
+                .map(|base| {
+                    let time = base.calc_time(seeked.actual_ts);
+                    time.seconds as f64 + time.frac
+                })
+                .unwrap_or(target);
             track.decoder.reset();
             pending.clear();
             eq.built = false; // biquad state is stale past the seek
@@ -1553,7 +2098,11 @@ fn seek_relative(
             shared.bump_generation(); // in-flight stale chunks are discarded by the callback
             *generation = shared.generation(); // fresh chunks carry the new one
             shared.set_playhead_frames((actual * device_rate as f64).round() as u64);
-            log_info!("DECODER", "seek {delta:+.1}s -> playhead {:.1}s (RAM for streams)", actual);
+            log_info!(
+                "DECODER",
+                "seek {delta:+.1}s -> playhead {:.1}s (RAM for streams)",
+                actual
+            );
             true
         }
         Err(SymphoniaError::Unsupported(_)) => {
@@ -1587,9 +2136,18 @@ fn play_source(
     play_source_with_output(context, cache, &mut None, source, load_id, false)
 }
 
-fn retain_track(suspended: &mut Option<SuspendedTrack>, source: Source, track: ActiveTrack,
-    title: Option<String>, exit: PlayExit) -> PlayExit {
-    *suspended = Some(SuspendedTrack { source, track, title });
+fn retain_track(
+    suspended: &mut Option<SuspendedTrack>,
+    source: Source,
+    track: ActiveTrack,
+    title: Option<String>,
+    exit: PlayExit,
+) -> PlayExit {
+    *suspended = Some(SuspendedTrack {
+        source,
+        track,
+        title,
+    });
     exit
 }
 
@@ -1601,9 +2159,23 @@ fn play_source_with_output(
     load_id: u64,
     recovering: bool,
 ) -> PlayExit {
-    let &PlaybackContext { shared, cmds, status_tx, chunk_tx, drained_rx, child_slot, buffer_slot } = context;
-    if load_id != shared.load_id() { return PlayExit::Stopped; }
-    if !recovering || suspended.as_ref().is_some_and(|saved| saved.source != source) {
+    let &PlaybackContext {
+        shared,
+        cmds,
+        status_tx,
+        chunk_tx,
+        drained_rx,
+        child_slot,
+        buffer_slot,
+    } = context;
+    if load_id != shared.load_id() {
+        return PlayExit::Stopped;
+    }
+    if !recovering
+        || suspended
+            .as_ref()
+            .is_some_and(|saved| saved.source != source)
+    {
         *suspended = None; // release the previous source before opening another
     }
     let mut generation = shared.generation();
@@ -1611,7 +2183,9 @@ fn play_source_with_output(
     let cached = cache
         .as_ref()
         .filter(|cached| cached.source == source && cached.buffer.complete());
-    let replay_buffer = suspended.as_ref().and_then(|saved| saved.track.stream_buffer.clone())
+    let replay_buffer = suspended
+        .as_ref()
+        .and_then(|saved| saved.track.stream_buffer.clone())
         .or_else(|| cached.map(|cached| cached.buffer.clone()));
     // Single-shot, SEQUENTIAL title resolution: one yt-dlp at a time, ever.
     // The prefetch child lives in the same ChildGuard slot as the audio
@@ -1639,14 +2213,17 @@ fn play_source_with_output(
         Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
         Ok(DecoderCmd::Load(s, load_id)) => return PlayExit::NewSource(s, load_id),
         Ok(DecoderCmd::RecoverOutput(s, load_id)) => return PlayExit::RecoverOutput(s, load_id),
-        Ok(DecoderCmd::SuspendOutput | DecoderCmd::RefreshOutput) => {},
-        Ok(DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_)) | Err(TryRecvError::Empty) => {}
+        Ok(DecoderCmd::SuspendOutput | DecoderCmd::RefreshOutput) => {}
+        Ok(DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))
+        | Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => return PlayExit::Shutdown,
     }
     let mut track = match open_track(&source, child_slot, buffer_slot, replay_buffer) {
         Ok(t) => t,
         Err(reason) => {
-            if load_id != shared.load_id() { return PlayExit::Suspended; }
+            if load_id != shared.load_id() {
+                return PlayExit::Suspended;
+            }
             log_error!("DECODER", "open failed: {reason}");
             let _ = status_tx.send(Status::Failed {
                 source,
@@ -1664,7 +2241,10 @@ fn play_source_with_output(
         track._child = saved.track._child.take();
         track._download = saved.track._download.take();
         track.err_tail = saved.track.err_tail.take();
-        log_info!("DECODER", "audio output recovery: retained source and download (no re-resolution)");
+        log_info!(
+            "DECODER",
+            "audio output recovery: retained source and download (no re-resolution)"
+        );
     }
     let replay_title = track.title.clone().or_else(|| resolved_title.clone());
     track.seek_status = Some(status_tx.clone());
@@ -1706,7 +2286,10 @@ fn play_source_with_output(
         let mut failure_reason = None;
 
         'play: loop {
-            if load_id != shared.load_id() { exit = PlayExit::Suspended; break 'play; }
+            if load_id != shared.load_id() {
+                exit = PlayExit::Suspended;
+                break 'play;
+            }
             // Command check between packets: the loop only runs while doing real
             // work, so this is work-time checking, not idle polling.
             match cmds.try_recv() {
@@ -1731,7 +2314,9 @@ fn play_source_with_output(
                     break 'play;
                 }
                 Ok(command @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))) => {
-                    if load_id != shared.load_id() { continue; }
+                    if load_id != shared.load_id() {
+                        continue;
+                    }
                     if seek_relative(
                         &mut track,
                         shared,
@@ -1776,7 +2361,10 @@ fn play_source_with_output(
                     break 'play;
                 }
                 Err(e) => {
-                    if load_id != shared.load_id() { exit = PlayExit::Suspended; break 'play; }
+                    if load_id != shared.load_id() {
+                        exit = PlayExit::Suspended;
+                        break 'play;
+                    }
                     log_error!("DECODER", "demux: {e}");
                     track.log_child_stderr();
                     exit = PlayExit::Failed;
@@ -1822,7 +2410,11 @@ fn play_source_with_output(
             };
             if track.sample_rate != pcm_rate || track.channels != pcm_channels {
                 if track.sample_rate != pcm_rate {
-                    log_info!("DECODER", "using decoded PCM rate {pcm_rate} Hz (container/previous {} Hz); device {dst_rate} Hz", track.sample_rate);
+                    log_info!(
+                        "DECODER",
+                        "using decoded PCM rate {pcm_rate} Hz (container/previous {} Hz); device {dst_rate} Hz",
+                        track.sample_rate
+                    );
                 }
                 track.sample_rate = pcm_rate;
                 track.channels = pcm_channels;
@@ -1843,7 +2435,8 @@ fn play_source_with_output(
                 // Container tags win (local files); the prefetched YouTube
                 // title fills the gap.
                 let _ = status_tx.send(Status::Opened {
-                    load_id, source: source.clone(),
+                    load_id,
+                    source: source.clone(),
                     sample_rate: track.sample_rate,
                     channels: track.channels as u16,
                     title: track.title.take().or_else(|| resolved_title.take()),
@@ -1852,7 +2445,10 @@ fn play_source_with_output(
                 crate::ui::wake_status();
                 opened = true;
             }
-            if sample_buf.as_ref().is_none_or(|buffer| buffer.capacity() < decoded.capacity() * pcm_channels) {
+            if sample_buf
+                .as_ref()
+                .is_none_or(|buffer| buffer.capacity() < decoded.capacity() * pcm_channels)
+            {
                 sample_buf = Some(SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
             }
             let sb = sample_buf.as_mut().unwrap();
@@ -1925,13 +2521,21 @@ fn play_source_with_output(
             // Emit fixed-size chunks; backpressure parks in send_chunk.
             while pending.len() >= chunk_samples {
                 match send_chunk(chunk_tx, cmds, &pending[..chunk_samples], generation) {
-                    SendOutcome::Sent => { pending.drain(..chunk_samples); }
+                    SendOutcome::Sent => {
+                        pending.drain(..chunk_samples);
+                    }
                     SendOutcome::Stopped => {
                         exit = PlayExit::Stopped;
                         break 'play;
                     }
-                    SendOutcome::Suspended => { exit = PlayExit::Suspended; break 'play; }
-                    SendOutcome::RecoverOutput(s, id) => { exit = PlayExit::RecoverOutput(s, id); break 'play; }
+                    SendOutcome::Suspended => {
+                        exit = PlayExit::Suspended;
+                        break 'play;
+                    }
+                    SendOutcome::RecoverOutput(s, id) => {
+                        exit = PlayExit::RecoverOutput(s, id);
+                        break 'play;
+                    }
                     SendOutcome::Seek(seek) => {
                         if seek_relative(
                             &mut track,
@@ -1987,13 +2591,22 @@ fn play_source_with_output(
         if matches!(exit, PlayExit::Eof) && !pending.is_empty() && pending.len() < chunk_samples {
             loop {
                 match send_chunk(chunk_tx, cmds, &pending, generation) {
-                    SendOutcome::Sent => { pending.clear(); break; }
+                    SendOutcome::Sent => {
+                        pending.clear();
+                        break;
+                    }
                     SendOutcome::Stopped => {
                         exit = PlayExit::Stopped;
                         break;
                     }
-                    SendOutcome::Suspended => { exit = PlayExit::Suspended; break; }
-                    SendOutcome::RecoverOutput(s, id) => { exit = PlayExit::RecoverOutput(s, id); break; }
+                    SendOutcome::Suspended => {
+                        exit = PlayExit::Suspended;
+                        break;
+                    }
+                    SendOutcome::RecoverOutput(s, id) => {
+                        exit = PlayExit::RecoverOutput(s, id);
+                        break;
+                    }
                     SendOutcome::Seek(seek) => {
                         if seek_relative(
                             &mut track,
@@ -2039,58 +2652,110 @@ fn play_source_with_output(
                     cmds.wake.register(interest);
                     let command = cmds.try_recv();
                     if matches!(command, Err(TryRecvError::Empty)) {
-                        if chunk_tx.sink_gone() { cmds.wake.cancel(); return PlayExit::SinkGone; }
+                        if chunk_tx.sink_gone() {
+                            cmds.wake.cancel();
+                            return PlayExit::SinkGone;
+                        }
                         match drained_rx.try_recv() {
                             Ok(g) if g == generation => {
                                 cmds.wake.cancel();
                                 if load_id != shared.load_id() {
-                                    return retain_track(suspended, source, track, replay_title, PlayExit::Suspended);
+                                    return retain_track(
+                                        suspended,
+                                        source,
+                                        track,
+                                        replay_title,
+                                        PlayExit::Suspended,
+                                    );
                                 }
                                 // A child may close stdout just before its exit
                                 // code becomes available. Check again after the
                                 // buffered tail drains rather than reporting a
                                 // failed HTTP stream as successful completion.
-                                if let Some(reason) = track._child.as_ref().and_then(ChildGuard::eof_failure) {
+                                if let Some(reason) =
+                                    track._child.as_ref().and_then(ChildGuard::eof_failure)
+                                {
                                     track.log_child_stderr();
                                     drop(track);
-                                    let _ = status_tx.send(Status::Failed { source, reason, generation });
+                                    let _ = status_tx.send(Status::Failed {
+                                        source,
+                                        reason,
+                                        generation,
+                                    });
                                     crate::ui::wake_status();
                                     return PlayExit::Failed;
                                 }
                                 // Store the same allocation before notifying the
                                 // broker; its repeat Load will reopen at byte 0.
                                 if shared.loop_enabled()
-                                    && let Some(buffer) = track.stream_buffer.as_ref().filter(|buffer| buffer.complete()) {
-                                        *cache = Some(StreamCache {
-                                            source: source.clone(), buffer: buffer.clone(), title: replay_title.clone(),
-                                        });
-                                    }
+                                    && let Some(buffer) = track
+                                        .stream_buffer
+                                        .as_ref()
+                                        .filter(|buffer| buffer.complete())
+                                {
+                                    *cache = Some(StreamCache {
+                                        source: source.clone(),
+                                        buffer: buffer.clone(),
+                                        title: replay_title.clone(),
+                                    });
+                                }
                                 let _ = status_tx.send(Status::Finished { load_id });
                                 crate::ui::wake_status();
                                 return PlayExit::Eof;
                             }
-                            Ok(_) => { cmds.wake.cancel(); continue; }
-                            Err(_) => { cmds.wake.wait(interest); continue; }
+                            Ok(_) => {
+                                cmds.wake.cancel();
+                                continue;
+                            }
+                            Err(_) => {
+                                cmds.wake.wait(interest);
+                                continue;
+                            }
                         }
                     }
                     cmds.wake.cancel();
                     match command {
-                            Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
-                            Ok(DecoderCmd::SuspendOutput | DecoderCmd::RefreshOutput) =>
-                                return retain_track(suspended, source, track, replay_title, PlayExit::Suspended),
-                            Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
-                            Ok(DecoderCmd::Load(s, load_id)) => return PlayExit::NewSource(s, load_id),
-                            Ok(DecoderCmd::RecoverOutput(s, id)) =>
-                                return retain_track(suspended, source, track, replay_title, PlayExit::RecoverOutput(s, id)),
-                            Ok(command @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_))) => {
-                                if seek_relative(&mut track, shared, DecoderSeek::from_command(command), &mut pending, &mut eq, &mut resampler, &mut generation) {
-                                    chunk_tx.begin(generation);
-                                    let _ = status_tx.send(Status::Seeked { load_id });
-                                    crate::ui::wake_status();
-                                    continue 'decode;
-                                }
+                        Ok(DecoderCmd::Stop) => return PlayExit::Stopped,
+                        Ok(DecoderCmd::SuspendOutput | DecoderCmd::RefreshOutput) => {
+                            return retain_track(
+                                suspended,
+                                source,
+                                track,
+                                replay_title,
+                                PlayExit::Suspended,
+                            );
+                        }
+                        Ok(DecoderCmd::Shutdown) => return PlayExit::Shutdown,
+                        Ok(DecoderCmd::Load(s, load_id)) => return PlayExit::NewSource(s, load_id),
+                        Ok(DecoderCmd::RecoverOutput(s, id)) => {
+                            return retain_track(
+                                suspended,
+                                source,
+                                track,
+                                replay_title,
+                                PlayExit::RecoverOutput(s, id),
+                            );
+                        }
+                        Ok(
+                            command
+                            @ (DecoderCmd::SeekRelative(_) | DecoderCmd::RestorePosition(_)),
+                        ) => {
+                            if seek_relative(
+                                &mut track,
+                                shared,
+                                DecoderSeek::from_command(command),
+                                &mut pending,
+                                &mut eq,
+                                &mut resampler,
+                                &mut generation,
+                            ) {
+                                chunk_tx.begin(generation);
+                                let _ = status_tx.send(Status::Seeked { load_id });
+                                crate::ui::wake_status();
+                                continue 'decode;
                             }
-                            Err(_) => return PlayExit::Shutdown,
+                        }
+                        Err(_) => return PlayExit::Shutdown,
                     }
                 }
             }
@@ -2208,7 +2873,20 @@ struct EqChain {
 
 impl EqChain {
     fn new() -> Self {
-        Self { bands: (0..EQ_BANDS).map(|_| Biquad { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0, z: Vec::new(), active: false }).collect(), built: false }
+        Self {
+            bands: (0..EQ_BANDS)
+                .map(|_| Biquad {
+                    b0: 1.0,
+                    b1: 0.0,
+                    b2: 0.0,
+                    a1: 0.0,
+                    a2: 0.0,
+                    z: Vec::new(),
+                    active: false,
+                })
+                .collect(),
+            built: false,
+        }
     }
 
     /// Rebuild coefficients — called only when `eq_dirty` flips (a command
@@ -2276,13 +2954,18 @@ impl LinearResampler {
             let k = self.t as usize; // floor
             if k >= in_frames {
                 // Everything needed is beyond this packet: carry the tail.
-                self.prev.copy_from_slice(&input[(in_frames - 1) * ch..in_frames * ch]);
+                self.prev
+                    .copy_from_slice(&input[(in_frames - 1) * ch..in_frames * ch]);
                 self.t -= in_frames as f64;
                 return;
             }
             let frac = (self.t - k as f64) as f32;
             for c in 0..ch {
-                let a = if k == 0 { self.prev[c] } else { input[(k - 1) * ch + c] };
+                let a = if k == 0 {
+                    self.prev[c]
+                } else {
+                    input[(k - 1) * ch + c]
+                };
                 let b = input[k * ch + c];
                 out.push(a + (b - a) * frac);
             }
@@ -2299,7 +2982,9 @@ mod tests {
     fn eq_packet_locals_match_original_samples_and_history_bit_for_bit() {
         fn original(eq: &mut EqChain, data: &mut [f32], channels: usize) {
             for band in &mut eq.bands {
-                if !band.active { continue; }
+                if !band.active {
+                    continue;
+                }
                 for channel in 0..channels {
                     for index in (channel..data.len()).step_by(channels) {
                         data[index] = band.process(channel, data[index]);
@@ -2309,17 +2994,29 @@ mod tests {
         }
         for rate in [22_050, 24_000, 44_100, 48_000, 96_000, 192_000] {
             for channels in [1, 2, 6, 8] {
-                for gains in [[1.0,5.0,4.0,2.0,3.0,3.0,-2.0,-3.0,-4.0,-5.0],
-                    [0.0,-12.0,0.0,12.0,0.04,-0.04,4.0,-8.0,6.0,-3.0], [0.0; EQ_BANDS]] {
+                for gains in [
+                    [1.0, 5.0, 4.0, 2.0, 3.0, 3.0, -2.0, -3.0, -4.0, -5.0],
+                    [0.0, -12.0, 0.0, 12.0, 0.04, -0.04, 4.0, -8.0, 6.0, -3.0],
+                    [0.0; EQ_BANDS],
+                ] {
                     let (mut expected, mut actual) = (EqChain::new(), EqChain::new());
                     expected.rebuild(&gains, rate, channels);
                     actual.rebuild(&gains, rate, channels);
                     let mut seed = 0x1234abcd_u32;
-                    let source: Vec<_> = (0..8193 * channels).map(|i| {
-                        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-                        if i > 6000 * channels { 0.0 } else if i % 97 == 0 { f32::from_bits(1) }
-                        else { (seed as i32 as f32) / i32::MAX as f32 * 0.25 }
-                    }).collect();
+                    let source: Vec<_> = (0..8193 * channels)
+                        .map(|i| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 17;
+                            seed ^= seed << 5;
+                            if i > 6000 * channels {
+                                0.0
+                            } else if i % 97 == 0 {
+                                f32::from_bits(1)
+                            } else {
+                                (seed as i32 as f32) / i32::MAX as f32 * 0.25
+                            }
+                        })
+                        .collect();
                     let mut offset = 0;
                     for frames in [1, 3, 64, 257, 1024, 4096, 2748] {
                         let end = (offset + frames * channels).min(source.len());
@@ -2327,24 +3024,33 @@ mod tests {
                         let mut right = left.clone();
                         original(&mut expected, &mut left, channels);
                         actual.apply(&mut right, channels);
-                        assert!(left.iter().zip(&right).all(|(a,b)| a.to_bits() == b.to_bits()), "rate {rate}, channels {channels}");
-                        for (a,b) in expected.bands.iter().zip(&actual.bands) {
-                            assert_eq!(a.active,b.active);
-                            for (za,zb) in a.z.iter().zip(&b.z) {
-                                assert!(za.iter().zip(zb).all(|(x,y)| x.to_bits() == y.to_bits()));
+                        assert!(
+                            left.iter()
+                                .zip(&right)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "rate {rate}, channels {channels}"
+                        );
+                        for (a, b) in expected.bands.iter().zip(&actual.bands) {
+                            assert_eq!(a.active, b.active);
+                            for (za, zb) in a.z.iter().zip(&b.z) {
+                                assert!(za.iter().zip(zb).all(|(x, y)| x.to_bits() == y.to_bits()));
                             }
                         }
                         offset = end;
                     }
-                    assert_eq!(offset,source.len());
+                    assert_eq!(offset, source.len());
                     // A seek/gain rebuild must still reset every history.
                     expected.rebuild(&[-3.0; EQ_BANDS], rate, channels);
                     actual.rebuild(&[-3.0; EQ_BANDS], rate, channels);
-                    let mut left = source[..128*channels].to_vec();
+                    let mut left = source[..128 * channels].to_vec();
                     let mut right = left.clone();
-                    original(&mut expected,&mut left,channels);
-                    actual.apply(&mut right,channels);
-                    assert!(left.iter().zip(&right).all(|(a,b)| a.to_bits() == b.to_bits()));
+                    original(&mut expected, &mut left, channels);
+                    actual.apply(&mut right, channels);
+                    assert!(
+                        left.iter()
+                            .zip(&right)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
                 }
             }
         }
@@ -2352,7 +3058,10 @@ mod tests {
 
     fn callback_info() -> cpal::OutputCallbackInfo {
         let timestamp = cpal::StreamInstant::new(1, 0);
-        cpal::OutputCallbackInfo::new(cpal::OutputStreamTimestamp { callback: timestamp, playback: timestamp })
+        cpal::OutputCallbackInfo::new(cpal::OutputStreamTimestamp {
+            callback: timestamp,
+            playback: timestamp,
+        })
     }
 
     #[test]
@@ -2367,7 +3076,9 @@ mod tests {
         let mut data = [1i16; 128];
         for generation in 0..3 {
             sender.begin(generation);
-            for _ in 0..2 { push_pcm(&sender, &commands, &[0.5; 16], generation); }
+            for _ in 0..2 {
+                push_pcm(&sender, &commands, &[0.5; 16], generation);
+            }
             sender.finish(generation); // 32-sample short track releases priming
             commands.wake.register(COMMAND | CAPACITY | DRAIN);
             let before = commands.wake.wake_count();
@@ -2423,7 +3134,9 @@ mod tests {
         for case in 0..6 {
             let (sender, receiver) = chunk_channel(48_000, 1, 2);
             let (tx, commands) = command_channel(2);
-            for _ in 0..2 { push_pcm(&sender, &commands, &[0.5; CHUNK_FRAMES], 0); }
+            for _ in 0..2 {
+                push_pcm(&sender, &commands, &[0.5; CHUNK_FRAMES], 0);
+            }
             let waiting = commands.wake.watch_wait();
             let (done, completed) = bounded(1);
             let worker = thread::spawn(move || {
@@ -2431,11 +3144,16 @@ mod tests {
                 done.send(()).unwrap();
                 (sender, outcome)
             });
-            assert_eq!(waiting.recv_timeout(Duration::from_secs(2)).unwrap(), COMMAND | CAPACITY);
+            assert_eq!(
+                waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+                COMMAND | CAPACITY
+            );
             let mut sink = Some(receiver);
             match case {
                 0 => tx.send(DecoderCmd::SeekRelative(5.0)).unwrap(),
-                1 => tx.send(DecoderCmd::Load(Source::File("new.wav".into()), 1)).unwrap(),
+                1 => tx
+                    .send(DecoderCmd::Load(Source::File("new.wav".into()), 1))
+                    .unwrap(),
                 2 => tx.send(DecoderCmd::Stop).unwrap(),
                 3 => tx.send(DecoderCmd::Shutdown).unwrap(),
                 4 => drop(tx),
@@ -2443,9 +3161,14 @@ mod tests {
             }
             completed.recv_timeout(Duration::from_secs(2)).unwrap();
             let (sender, outcome) = worker.join().unwrap();
-            assert!(matches!((case, outcome),
-                (0, SendOutcome::Seek(_)) | (1, SendOutcome::NewSource(_, 1)) |
-                (2, SendOutcome::Stopped) | (3 | 4, SendOutcome::Shutdown) | (5, SendOutcome::SinkGone)));
+            assert!(matches!(
+                (case, outcome),
+                (0, SendOutcome::Seek(_))
+                    | (1, SendOutcome::NewSource(_, 1))
+                    | (2, SendOutcome::Stopped)
+                    | (3 | 4, SendOutcome::Shutdown)
+                    | (5, SendOutcome::SinkGone)
+            ));
             assert_eq!(sender.free_count(), 1);
             sender.begin(1); // no callback ran; paused stale audio is reclaimed
             assert_eq!(sender.free_count(), 3);
@@ -2457,8 +3180,15 @@ mod tests {
     fn interrupted_publication_keeps_the_block_on_the_decoder() {
         let (sender, receiver) = chunk_channel(48_000, 1, 2);
         let (tx, commands) = command_channel(2);
-        PUBLICATION_INTERRUPT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || { tx.send(DecoderCmd::Stop).unwrap(); })));
-        assert!(matches!(send_chunk(&sender, &commands, &[0.5; 32], 0), SendOutcome::Stopped));
+        PUBLICATION_INTERRUPT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                tx.send(DecoderCmd::Stop).unwrap();
+            }))
+        });
+        assert!(matches!(
+            send_chunk(&sender, &commands, &[0.5; 32], 0),
+            SendOutcome::Stopped
+        ));
         assert_eq!(sender.reserve.borrow().len(), 1);
         assert_eq!(sender.free_count(), 3);
         assert!(receiver.queue.is_empty());
@@ -2479,14 +3209,21 @@ mod tests {
         assert_eq!(epoch, 8);
         signals.stream_error(4, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
         assert_eq!(signals.take(), (false, false, false));
-        signals.stream_error(epoch, &cpal::Error::with_message(cpal::ErrorKind::BackendError, "WASAPI stream aborted"));
+        signals.stream_error(
+            epoch,
+            &cpal::Error::with_message(cpal::ErrorKind::BackendError, "WASAPI stream aborted"),
+        );
         assert_eq!(signals.take(), (false, true, false));
         signals.endpoint_changed();
         assert_eq!(signals.take(), (true, false, true));
         let epoch = signals.next_epoch();
         signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::Xrun));
         signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::RealtimeDenied));
-        assert_eq!(signals.take(), (false, false, false), "nonfatal advisories cannot rebuild the stream");
+        assert_eq!(
+            signals.take(),
+            (false, false, false),
+            "nonfatal advisories cannot rebuild the stream"
+        );
         signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceChanged));
         assert_eq!(signals.take(), (true, false, false));
     }
@@ -2497,7 +3234,11 @@ mod tests {
         use cpal::platform::{OutputPromotion, OutputWorkerStartup};
         let signals = OutputSignals::new();
         let old = signals.stream_state.load(Ordering::Acquire);
-        let result = OutputWorkerStartup { thread_id: 123, thread_priority: Some(0), promotion: OutputPromotion::Disabled };
+        let result = OutputWorkerStartup {
+            thread_id: 123,
+            thread_priority: Some(0),
+            promotion: OutputPromotion::Disabled,
+        };
         assert!(signals.publish_startup(old, Some(&result)));
         assert!(!signals.publish_startup(old, Some(&result)));
         let current = signals.next_epoch();
@@ -2506,18 +3247,36 @@ mod tests {
         signals.stream_error(old, &cpal::Error::new(cpal::ErrorKind::DeviceChanged));
         signals.stream_error(old, &cpal::Error::new(cpal::ErrorKind::BackendError));
         assert_eq!(signals.take(), (false, false, false));
-        for promotion in [OutputPromotion::Fallback { mmcss_error: "in-memory MMCSS failure".into() },
-            OutputPromotion::Failed { mmcss_error: "in-memory MMCSS failure".into(), fallback_error: "in-memory priority failure".into() }] {
+        for promotion in [
+            OutputPromotion::Fallback {
+                mmcss_error: "in-memory MMCSS failure".into(),
+            },
+            OutputPromotion::Failed {
+                mmcss_error: "in-memory MMCSS failure".into(),
+                fallback_error: "in-memory priority failure".into(),
+            },
+        ] {
             let current = signals.next_epoch();
-            let result = OutputWorkerStartup { thread_id: 456, thread_priority: None, promotion };
+            let result = OutputWorkerStartup {
+                thread_id: 456,
+                thread_priority: None,
+                promotion,
+            };
             assert!(signals.publish_startup(current, Some(&result)));
-            assert_eq!(signals.stream_state.load(Ordering::Acquire), current, "priority failure is reported without output teardown");
+            assert_eq!(
+                signals.stream_state.load(Ordering::Acquire),
+                current,
+                "priority failure is reported without output teardown"
+            );
             assert_eq!(signals.take(), (false, false, false));
             assert!(!signals.publish_startup(current, Some(&result)));
         }
         assert!(!signals.publish_startup(current, None));
         let current = signals.next_epoch();
-        assert!(signals.publish_startup(current, None), "missing observation is explicitly unverified");
+        assert!(
+            signals.publish_startup(current, None),
+            "missing observation is explicitly unverified"
+        );
         assert!(!signals.publish_startup(current, None));
     }
 
@@ -2534,21 +3293,39 @@ mod tests {
         assert!(output.current.is_some());
         assert_eq!(sender.free_count(), 2);
         drop(output);
-        assert_eq!(sender.free_count(), 3, "retirement must not gradually exhaust the fixed pool");
+        assert_eq!(
+            sender.free_count(),
+            3,
+            "retirement must not gradually exhaust the fixed pool"
+        );
     }
 
     #[test]
     fn pending_device_pools_coalesce_without_disconnecting_the_live_decoder() {
         let (original, receiver) = chunk_channel(48_000, 2, 2);
         let oldest = Arc::downgrade(&receiver.state);
-        let controls = AudioControls { child_slot: Arc::new(Mutex::new(None)),
-            buffer_slot: Arc::new(Mutex::new(None)), output_slot: Arc::new(Mutex::new(None)) };
+        let controls = AudioControls {
+            child_slot: Arc::new(Mutex::new(None)),
+            buffer_slot: Arc::new(Mutex::new(None)),
+            output_slot: Arc::new(Mutex::new(None)),
+        };
         let (first, first_receiver) = chunk_channel(44_100, 1, 2);
         let intermediate = Arc::downgrade(&first_receiver.state);
-        controls.replace_output(OutputReplacement { sender: first, retired: receiver, epoch: 4 });
+        controls.replace_output(OutputReplacement {
+            sender: first,
+            retired: receiver,
+            epoch: 4,
+        });
         let (latest, latest_receiver) = chunk_channel(48_000, 6, 2);
-        controls.replace_output(OutputReplacement { sender: latest, retired: first_receiver, epoch: 6 });
-        assert!(intermediate.upgrade().is_none(), "superseded pending pool must be freed");
+        controls.replace_output(OutputReplacement {
+            sender: latest,
+            retired: first_receiver,
+            epoch: 6,
+        });
+        assert!(
+            intermediate.upgrade().is_none(),
+            "superseded pending pool must be freed"
+        );
         assert!(oldest.upgrade().is_some());
         assert!(!original.sink_gone());
         let replacement = controls.output_slot.lock().unwrap().take().unwrap();
@@ -2562,7 +3339,8 @@ mod tests {
 
     #[test]
     fn decoder_installs_changed_device_pools_and_releases_retired_allocations() {
-        let path = std::env::temp_dir().join(format!("kyouko-device-pools-{}.wav", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("kyouko-device-pools-{}.wav", std::process::id()));
         std::fs::write(&path, pcm_wav(&vec![8192; 48_000], 48_000)).unwrap();
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
@@ -2573,20 +3351,41 @@ mod tests {
         let mut receiver = audio.chunk_rx;
         let thread_id = audio.decoder.thread().id();
         let source = Source::File(path.to_string_lossy().into_owned());
-        for (cycle, (rate, channels)) in [(48_000, 2), (44_100, 1), (96_000, 2), (48_000, 6)].into_iter().enumerate() {
+        for (cycle, (rate, channels)) in [(48_000, 2), (44_100, 1), (96_000, 2), (48_000, 6)]
+            .into_iter()
+            .enumerate()
+        {
             let old_state = Arc::downgrade(&receiver.state);
             let (sender, fresh_receiver) = chunk_channel(rate, channels, buffer_depth(rate));
             let epoch = 2 + cycle as u64 * 2;
             shared.set_sample_rate(rate);
             shared.set_device_channels(channels as u32);
-            audio.controls.replace_output(OutputReplacement { sender, retired: receiver, epoch });
+            audio.controls.replace_output(OutputReplacement {
+                sender,
+                retired: receiver,
+                epoch,
+            });
             receiver = fresh_receiver;
             command_tx.send(DecoderCmd::Stop).unwrap();
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::OutputReady { epoch: ready } if ready == epoch));
-            assert!(old_state.upgrade().is_none(), "acknowledgement releases the old pool");
+            assert!(
+                matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::OutputReady { epoch: ready } if ready == epoch)
+            );
+            assert!(
+                old_state.upgrade().is_none(),
+                "acknowledgement releases the old pool"
+            );
             shared.bump_generation();
-            command_tx.send(DecoderCmd::Load(source.clone(), shared.load_id())).unwrap();
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { sample_rate: 48_000, channels: 1, .. }));
+            command_tx
+                .send(DecoderCmd::Load(source.clone(), shared.load_id()))
+                .unwrap();
+            assert!(matches!(
+                status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Status::Opened {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    ..
+                }
+            ));
             let mut frames = 0;
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
@@ -2597,19 +3396,29 @@ mod tests {
                         assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                         frames += chunk.len / channels;
                         recycle(&receiver.recycle, chunk);
-                        if let Some(wake) = receiver.state.wake.get() { wake.notify(CAPACITY); }
+                        if let Some(wake) = receiver.state.wake.get() {
+                            wake.notify(CAPACITY);
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        if receiver.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
+                        if receiver.state.eof_generation.load(Ordering::Acquire)
+                            == shared.generation()
+                        {
                             audio.drained_tx.send(shared.generation()).unwrap();
-                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
+                            assert!(matches!(
+                                status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                                Status::Finished { .. }
+                            ));
                             break;
                         }
                     }
                     Err(error) => panic!("pool disconnected: {error}"),
                 }
             }
-            assert!((frames as i64 - rate as i64).abs() <= 2, "device format cannot change playback duration");
+            assert!(
+                (frames as i64 - rate as i64).abs() <= 2,
+                "device format cannot change playback duration"
+            );
             assert_eq!(audio.decoder.thread().id(), thread_id);
         }
         command_tx.send(DecoderCmd::Shutdown).unwrap();
@@ -2629,7 +3438,9 @@ mod tests {
             fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
                 loop {
                     let count = self.current.read(out)?;
-                    if count > 0 { return Ok(count); }
+                    if count > 0 {
+                        return Ok(count);
+                    }
                     match self.chunks.recv() {
                         Ok(bytes) => self.current = std::io::Cursor::new(bytes),
                         Err(_) => return Ok(0),
@@ -2643,48 +3454,102 @@ mod tests {
             shared.set_sample_rate(48_000);
             shared.set_device_channels(2);
             shared.set_loop_enabled(looping);
-            let source = Source::Youtube { url: "ram-test://device-recovery".into(), format: "140".into(), playlist_index: None };
+            let source = Source::Youtube {
+                url: "ram-test://device-recovery".into(),
+                format: "140".into(),
+                playlist_index: None,
+            };
             let (command_tx, command_rx) = command_channel(8);
             let (status_tx, status_rx) = bounded(16);
             let (sender, mut receiver) = chunk_channel(48_000, 2, buffer_depth(48_000));
             let (_drained_tx, drained_rx) = drain_channel(&command_rx.wake);
-            let controls = AudioControls { child_slot: Arc::new(Mutex::new(None)),
-                buffer_slot: Arc::new(Mutex::new(None)), output_slot: Arc::new(Mutex::new(None)) };
+            let controls = AudioControls {
+                child_slot: Arc::new(Mutex::new(None)),
+                buffer_slot: Arc::new(Mutex::new(None)),
+                output_slot: Arc::new(Mutex::new(None)),
+            };
             let kills = Arc::new(AtomicU64::new(0));
             let kill_count = kills.clone();
             let interrupt = controls.clone();
-            let link = DecoderLink::with_interrupt(command_tx, command_rx.clone(), Arc::new(move || {
-                kill_count.fetch_add(1, Ordering::Relaxed);
-                interrupt.interrupt();
-            })).with_suspend(controls.clone().suspend_hook());
+            let link = DecoderLink::with_interrupt(
+                command_tx,
+                command_rx.clone(),
+                Arc::new(move || {
+                    kill_count.fetch_add(1, Ordering::Relaxed);
+                    interrupt.interrupt();
+                }),
+            )
+            .with_suspend(controls.clone().suspend_hook());
             let mut broker = Broker::new(shared.clone(), link.clone());
-            broker.handle_command(PlayerCommand::Load { source: source.clone(), paused: false });
+            broker.handle_command(PlayerCommand::Load {
+                source: source.clone(),
+                paused: false,
+            });
             assert!(matches!(command_rx.try_recv(), Ok(DecoderCmd::Load(_, _))));
-            broker.handle_status(Status::Opened { load_id: shared.load_id(), source: source.clone(), sample_rate: 48_000,
-                channels: 1, title: Some("RAM test".into()), duration: Some(Duration::from_secs(20)) });
+            broker.handle_status(Status::Opened {
+                load_id: shared.load_id(),
+                source: source.clone(),
+                sample_rate: 48_000,
+                channels: 1,
+                title: Some("RAM test".into()),
+                duration: Some(Duration::from_secs(20)),
+            });
             kills.store(0, Ordering::Relaxed);
 
             let bytes = pcm_wav(&vec![8192; 48_000 * 20], 48_000);
             let prefix = 44 + 48_000 * 8 * 2;
             let (data_tx, data_rx) = bounded(2);
             let mut producer = Some(data_tx);
-            producer.as_ref().unwrap().send(bytes[..prefix].to_vec()).unwrap();
-            let download = DownloadWorker::start(Pipe { chunks: data_rx, current: std::io::Cursor::new(Vec::new()) }, &controls.buffer_slot).unwrap();
+            producer
+                .as_ref()
+                .unwrap()
+                .send(bytes[..prefix].to_vec())
+                .unwrap();
+            let download = DownloadWorker::start(
+                Pipe {
+                    chunks: data_rx,
+                    current: std::io::Cursor::new(Vec::new()),
+                },
+                &controls.buffer_slot,
+            )
+            .unwrap();
             let buffer = download.buffer.clone();
             let allocation = Arc::downgrade(&buffer);
-            let mut track = open_track(&source, &controls.child_slot, &controls.buffer_slot, Some(buffer.clone())).unwrap();
+            let mut track = open_track(
+                &source,
+                &controls.child_slot,
+                &controls.buffer_slot,
+                Some(buffer.clone()),
+            )
+            .unwrap();
             track._download = Some(download);
-            let retained = SuspendedTrack { source: source.clone(), track, title: Some("RAM test".into()) };
+            let retained = SuspendedTrack {
+                source: source.clone(),
+                track,
+                title: Some("RAM test".into()),
+            };
             let decoder_shared = shared.clone();
             let decoder_controls = controls.clone();
-            let decoder = thread::spawn(move || run_decoder_with_output(decoder_shared, command_rx, status_tx,
-                sender, drained_rx, (decoder_controls, Some(retained))));
+            let decoder = thread::spawn(move || {
+                run_decoder_with_output(
+                    decoder_shared,
+                    command_rx,
+                    status_tx,
+                    sender,
+                    drained_rx,
+                    (decoder_controls, Some(retained)),
+                )
+            });
 
             for cycle in 0..8 {
                 if cycle == 4 {
                     // Finish the original producer halfway through the swaps.
                     // Both progressive and complete RAM buffers must survive.
-                    producer.take().unwrap().send(bytes[prefix..].to_vec()).unwrap();
+                    producer
+                        .take()
+                        .unwrap()
+                        .send(bytes[prefix..].to_vec())
+                        .unwrap();
                     buffer.wait_complete(Duration::from_secs(2)).unwrap();
                 }
                 let position = 2.0 + cycle as f64 * 0.5;
@@ -2692,11 +3557,16 @@ mod tests {
                 broker.audio_output_lost();
                 let old_pool = Arc::downgrade(&receiver.state);
                 let (rate, channels) = [(44_100, 1), (48_000, 2), (96_000, 6)][cycle % 3];
-                let (fresh_sender, fresh_receiver) = chunk_channel(rate, channels, buffer_depth(rate));
+                let (fresh_sender, fresh_receiver) =
+                    chunk_channel(rate, channels, buffer_depth(rate));
                 let epoch = 4 + cycle as u64 * 2;
                 shared.set_sample_rate(rate);
                 shared.set_device_channels(channels as u32);
-                controls.replace_output(OutputReplacement { sender: fresh_sender, retired: receiver, epoch });
+                controls.replace_output(OutputReplacement {
+                    sender: fresh_sender,
+                    retired: receiver,
+                    epoch,
+                });
                 receiver = fresh_receiver;
                 broker.audio_output_prepared(epoch);
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -2704,27 +3574,62 @@ mod tests {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     assert!(!remaining.is_zero(), "retained source recovery stalled");
                     let status = status_rx.recv_timeout(remaining).unwrap();
-                    assert!(!matches!(status, Status::Failed { .. } | Status::SeekFailed { .. }));
+                    assert!(!matches!(
+                        status,
+                        Status::Failed { .. } | Status::SeekFailed { .. }
+                    ));
                     broker.handle_status(status);
                 }
                 assert!((shared.position().as_secs_f64() - position).abs() < 0.05);
-                assert!(old_pool.upgrade().is_none(), "acknowledgement frees the retired PCM pool");
-                assert_eq!(kills.load(Ordering::Relaxed), 0, "device commands cannot kill yt-dlp");
+                assert!(
+                    old_pool.upgrade().is_none(),
+                    "acknowledgement frees the retired PCM pool"
+                );
+                assert_eq!(
+                    kills.load(Ordering::Relaxed),
+                    0,
+                    "device commands cannot kill yt-dlp"
+                );
                 assert_eq!(buffer.complete(), cycle >= 4);
-                let retained_buffer = controls.buffer_slot.lock().unwrap().as_ref().and_then(Weak::upgrade).unwrap();
-                assert!(Arc::ptr_eq(&buffer, &retained_buffer), "all swaps use the same byte allocation and producer");
-                assert!(controls.child_slot.lock().unwrap().is_none(), "recovery cannot spawn a source process");
+                let retained_buffer = controls
+                    .buffer_slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .unwrap();
+                assert!(
+                    Arc::ptr_eq(&buffer, &retained_buffer),
+                    "all swaps use the same byte allocation and producer"
+                );
+                assert!(
+                    controls.child_slot.lock().unwrap().is_none(),
+                    "recovery cannot spawn a source process"
+                );
             }
             broker.handle_command(PlayerCommand::Stop);
             assert_eq!(kills.load(Ordering::Relaxed), 1);
             drop(buffer);
-            let (fresh_sender, fresh_receiver) = chunk_channel(shared.sample_rate(), shared.device_channels() as usize, 2);
-            controls.replace_output(OutputReplacement { sender: fresh_sender, retired: receiver, epoch: 100 });
+            let (fresh_sender, fresh_receiver) =
+                chunk_channel(shared.sample_rate(), shared.device_channels() as usize, 2);
+            controls.replace_output(OutputReplacement {
+                sender: fresh_sender,
+                retired: receiver,
+                epoch: 100,
+            });
             link.send(DecoderCmd::RefreshOutput);
             loop {
-                if matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::OutputReady { epoch: 100 }) { break; }
+                if matches!(
+                    status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    Status::OutputReady { epoch: 100 }
+                ) {
+                    break;
+                }
             }
-            assert!(allocation.upgrade().is_none(), "Stop releases the only cached track before Shutdown");
+            assert!(
+                allocation.upgrade().is_none(),
+                "Stop releases the only cached track before Shutdown"
+            );
             link.send(DecoderCmd::Shutdown);
             decoder.join().unwrap();
             drop(fresh_receiver);
@@ -2737,9 +3642,16 @@ mod tests {
     #[ignore = "requires a saved track or diagnostic URL and an actual output device"]
     fn saved_track_device_hotswap_cycles_recover_on_wasapi() {
         use crate::broker::{Command as PlayerCommand, DecoderLink, Flow, Phase};
-        fn pump(output: &mut AudioOut, broker: &mut Broker, statuses: &Receiver<Status>, remaining: Duration) {
+        fn pump(
+            output: &mut AudioOut,
+            broker: &mut Broker,
+            statuses: &Receiver<Status>,
+            remaining: Duration,
+        ) {
             crate::ui::wait_headless_timeout(remaining);
-            for status in statuses.try_iter() { broker.handle_status(status); }
+            for status in statuses.try_iter() {
+                broker.handle_status(status);
+            }
             broker.poll_background();
             output.handle_device_events(broker);
             output.set_playing(broker.shared().phase() == Phase::Playing);
@@ -2747,13 +3659,19 @@ mod tests {
         let _wake = crate::ui::HeadlessWakeGuard::new();
         let mut saved = crate::config::load();
         if let Ok(file) = std::env::var("KYOUKO_HOTSWAP_TEST_FILE") {
-            assert!(std::path::Path::new(&file).is_file(), "diagnostic override must be an existing local file");
+            assert!(
+                std::path::Path::new(&file).is_file(),
+                "diagnostic override must be an existing local file"
+            );
             saved.last_track = Some(file);
             saved.last_folder = None;
             saved.last_playlist_index = None;
         }
         if let Ok(url) = std::env::var("KYOUKO_TEST_URL") {
-            assert!(url.starts_with("https://"), "diagnostic override must be an HTTPS URL");
+            assert!(
+                url.starts_with("https://"),
+                "diagnostic override must be an HTTPS URL"
+            );
             saved.last_track = Some(url);
             saved.last_folder = None;
             saved.last_playlist_index = None;
@@ -2769,98 +3687,170 @@ mod tests {
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
         let thread_id = audio.decoder.thread().id();
-        let mut output = AudioOut::managed(Ok(device), audio.chunk_rx, audio.drained_tx, shared.clone(), audio.controls.clone());
+        let mut output = AudioOut::managed(
+            Ok(device),
+            audio.chunk_rx,
+            audio.drained_tx,
+            shared.clone(),
+            audio.controls.clone(),
+        );
         output.start_notifications();
         // No saver is installed: use the real saved selection/controls without
         // writing state.cfg or injecting any window/keyboard/mouse input.
-        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(command_tx, command_rx.clone(), audio.controls.clone().hook())
-            .with_suspend(audio.controls.clone().suspend_hook())).with_playlist_fetching();
+        let mut broker = Broker::new(
+            shared.clone(),
+            DecoderLink::with_interrupt(
+                command_tx,
+                command_rx.clone(),
+                audio.controls.clone().hook(),
+            )
+            .with_suspend(audio.controls.clone().suspend_hook()),
+        )
+        .with_playlist_fetching();
         // Always shut down and join the decoder, even when a live assertion or
         // deadline fails. Otherwise a diagnostic could retain its child process.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let started = std::time::Instant::now();
-        broker.handle_command(PlayerCommand::RestoreState { last_folder: saved.last_folder,
-            last_track: saved.last_track, last_playlist_index: saved.last_playlist_index });
-        let deadline = std::time::Instant::now() + load_timeout;
-        while shared.phase() != Phase::Paused {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(!remaining.is_zero(), "initial load stalled");
-            pump(&mut output, &mut broker, &status_rx, remaining);
-        }
-        println!("initial stream loaded in {:.2}s", started.elapsed().as_secs_f64());
-        broker.handle_command(PlayerCommand::TogglePause);
-        output.set_playing(true);
-        for cycle in 0..4 {
-            // Playing is announced before the producer's 500 ms PCM watermark
-            // fills. Give startup priming its own interval rather than counting
-            // that deliberate silence as lost steady-state playback time.
-            let prime_until = std::time::Instant::now() + Duration::from_secs(1);
-            loop {
-                let remaining = prime_until.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() { break; }
-                pump(&mut output, &mut broker, &status_rx, remaining);
-            }
-            let counters = output.receiver.as_ref().unwrap().state.clone();
-            assert_eq!(counters.ready_generation.load(Ordering::Acquire), shared.generation(), "PCM must be primed before measuring steady playback");
-            let before_underruns = counters.underrun_frames.load(Ordering::Relaxed);
-            let start_position = shared.position().as_secs_f64();
-            let observe_until = std::time::Instant::now() + Duration::from_secs(2);
-            // Service real output notifications during the fault interval, just
-            // like the UI pump. No polling or simulated input is involved.
-            loop {
-                let remaining = observe_until.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() { break; }
-                pump(&mut output, &mut broker, &status_rx, remaining);
-            }
-            let position = shared.position().as_secs_f64();
-            assert!(position - start_position > 1.7, "healthy playback must continue between device cycles: {}s advanced", position - start_position);
-            assert_eq!(shared.phase(), Phase::Playing);
-            assert_eq!(counters.underrun_frames.load(Ordering::Relaxed), before_underruns, "no underruns during healthy playback");
-            drop(counters);
-            let old_pool = Arc::downgrade(&output.receiver.as_ref().unwrap().state);
-            let epoch = output.signals.stream_state.load(Ordering::Acquire) & !3;
-            // Invoke the same callback sink used by CPAL's device-error callback.
-            // The hardware stream really closes/reopens; no OS endpoint is disabled.
-            match cycle {
-                1 => output.signals.endpoint_changed(), // same-ID endpoint event / silent stall
-                2 => output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::StreamInvalidated)),
-                _ => output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable)),
-            }
-            output.handle_device_events(&mut broker);
-            assert_eq!(shared.phase(), Phase::Paused);
-            let recovery_started = std::time::Instant::now();
-            let deadline = recovery_started + load_timeout;
-            while shared.phase() != Phase::Playing {
+            let started = std::time::Instant::now();
+            broker.handle_command(PlayerCommand::RestoreState {
+                last_folder: saved.last_folder,
+                last_track: saved.last_track,
+                last_playlist_index: saved.last_playlist_index,
+            });
+            let deadline = std::time::Instant::now() + load_timeout;
+            while shared.phase() != Phase::Paused {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                assert!(!remaining.is_zero(), "device recovery stalled");
+                assert!(!remaining.is_zero(), "initial load stalled");
                 pump(&mut output, &mut broker, &status_rx, remaining);
             }
-            assert!((shared.position().as_secs_f64() - position).abs() < 0.15, "recovery retains playhead");
-            assert!(old_pool.upgrade().is_none(), "retired PCM allocation must be freed");
-            assert_eq!(audio.decoder.thread().id(), thread_id, "device swaps reuse the one decoder");
-            assert!(audio.controls.output_slot.lock().unwrap().is_none());
-            let new_epoch = output.signals.stream_state.load(Ordering::Acquire) & !3;
-            output.signals.stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
-            output.handle_device_events(&mut broker);
-            assert_eq!(output.signals.stream_state.load(Ordering::Acquire) & !3, new_epoch);
-            println!("device cycle {}: recovered in {:.2}s at {:.3}s, retired pool freed, decoder thread unchanged", cycle + 1, recovery_started.elapsed().as_secs_f64(), shared.position().as_secs_f64());
-        }
-        #[cfg(windows)]
-        unsafe {
-            // Recovery must leave the UI's STA usable for drag-and-drop.
-            windows::Win32::System::Ole::OleInitialize(None).unwrap();
-            windows::Win32::System::Ole::OleUninitialize();
-        }
+            println!(
+                "initial stream loaded in {:.2}s",
+                started.elapsed().as_secs_f64()
+            );
+            broker.handle_command(PlayerCommand::TogglePause);
+            output.set_playing(true);
+            for cycle in 0..4 {
+                // Playing is announced before the producer's 500 ms PCM watermark
+                // fills. Give startup priming its own interval rather than counting
+                // that deliberate silence as lost steady-state playback time.
+                let prime_until = std::time::Instant::now() + Duration::from_secs(1);
+                loop {
+                    let remaining =
+                        prime_until.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    pump(&mut output, &mut broker, &status_rx, remaining);
+                }
+                let counters = output.receiver.as_ref().unwrap().state.clone();
+                assert_eq!(
+                    counters.ready_generation.load(Ordering::Acquire),
+                    shared.generation(),
+                    "PCM must be primed before measuring steady playback"
+                );
+                let before_underruns = counters.underrun_frames.load(Ordering::Relaxed);
+                let start_position = shared.position().as_secs_f64();
+                let observe_until = std::time::Instant::now() + Duration::from_secs(2);
+                // Service real output notifications during the fault interval, just
+                // like the UI pump. No polling or simulated input is involved.
+                loop {
+                    let remaining =
+                        observe_until.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    pump(&mut output, &mut broker, &status_rx, remaining);
+                }
+                let position = shared.position().as_secs_f64();
+                assert!(
+                    position - start_position > 1.7,
+                    "healthy playback must continue between device cycles: {}s advanced",
+                    position - start_position
+                );
+                assert_eq!(shared.phase(), Phase::Playing);
+                assert_eq!(
+                    counters.underrun_frames.load(Ordering::Relaxed),
+                    before_underruns,
+                    "no underruns during healthy playback"
+                );
+                drop(counters);
+                let old_pool = Arc::downgrade(&output.receiver.as_ref().unwrap().state);
+                let epoch = output.signals.stream_state.load(Ordering::Acquire) & !3;
+                // Invoke the same callback sink used by CPAL's device-error callback.
+                // The hardware stream really closes/reopens; no OS endpoint is disabled.
+                match cycle {
+                    1 => output.signals.endpoint_changed(), // same-ID endpoint event / silent stall
+                    2 => output
+                        .signals
+                        .stream_error(epoch, &cpal::Error::new(cpal::ErrorKind::StreamInvalidated)),
+                    _ => output.signals.stream_error(
+                        epoch,
+                        &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+                    ),
+                }
+                output.handle_device_events(&mut broker);
+                assert_eq!(shared.phase(), Phase::Paused);
+                let recovery_started = std::time::Instant::now();
+                let deadline = recovery_started + load_timeout;
+                while shared.phase() != Phase::Playing {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    assert!(!remaining.is_zero(), "device recovery stalled");
+                    pump(&mut output, &mut broker, &status_rx, remaining);
+                }
+                assert!(
+                    (shared.position().as_secs_f64() - position).abs() < 0.15,
+                    "recovery retains playhead"
+                );
+                assert!(
+                    old_pool.upgrade().is_none(),
+                    "retired PCM allocation must be freed"
+                );
+                assert_eq!(
+                    audio.decoder.thread().id(),
+                    thread_id,
+                    "device swaps reuse the one decoder"
+                );
+                assert!(audio.controls.output_slot.lock().unwrap().is_none());
+                let new_epoch = output.signals.stream_state.load(Ordering::Acquire) & !3;
+                output.signals.stream_error(
+                    epoch,
+                    &cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable),
+                );
+                output.handle_device_events(&mut broker);
+                assert_eq!(
+                    output.signals.stream_state.load(Ordering::Acquire) & !3,
+                    new_epoch
+                );
+                println!(
+                    "device cycle {}: recovered in {:.2}s at {:.3}s, retired pool freed, decoder thread unchanged",
+                    cycle + 1,
+                    recovery_started.elapsed().as_secs_f64(),
+                    shared.position().as_secs_f64()
+                );
+            }
+            #[cfg(windows)]
+            unsafe {
+                // Recovery must leave the UI's STA usable for drag-and-drop.
+                windows::Win32::System::Ole::OleInitialize(None).unwrap();
+                windows::Win32::System::Ole::OleUninitialize();
+            }
         }));
-        assert!(matches!(broker.handle_command(PlayerCommand::Quit), Flow::Exit));
+        assert!(matches!(
+            broker.handle_command(PlayerCommand::Quit),
+            Flow::Exit
+        ));
         output.set_playing(false);
         drop(output);
         audio.decoder.join().unwrap();
-        if let Err(error) = result { std::panic::resume_unwind(error); }
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
     }
 
     fn push_pcm(sender: &ChunkSender, cmds: &CommandReceiver, samples: &[f32], generation: u64) {
-        assert!(matches!(send_chunk(sender, cmds, samples, generation), SendOutcome::Sent));
+        assert!(matches!(
+            send_chunk(sender, cmds, samples, generation),
+            SendOutcome::Sent
+        ));
     }
 
     #[test]
@@ -2880,7 +3870,9 @@ mod tests {
             output.render(&mut device, &shared, 2);
             assert!(device.iter().all(|&sample| sample == 0.0));
             assert_eq!(shared.position(), Duration::ZERO);
-            for _ in 1..depth { push_pcm(&sender, &cmd_rx, &samples, shared.generation()); }
+            for _ in 1..depth {
+                push_pcm(&sender, &cmd_rx, &samples, shared.generation());
+            }
             // No producer activity at all during the next 500 ms of demand.
             for _ in 0..50 {
                 output.render(&mut device, &shared, 2);
@@ -2897,8 +3889,13 @@ mod tests {
         shared.set_sample_rate(48_000);
         let (sender, receiver) = chunk_channel(48_000, 2, 2);
         let pointers: Vec<_> = sender.free.try_iter().collect();
-        let addresses: Vec<_> = pointers.iter().map(|chunk| chunk.data.as_ptr() as usize).collect();
-        for chunk in pointers { sender.keep(chunk); }
+        let addresses: Vec<_> = pointers
+            .iter()
+            .map(|chunk| chunk.data.as_ptr() as usize)
+            .collect();
+        for chunk in pointers {
+            sender.keep(chunk);
+        }
         let (_cmd_tx, cmd_rx) = command_channel(1);
         let mut output = PcmOutput::new(receiver);
         let samples = vec![0.5; CHUNK_FRAMES * 2];
@@ -2928,8 +3925,16 @@ mod tests {
             shared.bump_generation();
         }
         assert_eq!(sender.free_count(), 3);
-        for chunk in sender.reserve.borrow().iter().chain(sender.free.try_iter().collect::<Vec<_>>().iter()) {
-            assert!(addresses.contains(&(chunk.data.as_ptr() as usize)), "all allocations are reused");
+        for chunk in sender
+            .reserve
+            .borrow()
+            .iter()
+            .chain(sender.free.try_iter().collect::<Vec<_>>().iter())
+        {
+            assert!(
+                addresses.contains(&(chunk.data.as_ptr() as usize)),
+                "all allocations are reused"
+            );
         }
     }
 
@@ -2941,14 +3946,19 @@ mod tests {
         let (_cmd_tx, cmd_rx) = command_channel(1);
         let mut output = PcmOutput::new(receiver);
         // Fill the watermark and consume everything while producer is held.
-        for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0); }
+        for _ in 0..2 {
+            push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0);
+        }
         let mut data = [0.0; CHUNK_FRAMES * 2];
         output.render(&mut data, &shared, 1);
         let position = shared.position();
         output.render(&mut data, &shared, 1);
         assert_eq!(position, shared.position());
         assert!(!output.drained(0));
-        assert_eq!(sender.state.underrun_frames.load(Ordering::Relaxed), data.len() as u64);
+        assert_eq!(
+            sender.state.underrun_frames.load(Ordering::Relaxed),
+            data.len() as u64
+        );
         sender.finish(0);
         assert!(output.drained(0));
     }
@@ -2964,7 +3974,9 @@ mod tests {
             // Deterministically interleave a load while copying the last old
             // block, without timing assumptions or synthetic OS/UI input.
             let switch = GENERATION_RACE.with(|hook| hook.borrow_mut().take());
-            if let Some(switch) = switch { switch(); }
+            if let Some(switch) = switch {
+                switch();
+            }
             Self(sample)
         }
     }
@@ -2979,17 +3991,23 @@ mod tests {
         sender.finish(0);
         let mut output = PcmOutput::new(receiver);
         let race_shared = shared.clone();
-        GENERATION_RACE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
-            race_shared.bump_generation();
-            race_shared.reset_playhead();
-            sender.begin(1);
-            push_pcm(&sender, &cmd_rx, &[0.25; 16], 1);
-            sender.finish(1);
-        })));
+        GENERATION_RACE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                race_shared.bump_generation();
+                race_shared.reset_playhead();
+                sender.begin(1);
+                push_pcm(&sender, &cmd_rx, &[0.25; 16], 1);
+                sender.finish(1);
+            }))
+        });
         let mut device = [RacingSample(1.0); 64];
         output.render(&mut device, &shared, 1);
         assert_eq!(shared.position(), Duration::ZERO);
-        assert_eq!(output.chunks.queue.len(), 1, "new audio must survive the stale callback");
+        assert_eq!(
+            output.chunks.queue.len(),
+            1,
+            "new audio must survive the stale callback"
+        );
         output.render(&mut device, &shared, 1);
         assert!(device[..16].iter().all(|sample| sample.0 == 0.25));
         assert!(device[16..].iter().all(|sample| sample.0 == 0.0));
@@ -3000,15 +4018,27 @@ mod tests {
     fn full_pcm_ring_remains_interruptible_and_reclaims_stale_paused_audio() {
         let (sender, receiver) = chunk_channel(48_000, 1, 2);
         let (cmd_tx, cmd_rx) = command_channel(1);
-        for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0); }
+        for _ in 0..2 {
+            push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0);
+        }
         cmd_tx.send(DecoderCmd::SeekRelative(5.0)).unwrap();
-        assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0), SendOutcome::Seek(DecoderSeek::Relative(5.0))));
-        assert_eq!(sender.free_count(), 1, "the unsent block must return to its pool");
+        assert!(matches!(
+            send_chunk(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], 0),
+            SendOutcome::Seek(DecoderSeek::Relative(5.0))
+        ));
+        assert_eq!(
+            sender.free_count(),
+            1,
+            "the unsent block must return to its pool"
+        );
         sender.begin(1); // paused output never needs to run to free stale blocks
         assert!(receiver.queue.is_empty());
         assert_eq!(sender.free_count(), 3);
         drop(receiver);
-        assert!(matches!(send_chunk(&sender, &cmd_rx, &[0.0; 100], 1), SendOutcome::SinkGone));
+        assert!(matches!(
+            send_chunk(&sender, &cmd_rx, &[0.0; 100], 1),
+            SendOutcome::SinkGone
+        ));
     }
 
     // Count only operations on the current test thread, avoiding false
@@ -3024,15 +4054,21 @@ mod tests {
     unsafe impl std::alloc::GlobalAlloc for CallbackAllocator {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             ALLOC_TRACKING.with(|tracking| {
-                if tracking.get() { ALLOCATIONS.with(|count| count.set(count.get() + 1)); }
+                if tracking.get() {
+                    ALLOCATIONS.with(|count| count.set(count.get() + 1));
+                }
             });
             unsafe { std::alloc::System.alloc(layout) }
         }
         unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
             ALLOC_TRACKING.with(|tracking| {
-                if tracking.get() { DEALLOCATIONS.with(|count| count.set(count.get() + 1)); }
+                if tracking.get() {
+                    DEALLOCATIONS.with(|count| count.set(count.get() + 1));
+                }
             });
-            unsafe { std::alloc::System.dealloc(pointer, layout); }
+            unsafe {
+                std::alloc::System.dealloc(pointer, layout);
+            }
         }
     }
 
@@ -3045,7 +4081,9 @@ mod tests {
         let mut data = [0i16; CHUNK_FRAMES * 2];
         for _ in 0..3 {
             sender.begin(shared.generation());
-            for _ in 0..2 { push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], shared.generation()); }
+            for _ in 0..2 {
+                push_pcm(&sender, &cmd_rx, &[0.5; CHUNK_FRAMES], shared.generation());
+            }
             sender.finish(shared.generation());
             ALLOC_TRACKING.with(|tracking| tracking.set(true));
             output.render(&mut data[..37], &shared, 1);
@@ -3061,13 +4099,27 @@ mod tests {
     fn saved_local_tracks() -> (crate::config::PersistedState, Vec<std::path::PathBuf>) {
         let saved = crate::config::load();
         let mut files: Vec<_> = if let Some(folder) = &saved.last_folder {
-            std::fs::read_dir(folder).unwrap().flatten().map(|entry| entry.path())
+            std::fs::read_dir(folder)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
                 .filter(|path| path.is_file() && crate::broker::is_media_path(path))
                 .collect()
         } else {
-            let file = std::path::PathBuf::from(saved.last_track.as_ref().expect("state.cfg needs a local track or folder"));
-            assert!(file.is_file(), "saved last_track must be a local media file");
-            assert!(crate::broker::is_media_path(&file), "saved last_track must have a supported media extension");
+            let file = std::path::PathBuf::from(
+                saved
+                    .last_track
+                    .as_ref()
+                    .expect("state.cfg needs a local track or folder"),
+            );
+            assert!(
+                file.is_file(),
+                "saved last_track must be a local media file"
+            );
+            assert!(
+                crate::broker::is_media_path(&file),
+                "saved last_track must have a supported media extension"
+            );
             vec![file]
         };
         files.sort();
@@ -3078,7 +4130,9 @@ mod tests {
     fn restore_test_controls(shared: &SharedState, saved: &crate::config::PersistedState) {
         shared.set_volume(saved.volume);
         shared.set_eq_enabled(saved.eq_enabled);
-        for (band, gain) in saved.eq_gains.iter().enumerate() { shared.set_eq_gain(band, *gain); }
+        for (band, gain) in saved.eq_gains.iter().enumerate() {
+            shared.set_eq_gain(band, *gain);
+        }
     }
 
     #[test]
@@ -3094,17 +4148,29 @@ mod tests {
         let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         for file in files {
             let source = Source::File(file.to_string_lossy().into_owned());
-            let mut probe = open_track(&source, &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), None).unwrap();
+            let mut probe = open_track(
+                &source,
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                None,
+            )
+            .unwrap();
             let mut expected_seconds = 0.0;
             let mut first_spec = None;
             let mut padding_tolerance: f64 = 0.1;
             loop {
                 let packet = match probe.format.next_packet() {
                     Ok(packet) => packet,
-                    Err(SymphoniaError::IoError(error)) if error.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(SymphoniaError::IoError(error))
+                        if error.kind() == ErrorKind::UnexpectedEof =>
+                    {
+                        break;
+                    }
                     Err(error) => panic!("probe packet failed: {error}"),
                 };
-                if packet.track_id() != probe.track_id { continue; }
+                if packet.track_id() != probe.track_id {
+                    continue;
+                }
                 let decoded = match probe.decoder.decode(&packet) {
                     Ok(decoded) => decoded,
                     Err(SymphoniaError::DecodeError(_)) => continue,
@@ -3114,8 +4180,15 @@ mod tests {
                 let packet_seconds = decoded.frames() as f64 / spec.rate as f64;
                 expected_seconds += packet_seconds;
                 if first_spec.is_none() {
-                    println!("{}: container {} Hz/{} ch, decoded {} Hz/{} ch, timebase {:?}",
-                        file.display(), probe.sample_rate, probe.channels, spec.rate, spec.channels.count(), probe.time_base);
+                    println!(
+                        "{}: container {} Hz/{} ch, decoded {} Hz/{} ch, timebase {:?}",
+                        file.display(),
+                        probe.sample_rate,
+                        probe.channels,
+                        spec.rate,
+                        spec.channels.count(),
+                        probe.time_base
+                    );
                     first_spec = Some((spec.rate, spec.channels.count()));
                     // Compressed packets include codec priming/tail padding.
                     padding_tolerance = padding_tolerance.max(packet_seconds * 4.0);
@@ -3124,9 +4197,19 @@ mod tests {
             drop(probe);
             let started = std::time::Instant::now();
             shared.bump_generation();
-            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()), shared.load_id())).unwrap();
+            cmd_tx
+                .send(DecoderCmd::Load(
+                    Source::File(file.to_string_lossy().into_owned()),
+                    shared.load_id(),
+                ))
+                .unwrap();
             let duration = match status_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                Status::Opened { duration, sample_rate, channels, .. } => {
+                Status::Opened {
+                    duration,
+                    sample_rate,
+                    channels,
+                    ..
+                } => {
                     assert_eq!((sample_rate, channels as usize), first_spec.unwrap());
                     duration.unwrap()
                 }
@@ -3143,26 +4226,54 @@ mod tests {
                         assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                         frames += chunk.len / 2;
                         recycle(&audio.chunk_rx.recycle, chunk);
-                        if let Some(wake) = audio.chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
+                        if let Some(wake) = audio.chunk_rx.state.wake.get() {
+                            wake.notify(CAPACITY);
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
+                        if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire)
+                            == shared.generation()
+                        {
                             audio.drained_tx.send(shared.generation()).unwrap();
-                            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
+                            assert!(matches!(
+                                status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                                Status::Finished { .. }
+                            ));
                             break;
                         }
-                        assert!(started.elapsed() < Duration::from_secs(30), "local decoder stalled");
+                        assert!(
+                            started.elapsed() < Duration::from_secs(30),
+                            "local decoder stalled"
+                        );
                     }
                     Err(error) => panic!("local decoder disconnected: {error}"),
                 }
             }
             let seconds = frames as f64 / 48_000.0;
-            println!("{}: container {:.6}s, output {seconds:.6}s ({frames} device frames)", file.display(), duration.as_secs_f64());
-            assert!((seconds - expected_seconds).abs() < 2.0 / 48_000.0, "output must preserve decoded PCM duration");
-            assert!((seconds - duration.as_secs_f64()).abs() < padding_tolerance, "output must match container timing apart from codec padding");
-            assert!(started.elapsed() < duration / 10, "decoder must comfortably outpace playback");
-            println!("{}: {seconds:.3}s decoded in {:.3}s ({:.1}x realtime), peak chunk wait {:.3}ms",
-                file.display(), started.elapsed().as_secs_f64(), seconds / started.elapsed().as_secs_f64(), peak_wait.as_secs_f64() * 1000.0);
+            println!(
+                "{}: container {:.6}s, output {seconds:.6}s ({frames} device frames)",
+                file.display(),
+                duration.as_secs_f64()
+            );
+            assert!(
+                (seconds - expected_seconds).abs() < 2.0 / 48_000.0,
+                "output must preserve decoded PCM duration"
+            );
+            assert!(
+                (seconds - duration.as_secs_f64()).abs() < padding_tolerance,
+                "output must match container timing apart from codec padding"
+            );
+            assert!(
+                started.elapsed() < duration / 10,
+                "decoder must comfortably outpace playback"
+            );
+            println!(
+                "{}: {seconds:.3}s decoded in {:.3}s ({:.1}x realtime), peak chunk wait {:.3}ms",
+                file.display(),
+                started.elapsed().as_secs_f64(),
+                seconds / started.elapsed().as_secs_f64(),
+                peak_wait.as_secs_f64() * 1000.0
+            );
         }
         cmd_tx.send(DecoderCmd::Shutdown).unwrap();
         audio.decoder.join().unwrap();
@@ -3180,11 +4291,23 @@ mod tests {
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
         let counters = audio.chunk_rx.state.clone();
-        let stream = open_output_stream(device, config, audio.chunk_rx, audio.drained_tx, shared.clone()).unwrap();
+        let stream = open_output_stream(
+            device,
+            config,
+            audio.chunk_rx,
+            audio.drained_tx,
+            shared.clone(),
+        )
+        .unwrap();
         for file in files {
             shared.bump_generation();
             shared.reset_playhead();
-            cmd_tx.send(DecoderCmd::Load(Source::File(file.to_string_lossy().into_owned()), shared.load_id())).unwrap();
+            cmd_tx
+                .send(DecoderCmd::Load(
+                    Source::File(file.to_string_lossy().into_owned()),
+                    shared.load_id(),
+                ))
+                .unwrap();
             let duration = match status_rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                 Status::Opened { duration, .. } => duration,
                 other => panic!("local source failed: {other:?}"),
@@ -3196,7 +4319,12 @@ mod tests {
             // hardware observation. Neither path injects UI input or saves config.
             let full_track = duration.filter(|duration| *duration <= Duration::from_secs(30));
             if let Some(duration) = full_track {
-                assert!(matches!(status_rx.recv_timeout(duration + Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
+                assert!(matches!(
+                    status_rx
+                        .recv_timeout(duration + Duration::from_secs(5))
+                        .unwrap(),
+                    Status::Finished { .. }
+                ));
             } else {
                 thread::sleep(Duration::from_secs(10));
             }
@@ -3204,10 +4332,19 @@ mod tests {
             let elapsed = started.elapsed().as_secs_f64();
             let rendered = shared.position().as_secs_f64();
             let underruns = counters.underrun_frames.load(Ordering::Relaxed) - before;
-            println!("{}: {rendered:.3}s rendered in {elapsed:.3}s wall time, {underruns} underrun frames", file.display());
+            println!(
+                "{}: {rendered:.3}s rendered in {elapsed:.3}s wall time, {underruns} underrun frames",
+                file.display()
+            );
             if let Some(duration) = full_track {
-                assert!((rendered - duration.as_secs_f64()).abs() < 0.25, "track must render at 1x, allowing AAC padding");
-                assert!((rendered - elapsed).abs() < 0.5, "device clock must agree with PCM timing");
+                assert!(
+                    (rendered - duration.as_secs_f64()).abs() < 0.25,
+                    "track must render at 1x, allowing AAC padding"
+                );
+                assert!(
+                    (rendered - elapsed).abs() < 0.5,
+                    "device clock must agree with PCM timing"
+                );
             } else {
                 assert!(rendered > 9.0);
             }
@@ -3232,7 +4369,9 @@ mod tests {
         wav.extend_from_slice(&16u16.to_le_bytes());
         wav.extend_from_slice(b"data");
         wav.extend_from_slice(&size.to_le_bytes());
-        for sample in samples { wav.extend_from_slice(&sample.to_le_bytes()); }
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
         wav
     }
 
@@ -3241,7 +4380,10 @@ mod tests {
     // so no encoder, binary fixture, network, or filesystem is needed.
     fn silent_aac_mp4() -> Vec<u8> {
         fn words(values: &[u32]) -> Vec<u8> {
-            values.iter().flat_map(|value| value.to_be_bytes()).collect()
+            values
+                .iter()
+                .flat_map(|value| value.to_be_bytes())
+                .collect()
         }
         fn atom(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
             let mut bytes = words(&[u32::try_from(payload.len() + 8).unwrap()]);
@@ -3265,8 +4407,20 @@ mod tests {
 
         // Encode raw_data_block(): SCE id/tag, global gain, long-window ICS
         // with no bands/prediction, no pulse/TNS/gain control, then ID_END.
-        let fields = [(0, 3), (0, 4), (140, 8), (0, 1), (0, 2), (0, 1),
-            (0, 6), (0, 1), (0, 1), (0, 1), (0, 1), (7, 3)];
+        let fields = [
+            (0, 3),
+            (0, 4),
+            (140, 8),
+            (0, 1),
+            (0, 2),
+            (0, 1),
+            (0, 6),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (7, 3),
+        ];
         let mut frame = 0u32;
         let mut bits = 0;
         for (value, width) in fields {
@@ -3279,52 +4433,109 @@ mod tests {
         // AudioSpecificConfig: AAC-LC (2), 48 kHz (index 3), mono (1),
         // 1024-sample frames, no core dependency or extension.
         let asc = ((2u16 << 11) | (3 << 7) | (1 << 3)).to_be_bytes();
-        let decoder_config = descriptor(4, &[
-            vec![0x40, 0x15, 0, 0, 0], words(&[0, 0]), descriptor(5, &asc),
-        ].concat());
-        let esds = full_atom(b"esds", 0, &descriptor(3, &[
-            vec![0, 1, 0], decoder_config, descriptor(6, &[2]),
-        ].concat()));
-        let sample_entry = atom(b"mp4a", &[
-            words(&[0, 1, 0, 0, 0x0001_0010, 0, RATE << 16]), esds,
-        ].concat());
-        let ftyp = atom(b"ftyp", &[b"M4A ".to_vec(), words(&[0]), b"M4A isom".to_vec()].concat());
+        let decoder_config = descriptor(
+            4,
+            &[
+                vec![0x40, 0x15, 0, 0, 0],
+                words(&[0, 0]),
+                descriptor(5, &asc),
+            ]
+            .concat(),
+        );
+        let esds = full_atom(
+            b"esds",
+            0,
+            &descriptor(
+                3,
+                &[vec![0, 1, 0], decoder_config, descriptor(6, &[2])].concat(),
+            ),
+        );
+        let sample_entry = atom(
+            b"mp4a",
+            &[words(&[0, 1, 0, 0, 0x0001_0010, 0, RATE << 16]), esds].concat(),
+        );
+        let ftyp = atom(
+            b"ftyp",
+            &[b"M4A ".to_vec(), words(&[0]), b"M4A isom".to_vec()].concat(),
+        );
 
         // One chunk contains all fixed-size packets. Generate moov twice:
         // its size is stable, so the final stco points exactly past mdat's
         // header. Keeping moov first exercises progressive MP4 probing.
         let movie = |offset| {
-            let stbl = atom(b"stbl", &[
-                full_atom(b"stsd", 0, &[words(&[1]), sample_entry.clone()].concat()),
-                full_atom(b"stts", 0, &words(&[1, PACKETS, FRAMES_PER_PACKET])),
-                full_atom(b"stsc", 0, &words(&[1, 1, PACKETS, 1])),
-                full_atom(b"stsz", 0, &words(&[frame.len() as u32, PACKETS])),
-                full_atom(b"stco", 0, &words(&[1, offset])),
-            ].concat());
-            let dinf = atom(b"dinf", &full_atom(b"dref", 0, &[
-                words(&[1]), full_atom(b"url ", 1, &[]),
-            ].concat()));
-            let minf = atom(b"minf", &[
-                full_atom(b"smhd", 0, &words(&[0])), dinf, stbl,
-            ].concat());
-            let mdia = atom(b"mdia", &[
-                full_atom(b"mdhd", 0, &words(&[0, 0, RATE, DURATION, 0x55c4_0000])),
-                full_atom(b"hdlr", 0, &[words(&[0, u32::from_be_bytes(*b"soun"), 0, 0, 0]), b"Test\0".to_vec()].concat()),
-                minf,
-            ].concat());
+            let stbl = atom(
+                b"stbl",
+                &[
+                    full_atom(b"stsd", 0, &[words(&[1]), sample_entry.clone()].concat()),
+                    full_atom(b"stts", 0, &words(&[1, PACKETS, FRAMES_PER_PACKET])),
+                    full_atom(b"stsc", 0, &words(&[1, 1, PACKETS, 1])),
+                    full_atom(b"stsz", 0, &words(&[frame.len() as u32, PACKETS])),
+                    full_atom(b"stco", 0, &words(&[1, offset])),
+                ]
+                .concat(),
+            );
+            let dinf = atom(
+                b"dinf",
+                &full_atom(
+                    b"dref",
+                    0,
+                    &[words(&[1]), full_atom(b"url ", 1, &[])].concat(),
+                ),
+            );
+            let minf = atom(
+                b"minf",
+                &[full_atom(b"smhd", 0, &words(&[0])), dinf, stbl].concat(),
+            );
+            let mdia = atom(
+                b"mdia",
+                &[
+                    full_atom(b"mdhd", 0, &words(&[0, 0, RATE, DURATION, 0x55c4_0000])),
+                    full_atom(
+                        b"hdlr",
+                        0,
+                        &[
+                            words(&[0, u32::from_be_bytes(*b"soun"), 0, 0, 0]),
+                            b"Test\0".to_vec(),
+                        ]
+                        .concat(),
+                    ),
+                    minf,
+                ]
+                .concat(),
+            );
             let matrix = words(&[0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000]);
-            let tkhd = full_atom(b"tkhd", 3, &[
-                words(&[0, 0, 1, 0, DURATION, 0, 0, 0, 0x0100_0000]),
-                matrix.clone(), words(&[0, 0]),
-            ].concat());
-            let mvhd = full_atom(b"mvhd", 0, &[
-                words(&[0, 0, RATE, DURATION, 0x0001_0000, 0x0100_0000, 0, 0]),
-                matrix, words(&[0, 0, 0, 0, 0, 0, 2]),
-            ].concat());
-            atom(b"moov", &[mvhd, atom(b"trak", &[tkhd, mdia].concat())].concat())
+            let tkhd = full_atom(
+                b"tkhd",
+                3,
+                &[
+                    words(&[0, 0, 1, 0, DURATION, 0, 0, 0, 0x0100_0000]),
+                    matrix.clone(),
+                    words(&[0, 0]),
+                ]
+                .concat(),
+            );
+            let mvhd = full_atom(
+                b"mvhd",
+                0,
+                &[
+                    words(&[0, 0, RATE, DURATION, 0x0001_0000, 0x0100_0000, 0, 0]),
+                    matrix,
+                    words(&[0, 0, 0, 0, 0, 0, 2]),
+                ]
+                .concat(),
+            );
+            atom(
+                b"moov",
+                &[mvhd, atom(b"trak", &[tkhd, mdia].concat())].concat(),
+            )
         };
         let offset = u32::try_from(ftyp.len() + movie(0).len() + 8).unwrap();
-        [ftyp, movie(offset), atom(b"mdat", &frame.repeat(PACKETS as usize))].concat()
+        [
+            ftyp,
+            movie(offset),
+            atom(b"mdat", &frame.repeat(PACKETS as usize)),
+        ]
+        .concat()
     }
 
     #[test]
@@ -3335,7 +4546,11 @@ mod tests {
             buffer.append(b"cached track").unwrap();
             buffer.finish(Ok(()));
             let weak = Arc::downgrade(&buffer);
-            let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
+            let mut cache = Some(StreamCache {
+                source: source.clone(),
+                buffer,
+                title: None,
+            });
             select_stream_cache(&mut cache, &source, true);
             assert!(weak.upgrade().is_some());
             select_stream_cache(&mut cache, &next, next != source);
@@ -3347,7 +4562,11 @@ mod tests {
     #[test]
     fn downloader_releases_bytes_and_joins_before_the_next_track() {
         let slot: BufferSlot = Arc::new(Mutex::new(None));
-        let download = DownloadWorker::start(std::io::Cursor::new(b"one downloaded track".to_vec()), &slot).unwrap();
+        let download = DownloadWorker::start(
+            std::io::Cursor::new(b"one downloaded track".to_vec()),
+            &slot,
+        )
+        .unwrap();
         let weak = Arc::downgrade(&download.buffer);
         let mut reader = download.buffer.reader();
         let mut bytes = Vec::new();
@@ -3365,29 +4584,54 @@ mod tests {
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
         shared.set_phase(Phase::Playing);
-        let source = Source::Youtube { url: "ram-test://tail".into(), format: "140".into(), playlist_index: None };
+        let source = Source::Youtube {
+            url: "ram-test://tail".into(),
+            format: "140".into(),
+            playlist_index: None,
+        };
         let buffer = StreamBuffer::new();
         buffer.append(&pcm_wav(&vec![8192; 4096], 48_000)).unwrap();
         buffer.finish(Ok(()));
-        let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
+        let mut cache = Some(StreamCache {
+            source: source.clone(),
+            buffer,
+            title: None,
+        });
         let (cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
         let (_drained_tx, drained_rx) = drain_channel(&cmd_rx.wake);
         let decoder_shared = shared.clone();
-        let decoder = thread::spawn(move || play_source(&PlaybackContext {
-            shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
-            chunk_tx: &chunk_tx, drained_rx: &drained_rx,
-            child_slot: &Arc::new(Mutex::new(None)), buffer_slot: &Arc::new(Mutex::new(None)),
-        }, &mut cache, source, decoder_shared.load_id()));
-        assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Opened { .. }));
+        let decoder = thread::spawn(move || {
+            play_source(
+                &PlaybackContext {
+                    shared: &decoder_shared,
+                    cmds: &cmd_rx,
+                    status_tx: &status_tx,
+                    chunk_tx: &chunk_tx,
+                    drained_rx: &drained_rx,
+                    child_slot: &Arc::new(Mutex::new(None)),
+                    buffer_slot: &Arc::new(Mutex::new(None)),
+                },
+                &mut cache,
+                source,
+                decoder_shared.load_id(),
+            )
+        });
+        assert!(matches!(
+            status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Status::Opened { .. }
+        ));
         let first = chunk_rx.queue.recv_timeout(Duration::from_secs(5)).unwrap();
         // No drain notification is sent. The complete short WAV reaches the
         // final drain wait while playback still owns its downloaded reader.
         thread::sleep(Duration::from_millis(10));
         shared.set_playhead_frames(2400);
         cmd_tx.send(DecoderCmd::SeekRelative(-0.05)).unwrap();
-        assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Seeked { .. }));
+        assert!(matches!(
+            status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Status::Seeked { .. }
+        ));
         let replayed = chunk_rx.queue.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(first.samples(), replayed.samples());
         assert_ne!(first.generation, replayed.generation);
@@ -3403,12 +4647,20 @@ mod tests {
         shared.set_sample_rate(48_000);
         shared.set_loop_enabled(true);
         shared.set_phase(Phase::Playing);
-        let source = Source::Youtube { url: "ram-test://offline".into(), format: "140".into(), playlist_index: None };
+        let source = Source::Youtube {
+            url: "ram-test://offline".into(),
+            format: "140".into(),
+            playlist_index: None,
+        };
         let buffer = StreamBuffer::new();
         buffer.append(&pcm_wav(&vec![8192; 4096], 48_000)).unwrap();
         buffer.finish(Ok(()));
         let weak = Arc::downgrade(&buffer);
-        let mut cache = Some(StreamCache { source: source.clone(), buffer, title: Some("RAM title".into()) });
+        let mut cache = Some(StreamCache {
+            source: source.clone(),
+            buffer,
+            title: Some("RAM title".into()),
+        });
         let (_cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
@@ -3427,7 +4679,9 @@ mod tests {
                     Ok(chunk) => {
                         rounds.push(chunk.samples().to_vec());
                         recycle(&chunk_rx.recycle, chunk);
-                        if let Some(wake) = chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
+                        if let Some(wake) = chunk_rx.state.wake.get() {
+                            wake.notify(CAPACITY);
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         let _ = drained_tx.try_send(consumer_shared.generation());
@@ -3440,48 +4694,107 @@ mod tests {
         let decoder_shared = shared.clone();
         let decoder = thread::spawn(move || {
             for _ in 0..2 {
-                assert!(matches!(play_source(&PlaybackContext {
-                    shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
-                    chunk_tx: &chunk_tx, drained_rx: &drained_rx,
-                    child_slot: &child_slot, buffer_slot: &buffer_slot,
-                }, &mut cache, source.clone(), decoder_shared.load_id()), PlayExit::Eof));
-                assert!(child_slot.lock().unwrap().is_none(), "repeat must not spawn yt-dlp");
-                assert!(buffer_slot.lock().unwrap().is_none(), "repeat must not spawn a downloader");
+                assert!(matches!(
+                    play_source(
+                        &PlaybackContext {
+                            shared: &decoder_shared,
+                            cmds: &cmd_rx,
+                            status_tx: &status_tx,
+                            chunk_tx: &chunk_tx,
+                            drained_rx: &drained_rx,
+                            child_slot: &child_slot,
+                            buffer_slot: &buffer_slot,
+                        },
+                        &mut cache,
+                        source.clone(),
+                        decoder_shared.load_id()
+                    ),
+                    PlayExit::Eof
+                ));
+                assert!(
+                    child_slot.lock().unwrap().is_none(),
+                    "repeat must not spawn yt-dlp"
+                );
+                assert!(
+                    buffer_slot.lock().unwrap().is_none(),
+                    "repeat must not spawn a downloader"
+                );
             }
             drop(cache);
         });
         for _ in 0..2 {
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
-                Status::Opened { title: Some(title), .. } if title == "RAM title"));
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
+            assert!(
+                matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Status::Opened { title: Some(title), .. } if title == "RAM title")
+            );
+            assert!(matches!(
+                status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Status::Finished { .. }
+            ));
         }
         decoder.join().unwrap();
         done.store(true, Ordering::Release);
         let rounds = consumer.join().unwrap();
         assert_eq!(rounds.len(), 2);
-        assert_eq!(rounds[0], rounds[1], "both plays decode identical cached bytes from offset zero");
-        assert!(weak.upgrade().is_none(), "the last cache owner must release all bytes");
+        assert_eq!(
+            rounds[0], rounds[1],
+            "both plays decode identical cached bytes from offset zero"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "the last cache owner must release all bytes"
+        );
     }
 
     #[test]
     fn all_streaming_platforms_seek_a_downloaded_memory_container() {
-        for url in ["https://youtu.be/test", "https://www.bilibili.com/video/BVtest", "https://www.nicovideo.jp/watch/sm1"] {
+        for url in [
+            "https://youtu.be/test",
+            "https://www.bilibili.com/video/BVtest",
+            "https://www.nicovideo.jp/watch/sm1",
+        ] {
             let buffer = StreamBuffer::new();
-            buffer.append(&pcm_wav(&vec![8192; 48_000], 48_000)).unwrap();
+            buffer
+                .append(&pcm_wav(&vec![8192; 48_000], 48_000))
+                .unwrap();
             buffer.finish(Ok(()));
-            let mut track = open_track(&Source::from_raw(url), &Arc::new(Mutex::new(None)),
-                &Arc::new(Mutex::new(None)), Some(buffer)).unwrap();
+            let mut track = open_track(
+                &Source::from_raw(url),
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                Some(buffer),
+            )
+            .unwrap();
             let shared = SharedState::new();
             shared.set_sample_rate(48_000);
             let mut generation = shared.generation();
             let mut pending = vec![1.0];
             let mut eq = EqChain::new();
             let mut resampler = None;
-            assert!(seek_relative(&mut track, &shared, 0.5, &mut pending, &mut eq, &mut resampler, &mut generation));
+            assert!(seek_relative(
+                &mut track,
+                &shared,
+                0.5,
+                &mut pending,
+                &mut eq,
+                &mut resampler,
+                &mut generation
+            ));
             assert!(shared.position() <= Duration::from_millis(500));
-            assert!(shared.position() >= Duration::from_millis(450), "container seek returns the actual packet timestamp");
+            assert!(
+                shared.position() >= Duration::from_millis(450),
+                "container seek returns the actual packet timestamp"
+            );
             assert!(pending.is_empty());
-            assert!(seek_relative(&mut track, &shared, -10.0, &mut pending, &mut eq, &mut resampler, &mut generation));
+            assert!(seek_relative(
+                &mut track,
+                &shared,
+                -10.0,
+                &mut pending,
+                &mut eq,
+                &mut resampler,
+                &mut generation
+            ));
             assert_eq!(shared.position(), Duration::ZERO);
             assert!(track._child.is_none());
             assert!(track._download.is_none());
@@ -3493,8 +4806,13 @@ mod tests {
         let buffer = StreamBuffer::new();
         buffer.append(&silent_aac_mp4()).unwrap();
         buffer.finish(Ok(()));
-        let mut track = open_track(&Source::from_raw("https://youtu.be/generated"),
-            &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), Some(buffer)).unwrap();
+        let mut track = open_track(
+            &Source::from_raw("https://youtu.be/generated"),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            Some(buffer),
+        )
+        .unwrap();
         assert_eq!(track.duration, Some(Duration::from_millis(256)));
         let mut frames = 0;
         for _ in 0..12 {
@@ -3509,8 +4827,10 @@ mod tests {
             assert!(samples.samples().iter().all(|sample| *sample == 0.0));
         }
         assert_eq!(frames, 12_288);
-        assert!(matches!(track.format.next_packet(), Err(SymphoniaError::IoError(error))
-            if error.kind() == ErrorKind::UnexpectedEof));
+        assert!(
+            matches!(track.format.next_packet(), Err(SymphoniaError::IoError(error))
+            if error.kind() == ErrorKind::UnexpectedEof)
+        );
     }
 
     #[test]
@@ -3522,24 +4842,68 @@ mod tests {
         let payload = data.windows(4).position(|bytes| bytes == b"mdat").unwrap() + 4;
         let prefix = payload + (data.len() - payload) / 2;
         buffer.append(&data[..prefix]).unwrap();
-        let mut track = open_track(&Source::from_raw("https://youtu.be/progressive"),
-            &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), Some(buffer.clone())).unwrap();
+        let mut track = open_track(
+            &Source::from_raw("https://youtu.be/progressive"),
+            &Arc::new(Mutex::new(None)),
+            &Arc::new(Mutex::new(None)),
+            Some(buffer.clone()),
+        )
+        .unwrap();
         let packet = track.format.next_packet().unwrap();
         assert!(track.decoder.decode(&packet).is_ok());
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
         let mut generation = shared.generation();
-        assert!(seek_relative(&mut track, &shared, 0.05, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation));
+        assert!(seek_relative(
+            &mut track,
+            &shared,
+            0.05,
+            &mut Vec::new(),
+            &mut EqChain::new(),
+            &mut None,
+            &mut generation
+        ));
         assert!(!buffer.complete());
         assert!(shared.position() > Duration::from_millis(20));
-        assert!(!seek_relative(&mut track, &shared, 0.2, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation),
-            "undownloaded sample bytes must be refused without waiting");
-        assert!(seek_relative(&mut track, &shared, -5.0, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation));
+        assert!(
+            !seek_relative(
+                &mut track,
+                &shared,
+                0.2,
+                &mut Vec::new(),
+                &mut EqChain::new(),
+                &mut None,
+                &mut generation
+            ),
+            "undownloaded sample bytes must be refused without waiting"
+        );
+        assert!(seek_relative(
+            &mut track,
+            &shared,
+            -5.0,
+            &mut Vec::new(),
+            &mut EqChain::new(),
+            &mut None,
+            &mut generation
+        ));
         assert_eq!(shared.position(), Duration::ZERO);
-        assert!(track.decoder.decode(&track.seek_packet.take().unwrap()).is_ok());
+        assert!(
+            track
+                .decoder
+                .decode(&track.seek_packet.take().unwrap())
+                .is_ok()
+        );
         buffer.append(&data[prefix..]).unwrap();
         buffer.finish(Ok(()));
-        assert!(seek_relative(&mut track, &shared, 0.2, &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation));
+        assert!(seek_relative(
+            &mut track,
+            &shared,
+            0.2,
+            &mut Vec::new(),
+            &mut EqChain::new(),
+            &mut None,
+            &mut generation
+        ));
     }
 
     #[test]
@@ -3550,8 +4914,13 @@ mod tests {
             let payload = data.windows(4).position(|bytes| bytes == b"mdat").unwrap() + 4;
             let prefix = payload + (data.len() - payload) / 2;
             buffer.append(&data[..prefix]).unwrap();
-            let mut track = open_track(&Source::from_raw("https://youtu.be/recovery"),
-                &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), Some(buffer.clone())).unwrap();
+            let mut track = open_track(
+                &Source::from_raw("https://youtu.be/recovery"),
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                Some(buffer.clone()),
+            )
+            .unwrap();
             let shared = SharedState::new();
             shared.set_sample_rate(48_000);
             let (started_tx, started_rx) = bounded(1);
@@ -3559,23 +4928,40 @@ mod tests {
             let worker = thread::spawn(move || {
                 let mut generation = shared.generation();
                 started_tx.send(()).unwrap();
-                let restored = seek_relative(&mut track, &shared, DecoderSeek::Restore(0.2),
-                    &mut Vec::new(), &mut EqChain::new(), &mut None, &mut generation);
+                let restored = seek_relative(
+                    &mut track,
+                    &shared,
+                    DecoderSeek::Restore(0.2),
+                    &mut Vec::new(),
+                    &mut EqChain::new(),
+                    &mut None,
+                    &mut generation,
+                );
                 result_tx.send((restored, shared.position())).unwrap();
             });
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             let premature = result_rx.recv_timeout(Duration::from_millis(30));
-            if cancel { buffer.cancel(); } else {
+            if cancel {
+                buffer.cancel();
+            } else {
                 buffer.append(&data[prefix..]).unwrap();
                 buffer.finish(Ok(()));
             }
-            let result = match premature { Ok(result) => Ok(result), Err(_) => result_rx.recv_timeout(Duration::from_secs(1)) };
+            let result = match premature {
+                Ok(result) => Ok(result),
+                Err(_) => result_rx.recv_timeout(Duration::from_secs(1)),
+            };
             buffer.cancel(); // unblock the worker even if this regression fails
             worker.join().unwrap();
-            assert!(premature.is_err(), "recovery waits instead of refusing an uncached target");
+            assert!(
+                premature.is_err(),
+                "recovery waits instead of refusing an uncached target"
+            );
             let (restored, position) = result.unwrap();
             assert_eq!(restored, !cancel);
-            if !cancel { assert!(position >= Duration::from_millis(150)); }
+            if !cancel {
+                assert!(position >= Duration::from_millis(150));
+            }
         }
     }
 
@@ -3593,8 +4979,17 @@ mod tests {
     fn decoded_pcm_format_validates_rate_and_channel_stride() {
         use symphonia::core::audio::Channels;
         for rate in [22_050, 24_000, 44_100, 48_000] {
-            assert_eq!(decoded_pcm_format(SignalSpec::new(rate, Channels::FRONT_LEFT)), Ok((rate, 1)));
-            assert_eq!(decoded_pcm_format(SignalSpec::new(rate, Channels::FRONT_LEFT | Channels::FRONT_RIGHT)), Ok((rate, 2)));
+            assert_eq!(
+                decoded_pcm_format(SignalSpec::new(rate, Channels::FRONT_LEFT)),
+                Ok((rate, 1))
+            );
+            assert_eq!(
+                decoded_pcm_format(SignalSpec::new(
+                    rate,
+                    Channels::FRONT_LEFT | Channels::FRONT_RIGHT
+                )),
+                Ok((rate, 2))
+            );
         }
         assert!(decoded_pcm_format(SignalSpec::new(0, Channels::FRONT_LEFT)).is_err());
         assert!(decoded_pcm_format(SignalSpec::new(48_000, Channels::empty())).is_err());
@@ -3603,26 +4998,50 @@ mod tests {
     #[test]
     fn mp4_sample_entry_rate_cannot_change_decoded_pcm_timing() {
         let fixture = silent_aac_mp4();
-        let entry = fixture.windows(4).position(|bytes| bytes == b"mp4a").unwrap();
+        let entry = fixture
+            .windows(4)
+            .position(|bytes| bytes == b"mp4a")
+            .unwrap();
         // AudioSampleEntry stores a 16.16 rate 28 bytes after its type.
         let rate_offset = entry + 28;
-        assert_eq!(&fixture[rate_offset..rate_offset + 4], &(48_000u32 << 16).to_be_bytes());
+        assert_eq!(
+            &fixture[rate_offset..rate_offset + 4],
+            &(48_000u32 << 16).to_be_bytes()
+        );
         let mut rounds = Vec::new();
         for container_rate in [48_000u32, 24_000] {
             let mut bytes = fixture.to_vec();
-            bytes[rate_offset..rate_offset + 4].copy_from_slice(&(container_rate << 16).to_be_bytes());
+            bytes[rate_offset..rate_offset + 4]
+                .copy_from_slice(&(container_rate << 16).to_be_bytes());
             let shared = SharedState::new();
             shared.set_sample_rate(48_000);
             shared.set_device_channels(1);
             shared.set_volume(1.0);
             shared.set_eq_enabled(false);
-            let source = Source::Youtube { url: "ram-test://aac-rate".into(), format: "140".into(), playlist_index: None };
+            let source = Source::Youtube {
+                url: "ram-test://aac-rate".into(),
+                format: "140".into(),
+                playlist_index: None,
+            };
             let buffer = StreamBuffer::new();
             buffer.append(&bytes).unwrap();
             buffer.finish(Ok(()));
-            let mut cache = Some(StreamCache { source: source.clone(), buffer, title: None });
-            let mut probe = open_track(&source, &Arc::new(Mutex::new(None)), &Arc::new(Mutex::new(None)), cache.as_ref().map(|cache| cache.buffer.clone())).unwrap();
-            assert_eq!(probe.sample_rate, container_rate, "regression fixture must change demuxer metadata");
+            let mut cache = Some(StreamCache {
+                source: source.clone(),
+                buffer,
+                title: None,
+            });
+            let mut probe = open_track(
+                &source,
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(None)),
+                cache.as_ref().map(|cache| cache.buffer.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                probe.sample_rate, container_rate,
+                "regression fixture must change demuxer metadata"
+            );
             let time_base = probe.time_base.unwrap();
             assert_eq!((time_base.numer, time_base.denom), (1, 48_000));
             let packet = probe.format.next_packet().unwrap();
@@ -3633,24 +5052,50 @@ mod tests {
             let (chunk_tx, chunk_rx) = chunk_channel(48_000, 1, 4);
             let (drained_tx, drained_rx) = drain_channel(&cmd_rx.wake);
             let decoder_shared = shared.clone();
-            let decoder = thread::spawn(move || play_source(&PlaybackContext {
-                shared: &decoder_shared, cmds: &cmd_rx, status_tx: &status_tx,
-                chunk_tx: &chunk_tx, drained_rx: &drained_rx,
-                child_slot: &Arc::new(Mutex::new(None)), buffer_slot: &Arc::new(Mutex::new(None)),
-            }, &mut cache, source, decoder_shared.load_id()));
+            let decoder = thread::spawn(move || {
+                play_source(
+                    &PlaybackContext {
+                        shared: &decoder_shared,
+                        cmds: &cmd_rx,
+                        status_tx: &status_tx,
+                        chunk_tx: &chunk_tx,
+                        drained_rx: &drained_rx,
+                        child_slot: &Arc::new(Mutex::new(None)),
+                        buffer_slot: &Arc::new(Mutex::new(None)),
+                    },
+                    &mut cache,
+                    source,
+                    decoder_shared.load_id(),
+                )
+            });
             let duration = match status_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
-                Status::Opened { sample_rate: 48_000, channels: 1, duration, .. } => duration,
+                Status::Opened {
+                    sample_rate: 48_000,
+                    channels: 1,
+                    duration,
+                    ..
+                } => duration,
                 other => panic!("source must report its actual PCM format: {other:?}"),
             };
             let mut pcm = Vec::new();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                assert!(std::time::Instant::now() < deadline, "AAC regression decoder stalled");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "AAC regression decoder stalled"
+                );
                 match chunk_rx.queue.recv_timeout(Duration::from_millis(5)) {
-                    Ok(chunk) => { pcm.extend_from_slice(chunk.samples()); recycle(&chunk_rx.recycle, chunk);
-                        if let Some(wake) = chunk_rx.state.wake.get() { wake.notify(CAPACITY); } }
+                    Ok(chunk) => {
+                        pcm.extend_from_slice(chunk.samples());
+                        recycle(&chunk_rx.recycle, chunk);
+                        if let Some(wake) = chunk_rx.state.wake.get() {
+                            wake.notify(CAPACITY);
+                        }
+                    }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        if chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation() {
+                        if chunk_rx.state.eof_generation.load(Ordering::Acquire)
+                            == shared.generation()
+                        {
                             drained_tx.send(shared.generation()).unwrap();
                             break;
                         }
@@ -3659,29 +5104,46 @@ mod tests {
                 }
             }
             assert!(matches!(decoder.join().unwrap(), PlayExit::Eof));
-            assert!(matches!(status_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Status::Finished { .. }));
+            assert!(matches!(
+                status_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Status::Finished { .. }
+            ));
             rounds.push((duration, pcm));
         }
-        assert_eq!(rounds[0], rounds[1], "sample-entry hints must not change frame count, samples or duration");
+        assert_eq!(
+            rounds[0], rounds[1],
+            "sample-entry hints must not change frame count, samples or duration"
+        );
     }
 
     #[test]
     fn low_rate_pcm_resampling_preserves_one_second_and_one_khz_pitch() {
         use symphonia::core::audio::Channels;
         for src_rate in [22_050, 24_000] {
-            let (rate, channels) = decoded_pcm_format(SignalSpec::new(src_rate, Channels::FRONT_LEFT)).unwrap();
-            let input: Vec<f32> = (0..src_rate).map(|frame| {
-                (std::f32::consts::TAU * 1000.0 * frame as f32 / src_rate as f32).sin()
-            }).collect();
+            let (rate, channels) =
+                decoded_pcm_format(SignalSpec::new(src_rate, Channels::FRONT_LEFT)).unwrap();
+            let input: Vec<f32> = (0..src_rate)
+                .map(|frame| {
+                    (std::f32::consts::TAU * 1000.0 * frame as f32 / src_rate as f32).sin()
+                })
+                .collect();
             for dst_rate in [44_100, 48_000] {
                 let mut rs = LinearResampler::new(rate, dst_rate, channels);
                 let mut output = Vec::new();
                 // Exercise fractional carry across AAC-sized packets.
-                for packet in input.chunks(1024) { rs.process(packet, packet.len(), &mut output); }
+                for packet in input.chunks(1024) {
+                    rs.process(packet, packet.len(), &mut output);
+                }
                 assert!((output.len() as i64 - dst_rate as i64).abs() <= 1);
-                let cycles = output.windows(2).filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0).count();
+                let cycles = output
+                    .windows(2)
+                    .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+                    .count();
                 let pitch = cycles as f64 * dst_rate as f64 / output.len() as f64;
-                assert!((pitch - 1000.0).abs() < 2.0, "{src_rate} -> {dst_rate}: {pitch} Hz");
+                assert!(
+                    (pitch - 1000.0).abs() < 2.0,
+                    "{src_rate} -> {dst_rate}: {pitch} Hz"
+                );
             }
         }
     }
@@ -3691,15 +5153,23 @@ mod tests {
         let mut eq = EqChain::new();
         for rate in [22_050, 24_000] {
             eq.rebuild(&[-5.0; EQ_BANDS], rate, 1);
-            let mut tone: Vec<f32> = (0..rate).map(|frame| {
-                0.05 * (std::f32::consts::TAU * 1000.0 * frame as f32 / rate as f32).sin()
-            }).collect();
+            let mut tone: Vec<f32> = (0..rate)
+                .map(|frame| {
+                    0.05 * (std::f32::consts::TAU * 1000.0 * frame as f32 / rate as f32).sin()
+                })
+                .collect();
             eq.apply(&mut tone, 1);
-            assert!(tone.iter().all(|sample| sample.is_finite() && sample.abs() < 1.0));
+            assert!(
+                tone.iter()
+                    .all(|sample| sample.is_finite() && sample.abs() < 1.0)
+            );
             assert!(!eq.bands[EQ_BANDS - 1].active, "16 kHz is above Nyquist");
         }
         eq.rebuild(&[-5.0; EQ_BANDS], 48_000, 2);
-        assert!(eq.bands[EQ_BANDS - 1].active, "16 kHz remains available at device-capable source rates");
+        assert!(
+            eq.bands[EQ_BANDS - 1].active,
+            "16 kHz remains available at device-capable source rates"
+        );
     }
 
     #[test]
@@ -3709,7 +5179,11 @@ mod tests {
         let input = vec![0.5f32; 4410];
         let mut out = Vec::new();
         rs.process(&input, 4410, &mut out);
-        assert!((out.len() as i64 - 4800).abs() <= 2, "got {} frames", out.len());
+        assert!(
+            (out.len() as i64 - 4800).abs() <= 2,
+            "got {} frames",
+            out.len()
+        );
         // The first two frames interpolate from the zero-initialized carry —
         // a 2-sample soft start. Everything after is exact.
         assert!(out[2..].iter().all(|&s| (s - 0.5).abs() < 1e-6));
@@ -3721,12 +5195,19 @@ mod tests {
         let input = vec![0.25f32; 4800 * 2];
         let mut out = Vec::new();
         rs.process(&input, 4800, &mut out);
-        assert!((out.len() as i64 - 4410 * 2).abs() <= 4, "got {} samples", out.len());
+        assert!(
+            (out.len() as i64 - 4410 * 2).abs() <= 4,
+            "got {} samples",
+            out.len()
+        );
     }
 
     #[test]
     fn clean_title_takes_first_line_and_caps() {
-        assert_eq!(clean_title("Neo Tokyo [HD]\nsecond line\r\n"), "Neo Tokyo [HD]");
+        assert_eq!(
+            clean_title("Neo Tokyo [HD]\nsecond line\r\n"),
+            "Neo Tokyo [HD]"
+        );
         assert_eq!(clean_title("  padded  "), "padded");
         assert_eq!(clean_title(""), "");
         let long = "x".repeat(300);
@@ -3766,9 +5247,15 @@ mod tests {
         let (cmd_tx, cmd_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), cmd_rx.clone(), status_tx);
-        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
-            cmd_tx.clone(), cmd_rx.clone(), audio.controls.clone().hook(),
-        )).with_playlist_fetching();
+        let mut broker = Broker::new(
+            shared.clone(),
+            DecoderLink::with_interrupt(
+                cmd_tx.clone(),
+                cmd_rx.clone(),
+                audio.controls.clone().hook(),
+            ),
+        )
+        .with_playlist_fetching();
         let background_events = broker.background_events();
         let playlist = crate::broker::playlist_index_of(&url).is_some();
         let result = (|| -> Result<(), String> {
@@ -3776,13 +5263,18 @@ mod tests {
             // old reader and advance a playlist (or open another single video)
             // on the same decoder thread.
             for step in 0..2 {
-                let raw = if step == 0 || playlist { &*url } else { "https://www.youtube.com/watch?v=jNQXAC9IVRw" };
+                let raw = if step == 0 || playlist {
+                    &*url
+                } else {
+                    "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+                };
                 let started = std::time::Instant::now();
                 if step == 1 && playlist {
                     broker.handle_command(PlayerCommand::NextTrack);
                 } else {
                     broker.handle_command(PlayerCommand::Load {
-                        source: Source::from_raw(raw), paused: false,
+                        source: Source::from_raw(raw),
+                        paused: false,
                     });
                 }
                 let deadline = started + Duration::from_secs(60);
@@ -3798,7 +5290,10 @@ mod tests {
                     return Err(format!("stream did not enter Playing: {raw}"));
                 }
                 loop {
-                    let chunk = audio.chunk_rx.queue.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    let chunk = audio
+                        .chunk_rx
+                        .queue
+                        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
                         .map_err(|e| format!("waiting for decoded audio: {e}"))?;
                     let current = chunk.generation == shared.generation();
                     if current {
@@ -3806,23 +5301,45 @@ mod tests {
                         assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
                     }
                     recycle(&audio.chunk_rx.recycle, chunk);
-                        if let Some(wake) = audio.chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
-                    if !current { continue; }
+                    if let Some(wake) = audio.chunk_rx.state.wake.get() {
+                        wake.notify(CAPACITY);
+                    }
+                    if !current {
+                        continue;
+                    }
                     break;
                 }
-                println!("stream step {}: decoded audio in {:.2}s", step + 1, started.elapsed().as_secs_f64());
+                println!(
+                    "stream step {}: decoded audio in {:.2}s",
+                    step + 1,
+                    started.elapsed().as_secs_f64()
+                );
                 if playlist {
                     while broker.track_list().loading {
-                        background_events.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                        background_events
+                            .recv_timeout(
+                                deadline.saturating_duration_since(std::time::Instant::now()),
+                            )
                             .map_err(|e| format!("waiting for playlist metadata: {e}"))?;
                         broker.poll_background();
                     }
                     let list = broker.track_list();
                     if list.titles.len() < 2 || list.current != Some(step) {
-                        return Err(format!("playlist step {}: unexpected list {list:?}", step + 1));
+                        return Err(format!(
+                            "playlist step {}: unexpected list {list:?}",
+                            step + 1
+                        ));
                     }
-                    println!("playlist: {} tracks, selected entry {}: {}", list.titles.len(), step + 1, list.titles[step]);
-                    assert_eq!(broker.persist_snapshot().last_playlist_index, Some(step + 1));
+                    println!(
+                        "playlist: {} tracks, selected entry {}: {}",
+                        list.titles.len(),
+                        step + 1,
+                        list.titles[step]
+                    );
+                    assert_eq!(
+                        broker.persist_snapshot().last_playlist_index,
+                        Some(step + 1)
+                    );
                 }
             }
             Ok(())
@@ -3839,10 +5356,14 @@ mod tests {
     #[ignore = "requires yt-dlp and a live streaming source"]
     fn live_stream_seeks_and_repeats_from_the_same_ram_buffer() {
         use crate::broker::{Command as PlayerCommand, DecoderLink, Phase};
-        let url = std::env::var("KYOUKO_TEST_URL").expect("set KYOUKO_TEST_URL to a single streaming video");
+        let url = std::env::var("KYOUKO_TEST_URL")
+            .expect("set KYOUKO_TEST_URL to a single streaming video");
         let mut source = Source::from_raw(&url);
         if let Ok(selected) = std::env::var("KYOUKO_TEST_FORMAT")
-            && let Source::Youtube { format, .. } = &mut source { *format = selected; }
+            && let Source::Youtube { format, .. } = &mut source
+        {
+            *format = selected;
+        }
         let shared = SharedState::new();
         shared.set_sample_rate(48_000);
         shared.set_device_channels(2);
@@ -3850,77 +5371,143 @@ mod tests {
         let (command_tx, command_rx) = command_channel(8);
         let (status_tx, status_rx) = bounded(16);
         let audio = spawn(shared.clone(), command_rx.clone(), status_tx);
-        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
-            command_tx, command_rx, audio.controls.clone().hook()));
+        let mut broker = Broker::new(
+            shared.clone(),
+            DecoderLink::with_interrupt(command_tx, command_rx, audio.controls.clone().hook()),
+        );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            broker.handle_command(PlayerCommand::Load { source, paused: false });
+            broker.handle_command(PlayerCommand::Load {
+                source,
+                paused: false,
+            });
             let until = std::time::Instant::now() + Duration::from_secs(120);
             while shared.phase() == Phase::Loading {
-                broker.handle_status(status_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).unwrap());
+                broker.handle_status(
+                    status_rx
+                        .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+                        .unwrap(),
+                );
             }
             assert_eq!(shared.phase(), Phase::Playing);
-            let original = audio.controls.buffer_slot.lock().unwrap().as_ref().unwrap().clone();
-            original.upgrade().unwrap().wait_complete(until.saturating_duration_since(std::time::Instant::now())).unwrap();
+            let original = audio
+                .controls
+                .buffer_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            original
+                .upgrade()
+                .unwrap()
+                .wait_complete(until.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
             println!("stream fully cached; seeking +5s and back to zero using downloaded bytes");
             for delta in [5.0, -5.0] {
                 broker.handle_command(PlayerCommand::SeekRelative(delta));
                 loop {
-                    let status = status_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).unwrap();
+                    let status = status_rx
+                        .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
+                        .unwrap();
                     match status {
-                        Status::Seeked { .. } => { broker.handle_status(status); break; }
-                        Status::SeekFailed { .. } | Status::Failed { .. } => panic!("stream seek failed: {status:?}"),
+                        Status::Seeked { .. } => {
+                            broker.handle_status(status);
+                            break;
+                        }
+                        Status::SeekFailed { .. } | Status::Failed { .. } => {
+                            panic!("stream seek failed: {status:?}")
+                        }
                         status => broker.handle_status(status),
                     }
                 }
-                if delta > 0.0 { assert!((shared.position().as_secs_f64() - 5.0).abs() < 0.15); }
-                else { assert_eq!(shared.position(), Duration::ZERO); }
+                if delta > 0.0 {
+                    assert!((shared.position().as_secs_f64() - 5.0).abs() < 0.15);
+                } else {
+                    assert_eq!(shared.position(), Duration::ZERO);
+                }
             }
             let mut rounds = Vec::new();
             for round in 0..2 {
                 if round == 1 {
                     while shared.phase() == Phase::Loading {
-                        broker.handle_status(status_rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).unwrap());
+                        broker.handle_status(
+                            status_rx
+                                .recv_timeout(
+                                    until.saturating_duration_since(std::time::Instant::now()),
+                                )
+                                .unwrap(),
+                        );
                     }
                     assert_eq!(shared.phase(), Phase::Playing);
-                    assert!(audio.controls.child_slot.lock().unwrap().is_none(), "repeat must not spawn yt-dlp");
-                    assert!(audio.controls.buffer_slot.lock().unwrap().is_none(), "repeat must not spawn a download worker");
-                    assert!(original.upgrade().is_some(), "repeat retains the original allocation");
+                    assert!(
+                        audio.controls.child_slot.lock().unwrap().is_none(),
+                        "repeat must not spawn yt-dlp"
+                    );
+                    assert!(
+                        audio.controls.buffer_slot.lock().unwrap().is_none(),
+                        "repeat must not spawn a download worker"
+                    );
+                    assert!(
+                        original.upgrade().is_some(),
+                        "repeat retains the original allocation"
+                    );
                 }
                 let mut frames = 0usize;
                 let mut first_samples = Vec::new();
                 loop {
                     let remaining = until.saturating_duration_since(std::time::Instant::now());
                     assert!(!remaining.is_zero(), "stream decode/repeat timed out");
-                    if let Ok(chunk) = audio.chunk_rx.queue.recv_timeout(remaining.min(Duration::from_millis(10))) {
-                            if chunk.generation == shared.generation() {
-                                assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
-                                if first_samples.is_empty() { first_samples.extend_from_slice(&chunk.samples()[..chunk.samples().len().min(256)]); }
-                                frames += chunk.samples().len() / 2;
-                                shared.add_frames_played((chunk.samples().len() / 2) as u64);
+                    if let Ok(chunk) = audio
+                        .chunk_rx
+                        .queue
+                        .recv_timeout(remaining.min(Duration::from_millis(10)))
+                    {
+                        if chunk.generation == shared.generation() {
+                            assert!(chunk.samples().iter().all(|sample| sample.is_finite()));
+                            if first_samples.is_empty() {
+                                first_samples.extend_from_slice(
+                                    &chunk.samples()[..chunk.samples().len().min(256)],
+                                );
                             }
-                            recycle(&audio.chunk_rx.recycle, chunk);
-                        if let Some(wake) = audio.chunk_rx.state.wake.get() { wake.notify(CAPACITY); }
+                            frames += chunk.samples().len() / 2;
+                            shared.add_frames_played((chunk.samples().len() / 2) as u64);
+                        }
+                        recycle(&audio.chunk_rx.recycle, chunk);
+                        if let Some(wake) = audio.chunk_rx.state.wake.get() {
+                            wake.notify(CAPACITY);
+                        }
                     }
                     if let Ok(status) = status_rx.try_recv() {
-                            match status {
-                                Status::Finished { .. } => {
-                                    println!("round {}: decoded {frames} frames ({:.2}s)", round + 1, frames as f64 / 48_000.0);
-                                    if round == 0 { broker.handle_status(status); }
-                                    break;
+                        match status {
+                            Status::Finished { .. } => {
+                                println!(
+                                    "round {}: decoded {frames} frames ({:.2}s)",
+                                    round + 1,
+                                    frames as f64 / 48_000.0
+                                );
+                                if round == 0 {
+                                    broker.handle_status(status);
                                 }
-                                Status::Failed { .. } => panic!("stream decode failed: {status:?}"),
-                                status => broker.handle_status(status),
+                                break;
                             }
+                            Status::Failed { .. } => panic!("stream decode failed: {status:?}"),
+                            status => broker.handle_status(status),
+                        }
                     }
-                    if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire) == shared.generation()
-                        && audio.chunk_rx.queue.is_empty() {
+                    if audio.chunk_rx.state.eof_generation.load(Ordering::Acquire)
+                        == shared.generation()
+                        && audio.chunk_rx.queue.is_empty()
+                    {
                         let _ = audio.drained_tx.try_send(shared.generation());
                     }
                 }
                 assert!(frames > 48_000 * 5);
                 rounds.push((frames, first_samples));
             }
-            assert_eq!(rounds[0], rounds[1], "RAM replay must reproduce the full track frame count and opening PCM");
+            assert_eq!(
+                rounds[0], rounds[1],
+                "RAM replay must reproduce the full track frame count and opening PCM"
+            );
             broker.handle_command(PlayerCommand::Stop);
             // Releasing cached compressed bytes occurs on the decoder thread.
             broker.handle_command(PlayerCommand::Quit);
@@ -3931,7 +5518,10 @@ mod tests {
         drop(audio.chunk_rx);
         audio.decoder.join().unwrap();
         match result {
-            Ok(original) => assert!(original.upgrade().is_none(), "Stop/Quit must free the cached track"),
+            Ok(original) => assert!(
+                original.upgrade().is_none(),
+                "Stop/Quit must free the cached track"
+            ),
             Err(error) => std::panic::resume_unwind(error),
         }
         assert!(audio.controls.child_slot.lock().unwrap().is_none());
@@ -3969,21 +5559,34 @@ mod tests {
         let decoder_shared = shared.clone();
         let broker_cmd_rx = cmd_rx.clone();
         let decoder = thread::spawn(move || {
-            run_decoder(decoder_shared, cmd_rx, status_tx, chunk_tx, drained_rx, AudioControls {
-                child_slot, buffer_slot: Arc::new(Mutex::new(None)), output_slot: Arc::new(Mutex::new(None)),
-            });
+            run_decoder(
+                decoder_shared,
+                cmd_rx,
+                status_tx,
+                chunk_tx,
+                drained_rx,
+                AudioControls {
+                    child_slot,
+                    buffer_slot: Arc::new(Mutex::new(None)),
+                    output_slot: Arc::new(Mutex::new(None)),
+                },
+            );
         });
-        let mut broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(
-            cmd_tx.clone(), broker_cmd_rx, Arc::new(|| {}),
-        ));
+        let mut broker = Broker::new(
+            shared.clone(),
+            DecoderLink::with_interrupt(cmd_tx.clone(), broker_cmd_rx, Arc::new(|| {})),
+        );
         broker.handle_command(PlayerCommand::Load {
-            source: Source::File(dir.to_string_lossy().into_owned()), paused: false,
+            source: Source::File(dir.to_string_lossy().into_owned()),
+            paused: false,
         });
         let mut attempts = std::collections::HashMap::new();
         let mut reasons = Vec::new();
         let result = (|| -> Result<(), String> {
             for _ in 0..4 {
-                let status = status_rx.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
+                let status = status_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|e| e.to_string())?;
                 if let Status::Failed { source, reason, .. } = &status {
                     *attempts.entry(source.raw().to_string()).or_insert(0usize) += 1;
                     reasons.push(reason.clone());
@@ -4001,27 +5604,68 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert!(attempts.values().all(|&count| count == 2));
         assert_eq!(shared.phase(), Phase::Stopped);
-        assert!(status_rx.try_recv().is_err(), "no additional failures after queue exhaustion");
-        assert!(reasons.iter().any(|r| r.contains("without decodable audio")));
+        assert!(
+            status_rx.try_recv().is_err(),
+            "no additional failures after queue exhaustion"
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.contains("without decodable audio"))
+        );
     }
 
     #[test]
     #[cfg(windows)]
     fn stalled_source_deadline_terminates_process_and_preserves_error_at_pipe_eof() {
-        let child = Child::track(crate::process::command("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", "[Threading.Thread]::Sleep(30000)"])
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()).unwrap();
+        let child = Child::track(
+            crate::process::command("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[Threading.Thread]::Sleep(30000)",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+        .unwrap();
         let pid = child.id();
         let slot = Arc::new(Mutex::new(Some(child)));
         let buffer = StreamBuffer::new();
-        let deadline = source_deadline(&slot, pid, Some(buffer.clone()), Duration::from_millis(50), "test source timed out").unwrap();
+        let deadline = source_deadline(
+            &slot,
+            pid,
+            Some(buffer.clone()),
+            Duration::from_millis(50),
+            "test source timed out",
+        )
+        .unwrap();
         let error = buffer.reader().read(&mut [0]).unwrap_err();
         assert!(error.to_string().contains("test source timed out"));
         drop(deadline);
         buffer.finish(Ok(())); // killed-pipe EOF must not erase the timeout
         assert!(!buffer.complete());
-        assert!(buffer.reader().read(&mut [0]).unwrap_err().to_string().contains("timed out"));
-        assert!(!slot.lock().unwrap().as_mut().unwrap().wait().unwrap().success());
+        assert!(
+            buffer
+                .reader()
+                .read(&mut [0])
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
+        assert!(
+            !slot
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .wait()
+                .unwrap()
+                .success()
+        );
         drop(ChildGuard { slot: slot.clone() });
         assert!(slot.lock().unwrap().is_none());
     }
@@ -4030,11 +5674,19 @@ mod tests {
     fn child_guard_detects_unsuccessful_stream_exit() {
         for code in [0, 7] {
             #[cfg(windows)]
-            let child = Command::new("cmd.exe").args(["/C", &format!("exit {code}")])
-                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let child = Command::new("cmd.exe")
+                .args(["/C", &format!("exit {code}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
             #[cfg(not(windows))]
-            let child = Command::new("sh").args(["-c", &format!("exit {code}")])
-                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let child = Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
             let mut child = Child::track(child).unwrap();
             child.wait().unwrap();
             let slot = Arc::new(Mutex::new(Some(child)));

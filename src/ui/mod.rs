@@ -29,9 +29,9 @@ mod win32;
 pub(crate) use win32::performance;
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, not(windows), debug_assertions))]
 use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, Sender};
 
@@ -48,11 +48,15 @@ static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(windows, debug_assertions))]
 pub fn request_quit() {
     QUIT_REQUESTED.store(true, Ordering::Release);
-    if let Some(tx) = CMD_TX.get() { let _ = tx.try_send(Command::Quit); }
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.try_send(Command::Quit);
+    }
     wake_broker();
 }
 
-pub fn take_quit_request() -> bool { QUIT_REQUESTED.swap(false, Ordering::AcqRel) }
+pub fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, Ordering::AcqRel)
+}
 
 #[cfg(windows)]
 #[derive(Default)]
@@ -71,8 +75,11 @@ thread_local! {
 #[cfg(windows)]
 pub fn queue_local(command: Command) {
     LOCAL_INBOX.with_borrow_mut(|inbox| {
-        if matches!(command, Command::Quit) { inbox.quit = true; }
-        else if !inbox.quit { inbox.commands.push_back(command); }
+        if matches!(command, Command::Quit) {
+            inbox.quit = true;
+        } else if !inbox.quit {
+            inbox.commands.push_back(command);
+        }
     });
     wake_broker();
 }
@@ -83,7 +90,9 @@ pub fn take_local() -> Option<Command> {
         if std::mem::take(&mut inbox.quit) {
             inbox.commands.clear();
             Some(Command::Quit)
-        } else { inbox.commands.pop_front() }
+        } else {
+            inbox.commands.pop_front()
+        }
     })
 }
 
@@ -170,7 +179,9 @@ impl HeadlessWakeGuard {
 }
 #[cfg(any(test, not(windows), debug_assertions))]
 impl Drop for HeadlessWakeGuard {
-    fn drop(&mut self) { HEADLESS_ACTIVE.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        HEADLESS_ACTIVE.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(any(test, not(windows), debug_assertions))]
@@ -194,8 +205,11 @@ pub(crate) fn wait_headless_timeout(timeout: std::time::Duration) {
         let expected = 0u32;
         unsafe {
             let _ = windows::Win32::System::Threading::WaitOnAddress(
-                (&HEADLESS_WAKE as *const AtomicU32).cast(), (&expected as *const u32).cast(), size_of::<u32>(),
-                Some(timeout.as_millis().clamp(1, u32::MAX as u128 - 1) as u32));
+                (&HEADLESS_WAKE as *const AtomicU32).cast(),
+                (&expected as *const u32).cast(),
+                size_of::<u32>(),
+                Some(timeout.as_millis().clamp(1, u32::MAX as u128 - 1) as u32),
+            );
         }
         HEADLESS_WAKE.swap(0, Ordering::Acquire);
     }
@@ -217,7 +231,9 @@ fn post(msg: u32) {
 }
 
 #[cfg(not(windows))]
-fn post(_msg: u32) { wake_headless(); }
+fn post(_msg: u32) {
+    wake_headless();
+}
 
 pub fn run(
     broker: Broker,

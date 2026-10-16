@@ -13,19 +13,15 @@
 //! thread sleeps in `GetMessageW` until a real event arrives.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::{Receiver, TryRecvError};
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, POINTL, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect,
-    MonitorFromWindow, ValidateRect, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus, UnregisterHotKey,
-    HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, VIRTUAL_KEY, VK_ESCAPE,
-    VK_L, VK_Q, VK_OEM_1, VK_OEM_2, VK_OEM_COMMA, VK_OEM_PERIOD, VK_OEM_MINUS, VK_OEM_PLUS,
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, PAINTSTRUCT, ValidateRect,
 };
 use windows::Win32::System::Com::{
     DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
@@ -40,29 +36,37 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey,
+    ReleaseCapture, SetCapture, SetFocus, UnregisterHotKey, VIRTUAL_KEY, VK_ESCAPE, VK_L, VK_OEM_1,
+    VK_OEM_2, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_Q,
 };
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, IsWindow, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW,
-    PostMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetLayeredWindowAttributes, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    CREATESTRUCTW, GWLP_USERDATA, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW, LWA_ALPHA, MA_ACTIVATE, MSG,
-    SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WNDCLASSW, WM_CANCELMODE, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE,
-    WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCHITTEST, WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_TIMER, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_NCDESTROY, WM_MBUTTONDOWN, WM_MBUTTONUP, WA_INACTIVE,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCAPTION, HTCLIENT, HTNOWHERE, IDC_ARROW,
+    IsWindow, KillTimer, LWA_ALPHA, LoadCursorW, MA_ACTIVATE, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::{implement, Ref};
+use windows::core::{PCWSTR, w};
+use windows::core::{Ref, implement};
 
 use crate::audio::AudioOut;
 
-use super::render::{Renderer,
-    TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position};
-use super::{set_pump_hwnd, WM_APP_BROKER, WM_APP_STATUS, WM_APP_OUTPUT};
+use super::render::{
+    Renderer, TrackListClick, TrackListLayout, TrackListRenderer, tracklist_position,
+};
+use super::{WM_APP_BROKER, WM_APP_OUTPUT, WM_APP_STATUS, set_pump_hwnd};
 #[cfg(feature = "release-diagnostics")]
 pub(crate) mod performance;
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status, TrackList};
@@ -95,17 +99,72 @@ struct HotkeyBinding {
 }
 
 const HOTKEY_BINDINGS: [HotkeyBinding; 11] = [
-    HotkeyBinding { id: HOTKEY_SEEK_BACK, modifiers: MOD_ALT, key: VK_OEM_COMMA, label: "Alt+," },
-    HotkeyBinding { id: HOTKEY_SEEK_FORWARD, modifiers: MOD_ALT, key: VK_OEM_PERIOD, label: "Alt+." },
-    HotkeyBinding { id: HOTKEY_PREV_TRACK, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_COMMA, label: "Alt+Shift+," },
-    HotkeyBinding { id: HOTKEY_NEXT_TRACK, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_PERIOD, label: "Alt+Shift+." },
-    HotkeyBinding { id: HOTKEY_TOGGLE_PAUSE, modifiers: MOD_ALT, key: VK_OEM_2, label: "Alt+/" },
-    HotkeyBinding { id: HOTKEY_TOGGLE_LOOP, modifiers: MOD_ALT, key: VK_L, label: "Alt+L" },
-    HotkeyBinding { id: HOTKEY_TOGGLE_EQ, modifiers: MOD_ALT, key: VK_OEM_1, label: "Alt+;" },
-    HotkeyBinding { id: HOTKEY_TOGGLE_OVERLAY, modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0), key: VK_OEM_2, label: "Alt+Shift+/" },
-    HotkeyBinding { id: HOTKEY_QUIT, modifiers: MOD_ALT, key: VK_Q, label: "Alt+Q" },
-    HotkeyBinding { id: HOTKEY_VOLUME_DOWN, modifiers: MOD_ALT, key: VK_OEM_MINUS, label: "Alt+-" },
-    HotkeyBinding { id: HOTKEY_VOLUME_UP, modifiers: MOD_ALT, key: VK_OEM_PLUS, label: "Alt+=" },
+    HotkeyBinding {
+        id: HOTKEY_SEEK_BACK,
+        modifiers: MOD_ALT,
+        key: VK_OEM_COMMA,
+        label: "Alt+,",
+    },
+    HotkeyBinding {
+        id: HOTKEY_SEEK_FORWARD,
+        modifiers: MOD_ALT,
+        key: VK_OEM_PERIOD,
+        label: "Alt+.",
+    },
+    HotkeyBinding {
+        id: HOTKEY_PREV_TRACK,
+        modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0),
+        key: VK_OEM_COMMA,
+        label: "Alt+Shift+,",
+    },
+    HotkeyBinding {
+        id: HOTKEY_NEXT_TRACK,
+        modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0),
+        key: VK_OEM_PERIOD,
+        label: "Alt+Shift+.",
+    },
+    HotkeyBinding {
+        id: HOTKEY_TOGGLE_PAUSE,
+        modifiers: MOD_ALT,
+        key: VK_OEM_2,
+        label: "Alt+/",
+    },
+    HotkeyBinding {
+        id: HOTKEY_TOGGLE_LOOP,
+        modifiers: MOD_ALT,
+        key: VK_L,
+        label: "Alt+L",
+    },
+    HotkeyBinding {
+        id: HOTKEY_TOGGLE_EQ,
+        modifiers: MOD_ALT,
+        key: VK_OEM_1,
+        label: "Alt+;",
+    },
+    HotkeyBinding {
+        id: HOTKEY_TOGGLE_OVERLAY,
+        modifiers: HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_SHIFT.0),
+        key: VK_OEM_2,
+        label: "Alt+Shift+/",
+    },
+    HotkeyBinding {
+        id: HOTKEY_QUIT,
+        modifiers: MOD_ALT,
+        key: VK_Q,
+        label: "Alt+Q",
+    },
+    HotkeyBinding {
+        id: HOTKEY_VOLUME_DOWN,
+        modifiers: MOD_ALT,
+        key: VK_OEM_MINUS,
+        label: "Alt+-",
+    },
+    HotkeyBinding {
+        id: HOTKEY_VOLUME_UP,
+        modifiers: MOD_ALT,
+        key: VK_OEM_PLUS,
+        label: "Alt+=",
+    },
 ];
 
 fn hotkey_command(id: usize) -> Option<Command> {
@@ -136,7 +195,14 @@ impl GlobalHotkeys {
         self.unregister();
         self.hwnd = hwnd;
         for (slot, binding) in self.registered.iter_mut().zip(&HOTKEY_BINDINGS) {
-            match unsafe { RegisterHotKey(Some(hwnd), binding.id, binding.modifiers | MOD_NOREPEAT, binding.key.0 as u32) } {
+            match unsafe {
+                RegisterHotKey(
+                    Some(hwnd),
+                    binding.id,
+                    binding.modifiers | MOD_NOREPEAT,
+                    binding.key.0 as u32,
+                )
+            } {
                 Ok(()) => *slot = true,
                 Err(error) => log_warn!("UI", "cannot register hotkey {}: {error}", binding.label),
             }
@@ -146,15 +212,18 @@ impl GlobalHotkeys {
     fn unregister(&mut self) {
         for (slot, binding) in self.registered.iter_mut().zip(&HOTKEY_BINDINGS) {
             if std::mem::take(slot)
-                && let Err(error) = unsafe { UnregisterHotKey(Some(self.hwnd), binding.id) } {
-                    log_warn!("UI", "cannot unregister hotkey {}: {error}", binding.label);
-                }
+                && let Err(error) = unsafe { UnregisterHotKey(Some(self.hwnd), binding.id) }
+            {
+                log_warn!("UI", "cannot unregister hotkey {}: {error}", binding.label);
+            }
         }
     }
 }
 
 impl Drop for GlobalHotkeys {
-    fn drop(&mut self) { self.unregister(); }
+    fn drop(&mut self) {
+        self.unregister();
+    }
 }
 
 #[derive(Default)]
@@ -165,7 +234,9 @@ struct DrawerClickState {
 
 impl DrawerClickState {
     fn press(&mut self, action: TrackListClick, release_message: u32) -> bool {
-        if self.busy() || action == TrackListClick::None { return false; }
+        if self.busy() || action == TrackListClick::None {
+            return false;
+        }
         self.pending = Some((release_message, action));
         true
     }
@@ -178,7 +249,9 @@ impl DrawerClickState {
         self.pending.take().unwrap().1
     }
 
-    fn busy(&self) -> bool { self.pending.is_some() || self.close_queued }
+    fn busy(&self) -> bool {
+        self.pending.is_some() || self.close_queued
+    }
 }
 
 #[derive(Default, PartialEq)]
@@ -191,36 +264,53 @@ enum QuitClickState {
 }
 
 impl QuitClickState {
-    fn busy(&self) -> bool { *self != Self::Idle }
+    fn busy(&self) -> bool {
+        *self != Self::Idle
+    }
 
     fn press(&mut self) -> bool {
-        if self.busy() { return false; }
+        if self.busy() {
+            return false;
+        }
         *self = Self::Pressed;
         true
     }
 
     fn release(&mut self, message: u32) -> bool {
-        if message != WM_LBUTTONUP || *self != Self::Pressed { return false; }
+        if message != WM_LBUTTONUP || *self != Self::Pressed {
+            return false;
+        }
         *self = Self::Queued;
         true
     }
 
     fn finish(&mut self) -> Option<Command> {
-        if *self != Self::Queued { return None; }
+        if *self != Self::Queued {
+            return None;
+        }
         *self = Self::Dispatched;
         Some(Command::Quit)
     }
 
     fn cancel_press(&mut self) {
-        if *self == Self::Pressed { *self = Self::Idle; }
+        if *self == Self::Pressed {
+            *self = Self::Idle;
+        }
     }
 }
 
 fn drawer_hit_test(bounds: RECT, point: POINT) -> LRESULT {
-    LRESULT(if point.x >= bounds.left && point.x < bounds.right
-        && point.y >= bounds.top && point.y < bounds.bottom {
-        HTCLIENT as isize
-    } else { HTNOWHERE as isize })
+    LRESULT(
+        if point.x >= bounds.left
+            && point.x < bounds.right
+            && point.y >= bounds.top
+            && point.y < bounds.bottom
+        {
+            HTCLIENT as isize
+        } else {
+            HTNOWHERE as isize
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -299,9 +389,7 @@ pub fn run(
 
     unsafe {
         // Crisp text: 80 px means 80 physical pixels, never scaled.
-        if let Err(e) =
-            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-        {
+        if let Err(e) = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) {
             log_warn!("UI", "per-monitor DPI v2 unavailable: {e}");
         }
     }
@@ -319,7 +407,10 @@ pub fn run(
     let hinstance = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => windows::Win32::Foundation::HINSTANCE(h.0),
         Err(e) => {
-            log_error!("UI", "GetModuleHandleW failed: {e} — falling back to headless");
+            log_error!(
+                "UI",
+                "GetModuleHandleW failed: {e} — falling back to headless"
+            );
             drop(renderer);
             super::headless::run(broker, cmd_rx, status_rx, AudioOut::new(None));
             return;
@@ -347,7 +438,10 @@ pub fn run(
     // both are paired by OleUninitialize after the pump below).
     let ole = unsafe { OleInitialize(None) };
     if let Err(e) = &ole {
-        log_warn!("UI", "OleInitialize failed: {e} — drag-and-drop unavailable");
+        log_warn!(
+            "UI",
+            "OleInitialize failed: {e} — drag-and-drop unavailable"
+        );
     }
     audio_out.start_notifications();
     // Kept alive past the pump: the window's registration holds a reference
@@ -369,8 +463,8 @@ pub fn run(
         hidden: false,
         hotkeys: GlobalHotkeys::default(),
         quit_click: QuitClickState::default(),
-            drawer: None,
-            next_drawer_token: 0,
+        drawer: None,
+        next_drawer_token: 0,
     }));
 
     let hwnd = match unsafe {
@@ -391,7 +485,10 @@ pub fn run(
     } {
         Ok(h) => h,
         Err(e) => {
-            log_error!("UI", "CreateWindowExW failed: {e} — falling back to headless");
+            log_error!(
+                "UI",
+                "CreateWindowExW failed: {e} — falling back to headless"
+            );
             let s = unsafe { *Box::from_raw(state) };
             super::headless::run(s.broker, s.cmd_rx, s.status_rx, s.audio_out);
             return;
@@ -404,12 +501,15 @@ pub fn run(
         // Accept OLE drops (browser links arrive as text/URL formats, files
         // and folders as CF_HDROP) — see `DropTarget` below.
         if ole.is_ok()
-            && let Err(e) = RegisterDragDrop(hwnd, &drop_target) {
-                log_warn!("UI", "RegisterDragDrop failed: {e}");
-            }
+            && let Err(e) = RegisterDragDrop(hwnd, &drop_target)
+        {
+            log_warn!("UI", "RegisterDragDrop failed: {e}");
+        }
         // Content exists before the window is shown — no first-paint flash.
         let eq = (*state).shared.eq_gains();
-        (*state).renderer.draw(hwnd, (*state).broker.view(), (*state).shared.phase(), &eq);
+        (*state)
+            .renderer
+            .draw(hwnd, (*state).broker.view(), (*state).shared.phase(), &eq);
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         #[cfg(feature = "release-diagnostics")]
         performance::ready(hwnd);
@@ -419,8 +519,11 @@ pub fn run(
         );
 
         // Drain anything that arrived during window creation, then sync.
-        if drain_commands(&mut *state) || drain_statuses(&mut *state) { destroy(&mut *state); }
-        else { sync(&mut *state); }
+        if drain_commands(&mut *state) || drain_statuses(&mut *state) {
+            destroy(&mut *state);
+        } else {
+            sync(&mut *state);
+        }
 
         // The pump. GetMessageW parks in the kernel; there is no idle path.
         let mut msg = MSG::default();
@@ -437,8 +540,11 @@ pub fn run(
             // Drain native input at the outer message boundary: no recursive
             // broker dispatch, queue-capacity loss, or unbounded input backlog.
             if super::has_local() && IsWindow(Some(hwnd)).as_bool() {
-                if drain_commands(&mut *state) { destroy(&mut *state); }
-                else { sync(&mut *state); }
+                if drain_commands(&mut *state) {
+                    destroy(&mut *state);
+                } else {
+                    sync(&mut *state);
+                }
             }
         }
 
@@ -471,13 +577,26 @@ fn workarea_top_right(width: i32, _height: i32) -> (i32, i32) {
 }
 
 fn drawer_workarea(owner: HWND) -> RECT {
-    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
     unsafe {
-        if GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+        if GetMonitorInfoW(
+            MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST),
+            &mut info,
+        )
+        .as_bool()
+        {
             return info.rcWork;
         }
     }
-    RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+    RECT {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1080,
+    }
 }
 
 fn register_drawer_class() -> windows::core::Result<()> {
@@ -493,33 +612,60 @@ fn register_drawer_class() -> windows::core::Result<()> {
         if RegisterClassW(&class) == 0 {
             let error = windows::Win32::Foundation::GetLastError();
             if error != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
-                return Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(error.0)));
+                return Err(windows::core::Error::from_hresult(
+                    windows::core::HRESULT::from_win32(error.0),
+                ));
             }
         }
     }
     Ok(())
 }
 
-fn create_drawer(owner: HWND, token: usize, view: TrackList, layout: TrackListLayout, position: (i32, i32))
-    -> windows::core::Result<HWND>
-{
+fn create_drawer(
+    owner: HWND,
+    token: usize,
+    view: TrackList,
+    layout: TrackListLayout,
+    position: (i32, i32),
+) -> windows::core::Result<HWND> {
     register_drawer_class()?;
     let renderer = TrackListRenderer::new()?;
     let first = layout.first(view.titles.len(), view.current);
     #[cfg(test)]
     DRAWER_STATES.fetch_add(1, Ordering::Relaxed);
     let mut drawer = Box::new(DrawerState {
-        owner, token, owned: false, closing: false, click: DrawerClickState::default(), view, layout, first, wheel: 0, renderer,
+        owner,
+        token,
+        owned: false,
+        closing: false,
+        click: DrawerClickState::default(),
+        view,
+        layout,
+        first,
+        wheel: 0,
+        renderer,
     });
     let hwnd = unsafe {
-        CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, w!("kyouko_tracklist"), w!("Tracks"),
-            WS_POPUP, position.0, position.1, layout.width, layout.height(),
-            (!owner.is_invalid()).then_some(owner), None,
-            Some(GetModuleHandleW(None)?.into()), Some(&mut *drawer as *mut DrawerState as *const c_void))?
+        CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            w!("kyouko_tracklist"),
+            w!("Tracks"),
+            WS_POPUP,
+            position.0,
+            position.1,
+            layout.width,
+            layout.height(),
+            (!owner.is_invalid()).then_some(owner),
+            None,
+            Some(GetModuleHandleW(None)?.into()),
+            Some(&mut *drawer as *mut DrawerState as *const c_void),
+        )?
     };
     drawer.owned = true;
     let _ = Box::into_raw(drawer);
-    if let Err(error) = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), DRAWER_ALPHA, LWA_ALPHA) } {
+    if let Err(error) =
+        unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), DRAWER_ALPHA, LWA_ALPHA) }
+    {
         close_drawer(hwnd);
         return Err(error);
     }
@@ -531,27 +677,38 @@ fn create_drawer(owner: HWND, token: usize, view: TrackList, layout: TrackListLa
 fn close_drawer(hwnd: HWND) {
     unsafe {
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DrawerState;
-        if state.is_null() || (*state).closing { return; }
+        if state.is_null() || (*state).closing {
+            return;
+        }
         (*state).closing = true;
-        if GetCapture() == hwnd { let _ = ReleaseCapture(); }
+        if GetCapture() == hwnd {
+            let _ = ReleaseCapture();
+        }
         let _ = DestroyWindow(hwnd);
     }
 }
 
 fn dismiss_tracklist(state: *mut UiState) {
-    if let Some(drawer) = unsafe { (*state).drawer.take() } { close_drawer(drawer.hwnd); }
+    if let Some(drawer) = unsafe { (*state).drawer.take() } {
+        close_drawer(drawer.hwnd);
+    }
 }
 
 fn toggle_tracklist(state: *mut UiState) {
     if let Some(drawer) = unsafe { (*state).drawer.take() }
-        && unsafe { IsWindow(Some(drawer.hwnd)).as_bool() } {
-            close_drawer(drawer.hwnd);
-            return;
-        }
+        && unsafe { IsWindow(Some(drawer.hwnd)).as_bool() }
+    {
+        close_drawer(drawer.hwnd);
+        return;
+    }
     let owner = unsafe { (*state).hwnd };
     let view = unsafe { (*state).broker.track_list() };
     let work = drawer_workarea(owner);
-    let layout = TrackListLayout::new(view.titles.len(), work.right - work.left, work.bottom - work.top);
+    let layout = TrackListLayout::new(
+        view.titles.len(),
+        work.right - work.left,
+        work.bottom - work.top,
+    );
     let mut anchor = RECT::default();
     let _ = unsafe { GetWindowRect(owner, &mut anchor) };
     anchor.top += unsafe { (*state).renderer.track_info_y() };
@@ -574,17 +731,29 @@ fn toggle_tracklist(state: *mut UiState) {
 }
 
 fn refresh_tracklist(s: &UiState) {
-    let Some(drawer) = s.drawer else { return; };
+    let Some(drawer) = s.drawer else {
+        return;
+    };
     unsafe {
         let state = GetWindowLongPtrW(drawer.hwnd, GWLP_USERDATA) as *mut DrawerState;
-        if state.is_null() || (*state).click.busy() { return; }
-        if s.broker.track_list_matches(&(*state).view) { return; }
+        if state.is_null() || (*state).click.busy() {
+            return;
+        }
+        if s.broker.track_list_matches(&(*state).view) {
+            return;
+        }
         let view = s.broker.track_list();
         let work = drawer_workarea(s.hwnd);
-        let layout = TrackListLayout::new(view.titles.len(), work.right - work.left, work.bottom - work.top);
+        let layout = TrackListLayout::new(
+            view.titles.len(),
+            work.right - work.left,
+            work.bottom - work.top,
+        );
         let first = if (*state).view.current != view.current {
             layout.first(view.titles.len(), view.current)
-        } else { layout.scroll((*state).first, 0, view.titles.len()) };
+        } else {
+            layout.scroll((*state).first, 0, view.titles.len())
+        };
         (*state).view = view;
         (*state).layout = layout;
         (*state).first = first;
@@ -592,7 +761,15 @@ fn refresh_tracklist(s: &UiState) {
         let _ = GetWindowRect(s.hwnd, &mut anchor);
         anchor.top += s.renderer.track_info_y();
         let (x, y) = tracklist_position(anchor, work, layout);
-        let _ = SetWindowPos(drawer.hwnd, None, x, y, layout.width, layout.height(), SWP_NOACTIVATE | SWP_NOZORDER);
+        let _ = SetWindowPos(
+            drawer.hwnd,
+            None,
+            x,
+            y,
+            layout.width,
+            layout.height(),
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
         let _ = InvalidateRect(Some(drawer.hwnd), None, false);
     }
 }
@@ -605,23 +782,30 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             return LRESULT(1);
         }
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DrawerState;
-        if state.is_null() { return DefWindowProcW(hwnd, msg, wp, lp); }
+        if state.is_null() {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         match msg {
             WM_NCDESTROY => {
                 let owner = (*state).owner;
                 let token = (*state).token;
                 let owned = (*state).owned;
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                if owned { drop(Box::from_raw(state)); }
+                if owned {
+                    drop(Box::from_raw(state));
+                }
                 if !owner.is_invalid() {
-                    let _ = PostMessageW(Some(owner), WM_TRACKLIST_CLOSED, WPARAM(token), LPARAM(0));
+                    let _ =
+                        PostMessageW(Some(owner), WM_TRACKLIST_CLOSED, WPARAM(token), LPARAM(0));
                 }
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut paint);
-                (*state).renderer.draw(dc, &(*state).view, (*state).layout, (*state).first);
+                (*state)
+                    .renderer
+                    .draw(dc, &(*state).view, (*state).layout, (*state).first);
                 let _ = EndPaint(hwnd, &paint);
                 LRESULT(0)
             }
@@ -631,11 +815,24 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
             WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
             WM_NCHITTEST => {
                 let mut bounds = RECT::default();
-                if GetWindowRect(hwnd, &mut bounds).is_err() { return LRESULT(HTNOWHERE as isize); }
-                drawer_hit_test(bounds, POINT { x: x_lparam(lp), y: y_lparam(lp) })
+                if GetWindowRect(hwnd, &mut bounds).is_err() {
+                    return LRESULT(HTNOWHERE as isize);
+                }
+                drawer_hit_test(
+                    bounds,
+                    POINT {
+                        x: x_lparam(lp),
+                        y: y_lparam(lp),
+                    },
+                )
             }
             WM_LBUTTONDOWN => {
-                let action = (*state).layout.click(x_lparam(lp), y_lparam(lp), (*state).first, (*state).view.titles.len());
+                let action = (*state).layout.click(
+                    x_lparam(lp),
+                    y_lparam(lp),
+                    (*state).first,
+                    (*state).view.titles.len(),
+                );
                 if (*state).click.press(action, WM_LBUTTONUP) && GetCapture() != hwnd {
                     SetCapture(hwnd);
                 }
@@ -650,7 +847,9 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                     // Keep the unchanged surface and capture until this
                     // mouse-up handler has returned. Destruction runs in a
                     // later message, after the full click is consumed.
-                    if let Err(error) = PostMessageW(Some(hwnd), WM_TRACKLIST_FINISH_CLICK, WPARAM(0), LPARAM(0)) {
+                    if let Err(error) =
+                        PostMessageW(Some(hwnd), WM_TRACKLIST_FINISH_CLICK, WPARAM(0), LPARAM(0))
+                    {
                         (*state).click.close_queued = false;
                         log_warn!("UI", "cannot queue tracklist dismissal: {error}");
                     }
@@ -658,15 +857,22 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 LRESULT(0)
             }
             WM_TRACKLIST_FINISH_CLICK => {
-                if (*state).click.close_queued { close_drawer(hwnd); }
+                if (*state).click.close_queued {
+                    close_drawer(hwnd);
+                }
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
-                if (*state).click.busy() { return LRESULT(0); }
+                if (*state).click.busy() {
+                    return LRESULT(0);
+                }
                 (*state).wheel += wheel_delta(wp) as i32;
                 let steps = (*state).wheel / 120;
                 (*state).wheel %= 120;
-                let first = (*state).layout.scroll((*state).first, -steps * 3, (*state).view.titles.len());
+                let first =
+                    (*state)
+                        .layout
+                        .scroll((*state).first, -steps * 3, (*state).view.titles.len());
                 if first != (*state).first {
                     (*state).first = first;
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -674,22 +880,41 @@ unsafe extern "system" fn drawer_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: L
                 LRESULT(0)
             }
             WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
-                let action = (*state).layout.click(x_lparam(lp), y_lparam(lp), (*state).first, (*state).view.titles.len());
-                let release = if msg == WM_RBUTTONDOWN { WM_RBUTTONUP } else { WM_MBUTTONUP };
-                if action == TrackListClick::Dismiss && (*state).click.press(action, release) && GetCapture() != hwnd {
+                let action = (*state).layout.click(
+                    x_lparam(lp),
+                    y_lparam(lp),
+                    (*state).first,
+                    (*state).view.titles.len(),
+                );
+                let release = if msg == WM_RBUTTONDOWN {
+                    WM_RBUTTONUP
+                } else {
+                    WM_MBUTTONUP
+                };
+                if action == TrackListClick::Dismiss
+                    && (*state).click.press(action, release)
+                    && GetCapture() != hwnd
+                {
                     SetCapture(hwnd);
                 }
                 LRESULT(0)
             }
             WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
-                if !(*state).click.busy() { close_drawer(hwnd); }
+                if !(*state).click.busy() {
+                    close_drawer(hwnd);
+                }
                 LRESULT(0)
             }
             WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => {
-                if (*state).owned { close_drawer(hwnd); }
+                if (*state).owned {
+                    close_drawer(hwnd);
+                }
                 LRESULT(0)
             }
-            WM_CAPTURECHANGED | WM_CLOSE => { close_drawer(hwnd); LRESULT(0) }
+            WM_CAPTURECHANGED | WM_CLOSE => {
+                close_drawer(hwnd);
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
@@ -708,7 +933,9 @@ fn sync(s: &mut UiState) {
             s.timer_on = true;
             log_info!("UI", "1 Hz panel timer ON (playing)");
         } else if phase != Phase::Playing && s.timer_on {
-            unsafe { let _ = KillTimer(Some(s.hwnd), TIMER_ID); }
+            unsafe {
+                let _ = KillTimer(Some(s.hwnd), TIMER_ID);
+            }
             s.timer_on = false;
             log_info!("UI", "1 Hz panel timer OFF — zero wake-ups until resumed");
         }
@@ -730,7 +957,10 @@ fn drain_commands(s: &mut UiState) -> bool {
     }
     s.broker.poll_background();
     loop {
-        match super::take_local().map(Ok).unwrap_or_else(|| s.cmd_rx.try_recv()) {
+        match super::take_local()
+            .map(Ok)
+            .unwrap_or_else(|| s.cmd_rx.try_recv())
+        {
             Ok(Command::ToggleOverlay) => toggle_visible(s),
             Ok(cmd) => {
                 #[cfg(feature = "release-diagnostics")]
@@ -772,8 +1002,15 @@ fn quit_click_command(renderer: &Renderer, x: i32, y: i32) -> Option<Command> {
     renderer.quit_button_at(x, y).then_some(Command::Quit)
 }
 
-fn right_click_command(renderer: &Renderer, message: u32, lp: LPARAM, bounds: RECT) -> Option<Command> {
-    if !matches!(message, WM_RBUTTONDOWN | WM_NCRBUTTONDOWN) { return None; }
+fn right_click_command(
+    renderer: &Renderer,
+    message: u32,
+    lp: LPARAM,
+    bounds: RECT,
+) -> Option<Command> {
+    if !matches!(message, WM_RBUTTONDOWN | WM_NCRBUTTONDOWN) {
+        return None;
+    }
     // Client messages carry client coordinates; caption messages carry
     // signed screen coordinates, including monitors left/above the primary.
     let caption = message == WM_NCRBUTTONDOWN;
@@ -791,11 +1028,17 @@ fn toggle_visible(s: &mut UiState) {
     s.hidden = !s.hidden;
     let hwnd = s.hwnd;
     let hidden = s.hidden;
-    if let Some(drawer) = drawer { close_drawer(drawer.hwnd); }
+    if let Some(drawer) = drawer {
+        close_drawer(drawer.hwnd);
+    }
     unsafe {
         let _ = ShowWindow(hwnd, if hidden { SW_HIDE } else { SW_SHOW });
     }
-    log_info!("UI", "echo window: {}", if hidden { "hidden" } else { "shown" });
+    log_info!(
+        "UI",
+        "echo window: {}",
+        if hidden { "hidden" } else { "shown" }
+    );
 }
 
 /// Window and hotkey interactions share the broker command channel. The
@@ -826,13 +1069,17 @@ struct DropTarget {
 
 impl DropTarget {
     fn new() -> Self {
-        Self { can_drop: AtomicBool::new(false) }
+        Self {
+            can_drop: AtomicBool::new(false),
+        }
     }
 
     /// Does the data object carry anything we can consume? Queried once per
     /// drag gesture (DragEnter), not once per DragOver.
     fn accepts(obj: &IDataObject) -> bool {
-        [CF_UNICODETEXT, CF_TEXT, CF_HDROP].iter().any(|cf| Self::offers(obj, cf.0))
+        [CF_UNICODETEXT, CF_TEXT, CF_HDROP]
+            .iter()
+            .any(|cf| Self::offers(obj, cf.0))
             || Self::offers(obj, registered_format(w!("UniformResourceLocatorW")))
             || Self::offers(obj, registered_format(w!("UniformResourceLocator")))
     }
@@ -876,7 +1123,11 @@ impl IDropTarget_Impl for DropTarget_Impl {
         log_info!("UI", "ole drag enter: accepted={accepted}");
         self.can_drop.store(accepted, Ordering::Relaxed);
         unsafe {
-            *pdweffect = if accepted { DROPEFFECT_COPY } else { DROPEFFECT_NONE };
+            *pdweffect = if accepted {
+                DROPEFFECT_COPY
+            } else {
+                DROPEFFECT_NONE
+            };
         }
         Ok(())
     }
@@ -927,10 +1178,12 @@ impl IDropTarget_Impl for DropTarget_Impl {
             if cf == 0 {
                 continue;
             }
-            if let Some(url) = hglobal_string(obj, cf, wide).and_then(|t| url_from_drop_text(&t))
-            {
+            if let Some(url) = hglobal_string(obj, cf, wide).and_then(|t| url_from_drop_text(&t)) {
                 log_info!("UI", "drop: link {url}");
-                post_command(Command::Load { source: Source::from_raw(&url), paused: false });
+                post_command(Command::Load {
+                    source: Source::from_raw(&url),
+                    paused: false,
+                });
                 return Ok(());
             }
         }
@@ -1000,7 +1253,9 @@ unsafe fn medium_string(medium: &STGMEDIUM, wide: bool) -> Option<String> {
             String::from_utf8_lossy(&raw[..len]).into_owned()
         }
     };
-    unsafe { let _ = GlobalUnlock(h); }
+    unsafe {
+        let _ = GlobalUnlock(h);
+    }
     if text.is_empty() { None } else { Some(text) }
 }
 
@@ -1035,7 +1290,9 @@ unsafe fn hdrop_paths(medium: &STGMEDIUM) -> Vec<String> {
         // terminator off afterwards.
         let mut buf = vec![0u16; path_len as usize + 1];
         unsafe { DragQueryFileW(hdrop, index, Some(&mut buf)) };
-        let path = String::from_utf16_lossy(&buf).trim_end_matches('\0').to_string();
+        let path = String::from_utf16_lossy(&buf)
+            .trim_end_matches('\0')
+            .to_string();
         if !path.is_empty() {
             paths.push(path);
         }
@@ -1088,11 +1345,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_HOTKEY => {
-                if let Some(command) = hotkey_command(wp.0) { post_command(command); }
+                if let Some(command) = hotkey_command(wp.0) {
+                    post_command(command);
+                }
                 LRESULT(0)
             }
             WM_TRACKLIST_CLOSED => {
-                if s.drawer.is_some_and(|drawer| drawer.token == wp.0) { s.drawer = None; }
+                if s.drawer.is_some_and(|drawer| drawer.token == wp.0) {
+                    s.drawer = None;
+                }
                 LRESULT(0)
             }
             WM_APP_BROKER => {
@@ -1104,7 +1365,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_APP_STATUS => {
-                if drain_statuses(s) { destroy(s); } else { sync(s); }
+                if drain_statuses(s) {
+                    destroy(s);
+                } else {
+                    sync(s);
+                }
                 LRESULT(0)
             }
             WM_APP_OUTPUT => {
@@ -1138,11 +1403,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // Like the drawer, X must retain the surface and capture until
                 // the matching mouse-up is consumed. Quitting on down exposes
                 // the underlying app to the second half of this click.
-                if s.quit_click.busy() { return LRESULT(0); }
+                if s.quit_click.busy() {
+                    return LRESULT(0);
+                }
                 let x = x_lparam(lp);
                 let y = y_lparam(lp);
                 if quit_click_command(&s.renderer, x, y).is_some() {
-                    if s.quit_click.press() { SetCapture(hwnd); }
+                    if s.quit_click.press() {
+                        SetCapture(hwnd);
+                    }
                 } else if s.renderer.track_info_at(x, y) {
                     toggle_tracklist(state);
                 }
@@ -1155,16 +1424,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if s.quit_click.release(msg) {
                     // Leave capture and the unchanged window alive until this
                     // handler returns, then dispatch the usual graceful Quit.
-                    if let Err(error) = PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0)) {
+                    if let Err(error) =
+                        PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0))
+                    {
                         s.quit_click = QuitClickState::Idle;
                         log_warn!("UI", "cannot queue quit click: {error}");
-                        if GetCapture() == hwnd { let _ = ReleaseCapture(); }
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
                     }
                 }
                 LRESULT(0)
             }
             WM_QUIT_FINISH_CLICK => {
-                if let Some(command) = s.quit_click.finish() { post_command(command); }
+                if let Some(command) = s.quit_click.finish() {
+                    post_command(command);
+                }
                 // Capture stays ours through broker shutdown and DestroyWindow.
                 LRESULT(0)
             }
@@ -1209,7 +1484,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         "wheel eq[{}Hz]: {old:+.0} -> {new:+.0} dB",
                         crate::broker::EQ_BAND_HZ[band]
                     );
-                    post_command(Command::EqGain { band: Some(band), gain_db: new });
+                    post_command(Command::EqGain {
+                        band: Some(band),
+                        gain_db: new,
+                    });
                 }
                 LRESULT(0)
             }
@@ -1259,8 +1537,14 @@ mod tests {
     #[test]
     fn quit_button_dispatches_the_same_command_as_alt_q() {
         let renderer = Renderer::new("KYOUKO PLAYING\ntime\ntrack\nvolume\neq/repeat").unwrap();
-        assert!(matches!(quit_click_command(&renderer, 72, 4), Some(Command::Quit)));
-        assert!(matches!(hotkey_command(HOTKEY_QUIT as usize), Some(Command::Quit)));
+        assert!(matches!(
+            quit_click_command(&renderer, 72, 4),
+            Some(Command::Quit)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_QUIT as usize),
+            Some(Command::Quit)
+        ));
         for (x, y) in [(68, 4), (77, 4), (72, 2), (72, 20), (-1, 4), (80, 4)] {
             assert!(quit_click_command(&renderer, x, y).is_none());
         }
@@ -1280,11 +1564,17 @@ mod tests {
             assert!(click.finish().is_none());
         }
         assert!(click.release(WM_LBUTTONUP));
-        assert!(click.busy(), "retain the window/capture until deferred completion");
+        assert!(
+            click.busy(),
+            "retain the window/capture until deferred completion"
+        );
         assert!(!click.release(WM_LBUTTONUP));
         assert!(matches!(click.finish(), Some(Command::Quit)));
         assert!(click.finish().is_none());
-        assert!(click.busy(), "block new clicks until the broker destroys the window");
+        assert!(
+            click.busy(),
+            "block new clicks until the broker destroys the window"
+        );
         assert!(!click.press());
     }
 
@@ -1299,7 +1589,10 @@ mod tests {
         assert!(click.press());
         assert!(click.release(WM_LBUTTONUP));
         click.cancel_press();
-        assert!(matches!(click.finish(), Some(Command::Quit)), "capture loss after release cannot cancel a completed click");
+        assert!(
+            matches!(click.finish(), Some(Command::Quit)),
+            "capture loss after release cannot cancel a completed click"
+        );
         click.cancel_press();
         assert!(click.busy());
         assert!(click.finish().is_none());
@@ -1310,55 +1603,118 @@ mod tests {
         use crate::broker::DecoderLink;
         // No synthetic mouse input: exercise the click state and our private
         // completion message on an offscreen native window.
-        unsafe extern "system" fn test_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-            if msg == WM_CREATE { return LRESULT(0); } // do not contend with hotkey tests
+        unsafe extern "system" fn test_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+        ) -> LRESULT {
+            if msg == WM_CREATE {
+                return LRESULT(0);
+            } // do not contend with hotkey tests
             unsafe { wndproc(hwnd, msg, wp, lp) }
         }
         let shared = SharedState::new();
         let (decoder_tx, decoder_rx) = crate::decoder_wake::command_channel(8);
         let (_command_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
-        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})));
+        let broker = Broker::new(
+            shared.clone(),
+            DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})),
+        );
         let renderer = Renderer::new(broker.view()).unwrap();
         let (width, height) = renderer.size();
         let mut state = Box::new(UiState {
-            hwnd: HWND::default(), broker, cmd_rx, status_rx, shared, renderer,
-            audio_out: AudioOut::new(None), timer_on: false,
-            last_phase: Phase::Stopped, hidden: true,
-            hotkeys: GlobalHotkeys::default(), drawer: None, next_drawer_token: 0,
+            hwnd: HWND::default(),
+            broker,
+            cmd_rx,
+            status_rx,
+            shared,
+            renderer,
+            audio_out: AudioOut::new(None),
+            timer_on: false,
+            last_phase: Phase::Stopped,
+            hidden: true,
+            hotkeys: GlobalHotkeys::default(),
+            drawer: None,
+            next_drawer_token: 0,
             quit_click: QuitClickState::default(),
         });
         unsafe {
             let instance = GetModuleHandleW(None).unwrap();
-            let class = WNDCLASSW { lpfnWndProc: Some(test_wndproc), hInstance: instance.into(),
-                lpszClassName: w!("kyouko_quit_click_test"), ..Default::default() };
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(test_wndproc),
+                hInstance: instance.into(),
+                lpszClassName: w!("kyouko_quit_click_test"),
+                ..Default::default()
+            };
             assert_ne!(RegisterClassW(&class), 0);
-            let hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-                w!("kyouko_quit_click_test"), w!(""), WS_POPUP, -32000, -32000, width, height,
-                None, None, Some(instance.into()), Some(&mut *state as *mut UiState as *const c_void)).unwrap();
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                w!("kyouko_quit_click_test"),
+                w!(""),
+                WS_POPUP,
+                -32000,
+                -32000,
+                width,
+                height,
+                None,
+                None,
+                Some(instance.into()),
+                Some(&mut *state as *mut UiState as *const c_void),
+            )
+            .unwrap();
             state.hwnd = hwnd;
             assert!(state.quit_click.press());
             assert!(IsWindow(Some(hwnd)).as_bool());
             assert!(state.cmd_rx.is_empty());
-            assert!(decoder_rx.is_empty(), "no early Shutdown while the mouse is held");
+            assert!(
+                decoder_rx.is_empty(),
+                "no early Shutdown while the mouse is held"
+            );
             assert!(state.quit_click.release(WM_LBUTTONUP));
             PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0)).unwrap();
             assert!(IsWindow(Some(hwnd)).as_bool());
-            assert!(state.cmd_rx.is_empty(), "posting is deferred until mouse-up has returned");
+            assert!(
+                state.cmd_rx.is_empty(),
+                "posting is deferred until mouse-up has returned"
+            );
             let mut message = MSG::default();
-            assert!(GetMessageW(&mut message, Some(hwnd), WM_QUIT_FINISH_CLICK, WM_QUIT_FINISH_CLICK).0 > 0);
+            assert!(
+                GetMessageW(
+                    &mut message,
+                    Some(hwnd),
+                    WM_QUIT_FINISH_CLICK,
+                    WM_QUIT_FINISH_CLICK
+                )
+                .0 > 0
+            );
             DispatchMessageW(&message);
-            assert!(IsWindow(Some(hwnd)).as_bool(), "completion only queues graceful Quit");
+            assert!(
+                IsWindow(Some(hwnd)).as_bool(),
+                "completion only queues graceful Quit"
+            );
             assert!(state.cmd_rx.is_empty());
             assert!(matches!(super::super::take_local(), Some(Command::Quit)));
             // Duplicate completion messages cannot send another Quit.
             PostMessageW(Some(hwnd), WM_QUIT_FINISH_CLICK, WPARAM(0), LPARAM(0)).unwrap();
-            assert!(GetMessageW(&mut message, Some(hwnd), WM_QUIT_FINISH_CLICK, WM_QUIT_FINISH_CLICK).0 > 0);
+            assert!(
+                GetMessageW(
+                    &mut message,
+                    Some(hwnd),
+                    WM_QUIT_FINISH_CLICK,
+                    WM_QUIT_FINISH_CLICK
+                )
+                .0 > 0
+            );
             DispatchMessageW(&message);
             assert!(super::super::take_local().is_none());
             super::super::queue_local(Command::Quit);
             assert!(drain_commands(&mut state));
-            assert!(matches!(decoder_rx.try_recv(), Ok(crate::broker::DecoderCmd::Shutdown)));
+            assert!(matches!(
+                decoder_rx.try_recv(),
+                Ok(crate::broker::DecoderCmd::Shutdown)
+            ));
             destroy(&mut state);
             assert!(!IsWindow(Some(hwnd)).as_bool());
         }
@@ -1372,7 +1728,12 @@ mod tests {
     fn right_click_client_and_caption_surfaces_toggle_once_except_quit() {
         let renderer = Renderer::new("KYOUKO PLAYING\ntime\ntrack\nvolume\neq/repeat").unwrap();
         let (width, height) = renderer.size();
-        let bounds = RECT { left: -1200, top: -600, right: -1200 + width, bottom: -600 + height };
+        let bounds = RECT {
+            left: -1200,
+            top: -600,
+            right: -1200 + width,
+            bottom: -600 + height,
+        };
         // Exercise all pixels and both message coordinate systems without
         // sending synthetic Windows input or calling the window procedure.
         for y in 0..height {
@@ -1380,9 +1741,19 @@ mod tests {
                 let expected = !renderer.quit_button_at(x, y);
                 for (down, up, lp) in [
                     (WM_RBUTTONDOWN, WM_RBUTTONUP, packed_point(x, y)),
-                    (WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, packed_point(bounds.left + x, bounds.top + y)),
+                    (
+                        WM_NCRBUTTONDOWN,
+                        WM_NCRBUTTONUP,
+                        packed_point(bounds.left + x, bounds.top + y),
+                    ),
                 ] {
-                    assert_eq!(matches!(right_click_command(&renderer, down, lp, bounds), Some(Command::TogglePause)), expected);
+                    assert_eq!(
+                        matches!(
+                            right_click_command(&renderer, down, lp, bounds),
+                            Some(Command::TogglePause)
+                        ),
+                        expected
+                    );
                     assert!(right_click_command(&renderer, up, lp, bounds).is_none());
                     assert!(right_click_command(&renderer, WM_CONTEXTMENU, lp, bounds).is_none());
                 }
@@ -1399,11 +1770,26 @@ mod tests {
     fn right_clicks_outside_window_and_left_messages_do_not_toggle() {
         let renderer = Renderer::new("KYOUKO PLAYING\ntime\ntrack\nvolume\neq/repeat").unwrap();
         let (width, height) = renderer.size();
-        let bounds = RECT { left: 1000, top: 500, right: 1000 + width, bottom: 500 + height };
+        let bounds = RECT {
+            left: 1000,
+            top: 500,
+            right: 1000 + width,
+            bottom: 500 + height,
+        };
         for (x, y) in [(-1, 4), (width, 4), (10, -1), (10, height)] {
-            assert!(right_click_command(&renderer, WM_RBUTTONDOWN, packed_point(x, y), bounds).is_none());
-            assert!(right_click_command(&renderer, WM_NCRBUTTONDOWN,
-                packed_point(bounds.left + x, bounds.top + y), bounds).is_none());
+            assert!(
+                right_click_command(&renderer, WM_RBUTTONDOWN, packed_point(x, y), bounds)
+                    .is_none()
+            );
+            assert!(
+                right_click_command(
+                    &renderer,
+                    WM_NCRBUTTONDOWN,
+                    packed_point(bounds.left + x, bounds.top + y),
+                    bounds
+                )
+                .is_none()
+            );
         }
         for message in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEWHEEL, 0, u32::MAX] {
             assert!(right_click_command(&renderer, message, packed_point(10, 4), bounds).is_none());
@@ -1412,17 +1798,50 @@ mod tests {
 
     #[test]
     fn global_hotkey_ids_route_to_the_requested_commands() {
-        assert!(matches!(hotkey_command(HOTKEY_SEEK_BACK as usize), Some(Command::SeekRelative(-5.0))));
-        assert!(matches!(hotkey_command(HOTKEY_SEEK_FORWARD as usize), Some(Command::SeekRelative(5.0))));
-        assert!(matches!(hotkey_command(HOTKEY_PREV_TRACK as usize), Some(Command::PrevTrack)));
-        assert!(matches!(hotkey_command(HOTKEY_NEXT_TRACK as usize), Some(Command::NextTrack)));
-        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_PAUSE as usize), Some(Command::TogglePause)));
-        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_LOOP as usize), Some(Command::ToggleLoop)));
-        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_EQ as usize), Some(Command::ToggleEq)));
-        assert!(matches!(hotkey_command(HOTKEY_TOGGLE_OVERLAY as usize), Some(Command::ToggleOverlay)));
-        assert!(matches!(hotkey_command(HOTKEY_QUIT as usize), Some(Command::Quit)));
-        assert!(matches!(hotkey_command(HOTKEY_VOLUME_DOWN as usize), Some(Command::VolumeDown)));
-        assert!(matches!(hotkey_command(HOTKEY_VOLUME_UP as usize), Some(Command::VolumeStep(10))));
+        assert!(matches!(
+            hotkey_command(HOTKEY_SEEK_BACK as usize),
+            Some(Command::SeekRelative(-5.0))
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_SEEK_FORWARD as usize),
+            Some(Command::SeekRelative(5.0))
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_PREV_TRACK as usize),
+            Some(Command::PrevTrack)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_NEXT_TRACK as usize),
+            Some(Command::NextTrack)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_TOGGLE_PAUSE as usize),
+            Some(Command::TogglePause)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_TOGGLE_LOOP as usize),
+            Some(Command::ToggleLoop)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_TOGGLE_EQ as usize),
+            Some(Command::ToggleEq)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_TOGGLE_OVERLAY as usize),
+            Some(Command::ToggleOverlay)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_QUIT as usize),
+            Some(Command::Quit)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_VOLUME_DOWN as usize),
+            Some(Command::VolumeDown)
+        ));
+        assert!(matches!(
+            hotkey_command(HOTKEY_VOLUME_UP as usize),
+            Some(Command::VolumeStep(10))
+        ));
         for unknown in [0, 1, 0x10B, usize::MAX, (i32::MAX as usize) + 1] {
             assert!(hotkey_command(unknown).is_none());
         }
@@ -1430,10 +1849,19 @@ mod tests {
 
     #[test]
     fn global_hotkey_bindings_use_unique_ids_and_exact_oem_keys() {
-        let expected = [(MOD_ALT.0, 0xBC), (MOD_ALT.0, 0xBE),
-            (MOD_ALT.0 | MOD_SHIFT.0, 0xBC), (MOD_ALT.0 | MOD_SHIFT.0, 0xBE), (MOD_ALT.0, 0xBF),
-            (MOD_ALT.0, 0x4C), (MOD_ALT.0, 0xBA), (MOD_ALT.0 | MOD_SHIFT.0, 0xBF),
-            (MOD_ALT.0, 0x51), (MOD_ALT.0, 0xBD), (MOD_ALT.0, 0xBB)];
+        let expected = [
+            (MOD_ALT.0, 0xBC),
+            (MOD_ALT.0, 0xBE),
+            (MOD_ALT.0 | MOD_SHIFT.0, 0xBC),
+            (MOD_ALT.0 | MOD_SHIFT.0, 0xBE),
+            (MOD_ALT.0, 0xBF),
+            (MOD_ALT.0, 0x4C),
+            (MOD_ALT.0, 0xBA),
+            (MOD_ALT.0 | MOD_SHIFT.0, 0xBF),
+            (MOD_ALT.0, 0x51),
+            (MOD_ALT.0, 0xBD),
+            (MOD_ALT.0, 0xBB),
+        ];
         assert_eq!(HOTKEY_BINDINGS.len(), expected.len());
         let mut ids = std::collections::HashSet::new();
         let mut combinations = std::collections::HashSet::new();
@@ -1454,39 +1882,87 @@ mod tests {
         let (decoder_tx, decoder_rx) = crate::decoder_wake::command_channel(8);
         let (command_tx, cmd_rx) = crossbeam_channel::bounded(32);
         let (_status_tx, status_rx) = crossbeam_channel::bounded(16);
-        let broker = Broker::new(shared.clone(), DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})));
+        let broker = Broker::new(
+            shared.clone(),
+            DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), Arc::new(|| {})),
+        );
         let renderer = Renderer::new(broker.view()).unwrap();
         let mut state = Box::new(UiState {
-            hwnd: HWND::default(), broker, cmd_rx, status_rx, shared, renderer,
-            audio_out: AudioOut::new(None), timer_on: false,
-            last_phase: Phase::Stopped, hidden: true,
-            hotkeys: GlobalHotkeys::default(), drawer: None, next_drawer_token: 0,
+            hwnd: HWND::default(),
+            broker,
+            cmd_rx,
+            status_rx,
+            shared,
+            renderer,
+            audio_out: AudioOut::new(None),
+            timer_on: false,
+            last_phase: Phase::Stopped,
+            hidden: true,
+            hotkeys: GlobalHotkeys::default(),
+            drawer: None,
+            next_drawer_token: 0,
             quit_click: QuitClickState::default(),
         });
         unsafe {
             let instance = GetModuleHandleW(None).unwrap();
-            let class = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: instance.into(),
-                lpszClassName: w!("kyouko_hotkey_test"), ..Default::default() };
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(wndproc),
+                hInstance: instance.into(),
+                lpszClassName: w!("kyouko_hotkey_test"),
+                ..Default::default()
+            };
             assert_ne!(RegisterClassW(&class), 0);
             // Keep the native test window offscreen and non-activating. Test
             // broker commands directly, without injecting mouse/keyboard input.
-            let hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, w!("kyouko_hotkey_test"), w!(""),
-                WS_POPUP, -32000, -32000, 20, 20, None, None, Some(instance.into()),
-                Some(&mut *state as *mut UiState as *const c_void)).unwrap();
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                w!("kyouko_hotkey_test"),
+                w!(""),
+                WS_POPUP,
+                -32000,
+                -32000,
+                20,
+                20,
+                None,
+                None,
+                Some(instance.into()),
+                Some(&mut *state as *mut UiState as *const c_void),
+            )
+            .unwrap();
             state.hwnd = hwnd;
             assert!(!windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool());
             let registered = state.hotkeys.registered;
-            println!("native hotkeys registered: {}/{}", registered.iter().filter(|&&active| active).count(), HOTKEY_BINDINGS.len());
+            println!(
+                "native hotkeys registered: {}/{}",
+                registered.iter().filter(|&&active| active).count(),
+                HOTKEY_BINDINGS.len()
+            );
             for hidden in [false, true] {
-                command_tx.send(hotkey_command(HOTKEY_TOGGLE_OVERLAY as usize).unwrap()).unwrap();
+                command_tx
+                    .send(hotkey_command(HOTKEY_TOGGLE_OVERLAY as usize).unwrap())
+                    .unwrap();
                 assert!(!drain_commands(&mut state));
                 assert_eq!(state.hidden, hidden);
-                assert_eq!(windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool(), !hidden);
-                assert_eq!(state.hotkeys.registered, registered, "visibility cannot unregister global hotkeys");
+                assert_eq!(
+                    windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool(),
+                    !hidden
+                );
+                assert_eq!(
+                    state.hotkeys.registered, registered,
+                    "visibility cannot unregister global hotkeys"
+                );
             }
-            command_tx.send(hotkey_command(HOTKEY_QUIT as usize).unwrap()).unwrap();
-            assert!(drain_commands(&mut state), "Alt+Q must exit even when the overlay is hidden");
-            assert!(matches!(decoder_rx.try_recv(), Ok(crate::broker::DecoderCmd::Shutdown)));
+            command_tx
+                .send(hotkey_command(HOTKEY_QUIT as usize).unwrap())
+                .unwrap();
+            assert!(
+                drain_commands(&mut state),
+                "Alt+Q must exit even when the overlay is hidden"
+            );
+            assert!(matches!(
+                decoder_rx.try_recv(),
+                Ok(crate::broker::DecoderCmd::Shutdown)
+            ));
             DestroyWindow(hwnd).unwrap();
             assert!(!IsWindow(Some(hwnd)).as_bool());
             assert_eq!(state.hotkeys.registered, [false; HOTKEY_BINDINGS.len()]);
@@ -1494,7 +1970,13 @@ mod tests {
             // Existing third-party shortcuts are logged and left untouched.
             for (binding, active) in HOTKEY_BINDINGS.iter().zip(registered) {
                 if active {
-                    RegisterHotKey(None, binding.id, binding.modifiers | MOD_NOREPEAT, binding.key.0 as u32).unwrap();
+                    RegisterHotKey(
+                        None,
+                        binding.id,
+                        binding.modifiers | MOD_NOREPEAT,
+                        binding.key.0 as u32,
+                    )
+                    .unwrap();
                     UnregisterHotKey(None, binding.id).unwrap();
                 }
             }
@@ -1503,12 +1985,23 @@ mod tests {
 
     #[test]
     fn drawer_hit_test_owns_the_entire_surface_on_negative_monitors() {
-        let bounds = RECT { left: -420, top: -100, right: 0, bottom: 216 };
+        let bounds = RECT {
+            left: -420,
+            top: -100,
+            right: 0,
+            bottom: 216,
+        };
         for (x, y) in [(-420, -100), (-1, -100), (-420, 215), (-1, 215), (-210, 0)] {
-            assert_eq!(drawer_hit_test(bounds, POINT { x, y }), LRESULT(HTCLIENT as isize));
+            assert_eq!(
+                drawer_hit_test(bounds, POINT { x, y }),
+                LRESULT(HTCLIENT as isize)
+            );
         }
         for (x, y) in [(-421, 0), (0, 0), (-1, -101), (-1, 216)] {
-            assert_eq!(drawer_hit_test(bounds, POINT { x, y }), LRESULT(HTNOWHERE as isize));
+            assert_eq!(
+                drawer_hit_test(bounds, POINT { x, y }),
+                LRESULT(HTNOWHERE as isize)
+            );
         }
     }
 
@@ -1516,28 +2009,50 @@ mod tests {
     fn drawer_selection_dispatches_once_and_waits_for_the_matching_release() {
         let layout = TrackListLayout::new(20, 1920, 1080);
         let mut click = DrawerClickState::default();
-        assert_eq!(click.release(WM_LBUTTONUP), TrackListClick::None, "opening-click release keeps the list open");
+        assert_eq!(
+            click.release(WM_LBUTTONUP),
+            TrackListClick::None,
+            "opening-click release keeps the list open"
+        );
         assert!(!click.press(layout.click(10, 0, 0, 20), WM_LBUTTONUP));
         assert!(!click.busy(), "header clicks do not close the list");
         assert!(click.press(layout.click(10, layout.height() - 1, 5, 20), WM_LBUTTONUP));
         assert!(click.busy());
-        assert!(!click.close_queued, "mouse-down only records the selection; no jump or dismissal yet");
+        assert!(
+            !click.close_queued,
+            "mouse-down only records the selection; no jump or dismissal yet"
+        );
         assert!(!click.press(TrackListClick::Jump(1), WM_LBUTTONUP));
         assert!(!click.press(TrackListClick::Dismiss, WM_RBUTTONUP));
-        assert_eq!(click.release(WM_RBUTTONUP), TrackListClick::None, "unrelated release cannot expose the background");
+        assert_eq!(
+            click.release(WM_RBUTTONUP),
+            TrackListClick::None,
+            "unrelated release cannot expose the background"
+        );
         assert!(click.busy());
         assert_eq!(click.release(WM_LBUTTONUP), TrackListClick::Jump(17));
-        assert!(click.close_queued, "consume mouse-up before the queued destruction");
+        assert!(
+            click.close_queued,
+            "consume mouse-up before the queued destruction"
+        );
         assert!(click.busy());
         assert_eq!(click.release(WM_LBUTTONUP), TrackListClick::None);
-        assert!(!click.press(TrackListClick::Jump(1), WM_LBUTTONUP), "no second selection while close is queued");
+        assert!(
+            !click.press(TrackListClick::Jump(1), WM_LBUTTONUP),
+            "no second selection while close is queued"
+        );
     }
 
     #[test]
     fn drawer_outside_dismissal_consumes_each_button_without_a_jump() {
         let layout = TrackListLayout::new(2, 1920, 1080);
         for release in [WM_LBUTTONUP, WM_RBUTTONUP, WM_MBUTTONUP] {
-            for (x, y) in [(-1, 10), (layout.width, 10), (10, -1), (10, layout.height())] {
+            for (x, y) in [
+                (-1, 10),
+                (layout.width, 10),
+                (10, -1),
+                (10, layout.height()),
+            ] {
                 let mut click = DrawerClickState::default();
                 assert!(click.press(layout.click(x, y, 0, 2), release));
                 assert!(click.busy());
@@ -1552,14 +2067,18 @@ mod tests {
     #[test]
     fn hidden_drawer_creation_and_destruction_release_owned_state() {
         let before = DRAWER_STATES.load(Ordering::Relaxed);
-        let view = TrackList { titles: vec!["Song A".into(), "Song B".into()], current: Some(1), loading: false };
+        let view = TrackList {
+            titles: vec!["Song A".into(), "Song B".into()],
+            current: Some(1),
+            loading: false,
+        };
         let layout = TrackListLayout::new(view.titles.len(), 1920, 1080);
         let hwnd = create_drawer(HWND::default(), 1, view, layout, (0, 0)).unwrap();
         unsafe {
             assert!(IsWindow(Some(hwnd)).as_bool());
             assert!(!windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool());
             use windows::Win32::UI::WindowsAndMessaging::{
-                GetLayeredWindowAttributes, GWL_EXSTYLE, WS_EX_TRANSPARENT,
+                GWL_EXSTYLE, GetLayeredWindowAttributes, WS_EX_TRANSPARENT,
             };
             let styles = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
             assert_ne!(styles & WS_EX_LAYERED.0, 0);
@@ -1578,7 +2097,10 @@ mod tests {
             GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), None).unwrap();
             assert_eq!(alpha, DRAWER_ALPHA);
             assert!(IsWindow(Some(hwnd)).as_bool());
-            assert_eq!((*state).click.release(WM_LBUTTONUP), TrackListClick::Jump(1));
+            assert_eq!(
+                (*state).click.release(WM_LBUTTONUP),
+                TrackListClick::Jump(1)
+            );
             GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), None).unwrap();
             assert_eq!(alpha, DRAWER_ALPHA);
             assert!(IsWindow(Some(hwnd)).as_bool());
@@ -1590,11 +2112,21 @@ mod tests {
             PostMessageW(Some(hwnd), WM_TRACKLIST_FINISH_CLICK, WPARAM(0), LPARAM(0)).unwrap();
             assert!(IsWindow(Some(hwnd)).as_bool());
             let mut message = MSG::default();
-            assert!(GetMessageW(&mut message, Some(hwnd), WM_TRACKLIST_FINISH_CLICK, WM_TRACKLIST_FINISH_CLICK).0 > 0);
+            assert!(
+                GetMessageW(
+                    &mut message,
+                    Some(hwnd),
+                    WM_TRACKLIST_FINISH_CLICK,
+                    WM_TRACKLIST_FINISH_CLICK
+                )
+                .0 > 0
+            );
             assert_eq!(message.message, WM_TRACKLIST_FINISH_CLICK);
             DispatchMessageW(&message);
         }
-        unsafe { assert!(!IsWindow(Some(hwnd)).as_bool()); }
+        unsafe {
+            assert!(!IsWindow(Some(hwnd)).as_bool());
+        }
         assert_eq!(DRAWER_STATES.load(Ordering::Relaxed), before);
     }
 }

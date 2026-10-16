@@ -73,7 +73,9 @@ impl StreamBuffer {
         let mut bytes = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
         // Timeout/cancellation and pipe EOF can race. Preserve the first
         // terminal result so EOF cannot turn a timed-out download into success.
-        if bytes.done { return; }
+        if bytes.done {
+            return;
+        }
         bytes.done = true;
         bytes.error = result.err().map(|error| error.to_string());
         self.ready.notify_all();
@@ -103,11 +105,25 @@ impl StreamBuffer {
     #[cfg(test)]
     pub fn wait_complete(&self, timeout: std::time::Duration) -> std::io::Result<()> {
         let bytes = self.bytes.lock().unwrap_or_else(|error| error.into_inner());
-        let (bytes, _) = self.ready.wait_timeout_while(bytes, timeout, |bytes| !bytes.done && !bytes.cancelled)
+        let (bytes, _) = self
+            .ready
+            .wait_timeout_while(bytes, timeout, |bytes| !bytes.done && !bytes.cancelled)
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(error) = &bytes.error { return Err(io::Error::other(error.clone())); }
-        if bytes.cancelled { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "stream cancelled")); }
-        if !bytes.done { return Err(io::Error::new(io::ErrorKind::TimedOut, "download completion timed out")); }
+        if let Some(error) = &bytes.error {
+            return Err(io::Error::other(error.clone()));
+        }
+        if bytes.cancelled {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "stream cancelled",
+            ));
+        }
+        if !bytes.done {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "download completion timed out",
+            ));
+        }
         Ok(())
     }
 
@@ -122,7 +138,8 @@ impl StreamBuffer {
     }
 
     fn seek_mode(&self, downloaded_only: bool) -> DownloadedSeek<'_> {
-        self.downloaded_only.store(downloaded_only, Ordering::Release);
+        self.downloaded_only
+            .store(downloaded_only, Ordering::Release);
         self.seeking.store(true, Ordering::Release);
         DownloadedSeek(self)
     }
@@ -131,7 +148,11 @@ impl StreamBuffer {
         MemoryReader {
             buffer: self.clone(),
             position: 0,
-            epoch: self.bytes.lock().unwrap_or_else(|e| e.into_inner()).reader_epoch,
+            epoch: self
+                .bytes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reader_epoch,
         }
     }
 }
@@ -273,20 +294,29 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let read_tx = tx.clone();
         let reading = std::thread::spawn(move || {
-            read_tx.send(reader.read_exact(&mut [0; 2]).unwrap_err().kind()).unwrap();
+            read_tx
+                .send(reader.read_exact(&mut [0; 2]).unwrap_err().kind())
+                .unwrap();
         });
         let seeking = std::thread::spawn(move || {
-            tx.send(end_reader.seek(SeekFrom::End(0)).unwrap_err().kind()).unwrap();
+            tx.send(end_reader.seek(SeekFrom::End(0)).unwrap_err().kind())
+                .unwrap();
         });
         buffer.retire_readers();
         for _ in 0..2 {
-            assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), io::ErrorKind::ConnectionAborted);
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+                io::ErrorKind::ConnectionAborted
+            );
         }
         reading.join().unwrap();
         seeking.join().unwrap();
         buffer.append(b"bc").unwrap();
         buffer.finish(Ok(()));
-        assert!(buffer.complete(), "reader interruption must not cancel the producer");
+        assert!(
+            buffer.complete(),
+            "reader interruption must not cancel the producer"
+        );
         let mut actual = [0; 3];
         buffer.reader().read_exact(&mut actual).unwrap();
         assert_eq!(&actual, b"abc");
@@ -371,7 +401,9 @@ mod tests {
             assert_eq!(bytes.data.capacity(), MAX_STREAM_BYTES);
         }
         let mut reader = buffer.reader();
-        reader.seek(SeekFrom::Start((MAX_STREAM_BYTES - 1) as u64)).unwrap();
+        reader
+            .seek(SeekFrom::Start((MAX_STREAM_BYTES - 1) as u64))
+            .unwrap();
         let mut last = [0];
         reader.read_exact(&mut last).unwrap();
         assert_eq!(last, [7]);
@@ -393,11 +425,15 @@ mod tests {
             tx.send(error.kind()).unwrap();
         });
         buffer.cancel();
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
-            io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            io::ErrorKind::ConnectionAborted
+        );
         worker.join().unwrap();
-        assert_eq!(buffer.reader().seek(SeekFrom::Start(0)).unwrap_err().kind(),
-            io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            buffer.reader().seek(SeekFrom::Start(0)).unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
     }
 
     #[test]

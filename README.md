@@ -155,8 +155,8 @@ leaves the last committed configuration intact.
 Requirements:
 
 - Windows 10 or 11.
-- Rust 1.99.0 and Cargo, the toolchain used by Windows CI. OS file locking
-  requires Rust 1.89 or newer.
+- Rust 1.99.0 or newer and Cargo. `Cargo.toml` declares 1.99.0 as the minimum
+  supported version; Windows CI tests that version with Clippy and rustfmt.
 - For the MSVC target, Visual Studio C++ Build Tools and the Windows SDK,
   including the Resource Compiler (`rc.exe`).
 - `yt-dlp` on `PATH` for network playback. Local playback has no external
@@ -276,6 +276,19 @@ playlist output is deferred so controlled selection tests launch no network
 processes. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for boundaries and results.
 Ordinary builds exclude the controller and all its hooks.
 
+For memory studies, set `KYOUKO_APP_OBSERVATIONS` to a new JSONL file path.
+The finite diagnostic controller writes each observation after its window and
+releases it, avoiding the default accumulation of observation snapshots in RAM.
+Startup/command rows remain in the result JSON, alongside the streamed path/count.
+An existing destination or write failure fails the diagnostic and requests Quit.
+This does not change ordinary builds or normal playback behavior.
+
+Diagnostic snapshots distinguish first callback entry (`callback`) from first
+copied PCM (`pcm`) and expose the generation's priming watermark (`pcm_primed`).
+Both callback recorders have independent fixed storage and overflow counters;
+resume timing requires an unchanged generation. This can locate a delay before
+rendering without treating Bluetooth audible wake-up lag as decoder/UI latency.
+
 For decoder-stage profiling in a finite diagnostic run, `KYOUKO_DSP_PROFILE`
 names a JSON output file. The decoder records successful packet-read, decode,
 sample-copy, EQ, volume, resampling and channel-mix/copy wall durations, then
@@ -285,7 +298,36 @@ comparisons. Native output identity is included in diagnostic UI snapshots.
 The separate matched EQ comparison retains local tools and raw evidence under
 ignored `target/cpu-eval/`; Python tools are not shipped in the repository.
 
+The second-endpoint assessment used Headphones (BT SPEAKER) on the same computer,
+with 96 matched CPU windows, about 31 minutes of continuous playback, and separate
+startup/command timing. Raw evidence and local tools are retained under ignored
+`target/device-bt-20261016/`. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for the
+measured active-EQ savings, bypass-control increase, initial-resume outlier and
+limits; this does not establish physical Bluetooth latency or glitch-free output.
+
+A separate BT resume follow-up covers 30 resumes after 1/15/60/120-second pauses
+and fresh launches. With PCM already primed, the measured delay preceded the first
+render callback; PCM copying then took at most 0.004 ms. This localizes the delay
+to the output resumption path without identifying a particular Windows/driver/
+Bluetooth component or measuring audible sound. Raw evidence and local tools are
+under ignored `target/bt-resume-20261016/`; normal pause behavior is unchanged.
+
+The bypass CPU follow-up uses eight matched pairs with 120-second windows and
+the exact original binaries. Mean change was +0.039 percentage points of one
+core, with a descriptive 95% interval of −0.005 to +0.083; the earlier increase
+was not reproduced at the predeclared +0.10-point bound. Smaller effects remain
+possible. Raw evidence and local tools are under ignored
+`target/bt-bypass-20261016/`; see [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
+
+Memory controls found that retaining full diagnostic snapshots caused growth
+even while paused: three matched pairs averaged +498 KiB with retained snapshots
+versus -97 KiB with streaming. A separate six-minute streamed playback check had
+zero PCM underruns and a +28 KiB first-to-last private-commit change. Multi-hour
+stability remains unverified. Raw evidence and local tools are under ignored
+`target/bt-memory-20261016/`; see [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
+
 ```text
+cargo fmt --package kyouko-player -- --check
 cargo check --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
@@ -293,7 +335,11 @@ cargo build --locked --release
 ```
 
 `.github/workflows/windows.yml` runs these checks on a fresh Windows 2025
-runner using Rust 1.99.0. It also checks the embedded executable icon, release
+runner using Rust 1.99.0. Run `cargo fmt --package kyouko-player` to apply the
+standard rustfmt layout to this package's Rust sources. The package selector
+keeps vendored path dependencies outside the formatting gate. Use Rust 1.99.0's
+rustfmt to match CI (`cargo +1.99.0 fmt --package kyouko-player`).
+CI also checks the embedded executable icon, release
 logging, and duplicate-launch protection. It builds for verification and does
 not upload executables or publish packages. Audio tests generate their WAV
 and AAC/MP4 samples in memory using Rust; no fixture files or FFmpeg are needed.

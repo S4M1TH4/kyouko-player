@@ -1,10 +1,10 @@
 //! Debug/non-Windows headless diagnostics. Windows release builds require
 //! a usable GUI; a failed window initialization shuts down gracefully.
 
-#[cfg(any(not(windows), debug_assertions))]
-use crossbeam_channel::{TryRecvError, Receiver};
 #[cfg(all(windows, not(debug_assertions)))]
 use crossbeam_channel::Receiver;
+#[cfg(any(not(windows), debug_assertions))]
+use crossbeam_channel::{Receiver, TryRecvError};
 
 use crate::audio::AudioOut;
 use crate::broker::{Broker, Command, Status};
