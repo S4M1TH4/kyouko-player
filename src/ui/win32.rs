@@ -68,6 +68,7 @@ use super::render::{
 };
 use super::{WM_APP_BROKER, WM_APP_OUTPUT, WM_APP_STATUS, set_pump_hwnd};
 #[cfg(feature = "release-diagnostics")]
+#[path = "../diagnostics/win32_performance.rs"]
 pub(crate) mod performance;
 use crate::broker::{Broker, Command, Flow, Phase, SharedState, Source, Status, TrackList};
 use crate::{log_debug, log_error, log_info, log_warn};

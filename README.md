@@ -401,9 +401,9 @@ seek/repeat diagnostic; it does not change application settings.
 | `src/audio.rs` | Decoding, DSP, PCM pool, and output stream ownership |
 | `src/pcm_queue.rs` | Preallocated atomic PCM queues with bounded claim attempts |
 | `src/decoder_wake.rs` | Decoder command delivery and race-safe address wait/wake |
-| `src/audio_performance.rs` | Opt-in PCM-only CPU and callback timing diagnostics |
-| `src/audio_cpu_profile.rs` | Optional decoder-stage wall timings for finite release diagnostics |
-| `src/ui/win32/performance.rs` | Finite full-application release assessment controller |
+| `src/diagnostics/audio_performance.rs` | Opt-in PCM-only CPU and callback timing diagnostics |
+| `src/diagnostics/audio_cpu_profile.rs` | Optional decoder-stage wall timings for finite release diagnostics |
+| `src/diagnostics/win32_performance.rs` | Finite full-application release assessment controller |
 | `src/audio_device.rs` | Windows audio endpoint notifications |
 | `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |
 | `src/config.rs` | State configuration and atomic saves |
@@ -413,6 +413,11 @@ seek/repeat diagnostic; it does not change application settings.
 | `src/logging.rs` | Diagnostic logging |
 | `src/ui/` | Win32 overlay, tracklist, rendering, and hotkeys |
 | `build.rs`, `build/icon.rs` | Icon generation and PE resource embedding |
+
+Diagnostic sources are grouped in `src/diagnostics/`. Their `#[path]` declarations
+keep them attached to the audio and Win32 modules, preserving access to private
+state. PCM timing is test-only; decoder profiling and the application controller
+require `release-diagnostics`. Normal application builds exclude all three.
 
 ## License
 

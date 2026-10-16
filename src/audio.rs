@@ -67,10 +67,10 @@ use crate::stream_buffer::StreamBuffer;
 use crate::{log_debug, log_info, log_warn};
 
 #[cfg(all(windows, feature = "release-diagnostics"))]
-#[path = "audio_cpu_profile.rs"]
+#[path = "diagnostics/audio_cpu_profile.rs"]
 mod cpu_profile;
 #[cfg(test)]
-#[path = "audio_performance.rs"]
+#[path = "diagnostics/audio_performance.rs"]
 mod performance;
 
 /// One decoded, EQ'd, volume-applied, resampled block of interleaved f32

@@ -490,7 +490,7 @@ interruptions while the PCM pool is full and no callback runs.
 
 The atomic queue work is bounded; Windows scheduling and address wake primitives
 do **not** provide hard real-time guarantees. Decoder starvation and delayed
-output callbacks are independent failure modes. `src/audio_performance.rs` is
+output callbacks are independent failure modes. `src/diagnostics/audio_performance.rs` is
 test-only: callbacks capture raw monotonic entry/end times, absolute QPC, CPAL
 callback and predicted-playback timestamps, and frame counts in fixed storage.
 The diagnostic separately analyzes actual entry intervals and device-clock
@@ -510,7 +510,7 @@ See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
 ### Full-application release diagnostics
 
 Full-application diagnostics are separately compiled with the opt-in
-`release-diagnostics` feature. `src/ui/win32/performance.rs` runs a finite plan
+`release-diagnostics` feature. `src/diagnostics/win32_performance.rs` runs a finite plan
 alongside normal `main` initialization, the actual visible overlay, UI pump,
 WASAPI, logger and state writer. A marker beside isolated state is mandatory.
 Commands use the bounded production CMD_TX and WM_APP_BROKER path; UI inspections
@@ -555,7 +555,7 @@ The local-only `target/release-assessment/release_assessment.py` retains plans,
 fixture recipes, logs, process measurements and nearest-rank analysis alongside
 it. Python tools and raw artifacts are ignored, rather than versioned source;
 the Rust controller and its Cargo feature remain part of the repository.
-`src/audio_cpu_profile.rs` is also diagnostic-feature-only. An optional
+`src/diagnostics/audio_cpu_profile.rs` is also diagnostic-feature-only. An optional
 `KYOUKO_DSP_PROFILE` destination enables seven decoder-stage wall counters;
 successful packet stages include preemption/allocation and exclude capacity
 waits and callbacks. Export occurs at track teardown. With the variable unset,
