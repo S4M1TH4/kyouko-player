@@ -15,6 +15,9 @@ download continues until its stream buffer is complete.
 
 ## Architecture
 
+See the [architecture and developer guide](docs/ARCHITECTURE.md) for development
+details.
+
 The broker owns playback state, queues, and persistence. The Win32 UI receives
 native messages and dispatches commands. A dedicated decoder thread performs
 file and stream reads, Symphonia decoding, equalization, resampling, and volume
@@ -24,7 +27,7 @@ The EQ keeps each band's channel history in local f64 variables for a decoded
 packet and stores it afterward. Sample arithmetic and per-band f32 rounding
 remain unchanged; a regression compares samples and filter history bit for bit
 with the original loop. Measured CPU comparisons are in
-[PCM performance measurements](PCM_PERFORMANCE.md).
+[PCM performance measurements](docs/PCM_PERFORMANCE.md).
 
 The sample callback uses preallocated PCM blocks and bounded atomic rings.
 Each queue claim makes one attempt and returns on contention. It performs no
@@ -46,7 +49,7 @@ The ready queue still holds at least 1.5 seconds of audio, plus the existing
 extra block for rendering/production, and primes 500 ms. Short tracks start at
 EOF. Device buffers remain native/default. Windows scheduling and address wakes
 provide no hard real-time guarantee; callback delays can occur without decoder
-starvation. See [PCM performance measurements](PCM_PERFORMANCE.md).
+starvation. See [PCM performance measurements](docs/PCM_PERFORMANCE.md).
 
 Each load carries an identity separate from PCM seek generations. Late decoder
 events cannot resume a stopped track or alter a newer selection. Native input
@@ -234,7 +237,7 @@ storage. Analysis, sorting, formatting, CPU accounting and file writes happen
 outside it. Actual callback-entry intervals, device-clock timestamp intervals,
 application execution time and PCM starvation are separate measurements.
 Long intervals do not prove audible glitches; zero PCM underruns do not prove
-glitch-free output. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for the fresh
+glitch-free output. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for the fresh
 comparison, trace coverage, scheduler evidence and measurement limits, and
 [vendor patch notes](vendor/cpal/OUTPUT_STARTUP_PATCH.md) for the exact extension. The
 vendored subset retains WASAPI on Windows and ALSA/PipeWire/PulseAudio for the
@@ -276,7 +279,7 @@ and finite UI inspection messages; it injects no mouse/keyboard input. The
 Other runs capture first application PCM delivery in fixed atomic storage;
 this measures neither physical sound latency nor device glitches. Synthetic
 playlist output is deferred so controlled selection tests launch no network
-processes. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for boundaries and results.
+processes. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for boundaries and results.
 Ordinary builds exclude the controller and all its hooks.
 
 For memory studies, set `KYOUKO_APP_OBSERVATIONS` to a new JSONL file path.
@@ -304,7 +307,7 @@ ignored `target/cpu-eval/`; Python tools are not shipped in the repository.
 The second-endpoint assessment used Headphones (BT SPEAKER) on the same computer,
 with 96 matched CPU windows, about 31 minutes of continuous playback, and separate
 startup/command timing. Raw evidence and local tools are retained under ignored
-`target/device-bt-20261016/`. See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for the
+`target/device-bt-20261016/`. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for the
 measured active-EQ savings, bypass-control increase, initial-resume outlier and
 limits; this does not establish physical Bluetooth latency or glitch-free output.
 
@@ -320,14 +323,14 @@ the exact original binaries. Mean change was +0.039 percentage points of one
 core, with a descriptive 95% interval of −0.005 to +0.083; the earlier increase
 was not reproduced at the predeclared +0.10-point bound. Smaller effects remain
 possible. Raw evidence and local tools are under ignored
-`target/bt-bypass-20261016/`; see [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
+`target/bt-bypass-20261016/`; see [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
 
 Memory controls found that retaining full diagnostic snapshots caused growth
 even while paused: three matched pairs averaged +498 KiB with retained snapshots
 versus -97 KiB with streaming. A separate six-minute streamed playback check had
 zero PCM underruns and a +28 KiB first-to-last private-commit change. Multi-hour
 stability remains unverified. Raw evidence and local tools are under ignored
-`target/bt-memory-20261016/`; see [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
+`target/bt-memory-20261016/`; see [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
 
 ```text
 cargo fmt --package kyouko-player -- --check
@@ -416,3 +419,8 @@ seek/repeat diagnostic; it does not change application settings.
 The project's original code is licensed under the [MIT License](LICENSE).
 Vendored code and other dependencies retain their respective licenses;
 see [CPAL's license](vendor/cpal/LICENSE) for the vendored audio dependency.
+
+[Third-party notices](docs/THIRD_PARTY_NOTICES.md) contain the dependency license
+texts, required attributions and MPL source-download information. Include that
+document, `docs/licenses/` and the root `LICENSE` in the release ZIP, preserving
+their paths. Review these materials when dependencies or the compiler change.

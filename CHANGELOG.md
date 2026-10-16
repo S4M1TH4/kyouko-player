@@ -24,7 +24,7 @@ Planned initial Windows release. The version is defined in `Cargo.toml`.
 - Optimized EQ processing with bit-for-bit sample/history regression coverage.
   Matched measurements showed roughly 50–53% lower player CPU across the tested
   EQ-on workloads on one computer with two output devices. See
-  [performance measurements](PCM_PERFORMANCE.md) for methods and limits.
+  [performance measurements](docs/PCM_PERFORMANCE.md) for methods and limits.
 - Command and load-generation handling that keeps stale decoder events from
   overriding newer playback requests.
 - Atomic settings persistence and shutdown cleanup for owned streaming and

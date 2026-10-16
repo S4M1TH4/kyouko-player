@@ -1260,8 +1260,8 @@ All measured processes reported `NORMAL_PRIORITY_CLASS=32`; playback and builds
 were unelevated. No process/global priority, affinity, power plan, driver,
 registry, overlay, hotkey, playlist or format changes were made.
 
-See [vendor patch notes](vendor/cpal/OUTPUT_STARTUP_PATCH.md) and
-[startup diff](vendor/cpal/startup-observation.patch). Cargo selects the pinned
+See [vendor patch notes](../vendor/cpal/OUTPUT_STARTUP_PATCH.md) and
+[startup diff](../vendor/cpal/startup-observation.patch). Cargo selects the pinned
 source copy through `[patch.crates-io]`; installed registry source was not edited.
 
 ## Source, device and procedure

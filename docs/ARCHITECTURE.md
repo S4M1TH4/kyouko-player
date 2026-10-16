@@ -5,6 +5,8 @@
 > disk; file names and symbol names are literal. When this document and the
 > code disagree, the code wins — then fix this document.
 
+Source paths and shell commands in this guide are relative to the repository root.
+
 ---
 
 ## 1. Executive Summary & Core Pillars
@@ -561,7 +563,8 @@ no stage clock is read. No sampler, timer or additional worker is created.
 UI inspection exports the owner's native output key to verify endpoint, rate,
 channels and format during comparisons. The matched EQ study retains its
 ignored local Python tools and raw process measurements in `target/cpu-eval/`.
-See README for commands and PCM_PERFORMANCE.md for the assessment.
+See [README](../README.md) for commands and
+[PCM_PERFORMANCE.md](PCM_PERFORMANCE.md) for the assessment.
 
 ### `src/stream_buffer.rs` — bounded progressive RAM reader
 

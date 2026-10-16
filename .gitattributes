@@ -1,0 +1,2 @@
+# Preserve copied upstream legal documents and their original whitespace.
+/docs/licenses/** -text -whitespace

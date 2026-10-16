@@ -1,3 +1,6 @@
+> Modified for kyouko-player: WASAPI startup observation and/or the
+> Windows/Linux platform subset. See MODIFICATIONS.md in the CPAL root.
+
 # CPAL 0.18.2 — local Windows/Linux subset
 
 This is the pinned CPAL source used by kyouko-player through Cargo's

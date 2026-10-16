@@ -1,3 +1,6 @@
+// Modified for kyouko-player: WASAPI startup observation and/or the
+// Windows/Linux platform subset. See MODIFICATIONS.md in the CPAL root.
+
 //! The suite of traits allowing CPAL to abstract over hosts, devices, event loops and stream IDs.
 //!
 //! # Custom Host Implementations

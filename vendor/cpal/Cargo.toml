@@ -1,3 +1,6 @@
+# Modified for kyouko-player: WASAPI startup observation and/or the
+# Windows/Linux platform subset. See MODIFICATIONS.md in the CPAL root.
+
 # Local CPAL 0.18.2 source subset: Windows WASAPI and Linux desktop audio.
 # See OUTPUT_STARTUP_PATCH.md and PLATFORM_SCOPE.md for provenance and scope.
 

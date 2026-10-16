@@ -1,3 +1,6 @@
+// Modified for kyouko-player: WASAPI startup observation and/or the
+// Windows/Linux platform subset. See MODIFICATIONS.md in the CPAL root.
+
 //! Platform dispatch for the retained Windows and Linux audio hosts.
 pub use self::platform_impl::*;
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
