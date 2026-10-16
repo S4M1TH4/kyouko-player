@@ -407,3 +407,9 @@ seek/repeat diagnostic; it does not change application settings.
 | `src/logging.rs` | Diagnostic logging |
 | `src/ui/` | Win32 overlay, tracklist, rendering, and hotkeys |
 | `build.rs`, `build/icon.rs` | Icon generation and PE resource embedding |
+
+## License
+
+The project's original code is licensed under the [MIT License](LICENSE).
+Vendored code and other dependencies retain their respective licenses;
+see [CPAL's license](vendor/cpal/LICENSE) for the vendored audio dependency.
