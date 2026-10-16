@@ -156,6 +156,28 @@ updates, writes a unique temporary file, flushes it, and atomically replaces
 A forced termination can lose pending changes; an interrupted temporary write
 leaves the last committed configuration intact.
 
+## Runtime requirements
+
+The Windows release targets x64 Windows 10/11. Rust, Cargo and Visual Studio are
+not needed to run the downloaded executable. This MSVC build imports
+`VCRUNTIME140.dll`; if it is missing, install Microsoft's
+[current Visual C++ x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
+
+Local playback uses the built-in decoders and needs no external decoder tools.
+For streaming:
+
+- Install [yt-dlp](https://github.com/yt-dlp/yt-dlp#installation) and make
+  `yt-dlp --version` work on `PATH` before launching the player.
+- For full YouTube support, install a supported
+  [Deno runtime and yt-dlp EJS scripts](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
+  Deno is enabled by default; make `deno --version` work on `PATH`. The official
+  Windows `yt-dlp.exe` already bundles Python and the EJS scripts, so those need
+  no separate installation. Other yt-dlp distributions may require EJS setup.
+- FFmpeg/ffprobe are recommended for yt-dlp operations that need them, such as
+  merging or post-processing. The player does not invoke them for local decoding.
+
+These tools and Microsoft runtime DLLs are not bundled in the player ZIP.
+
 ## Build
 
 Requirements:
@@ -165,8 +187,7 @@ Requirements:
   supported version; Windows CI tests that version with Clippy and rustfmt.
 - For the MSVC target, Visual Studio C++ Build Tools and the Windows SDK,
   including the Resource Compiler (`rc.exe`).
-- `yt-dlp` on `PATH` for network playback. Local playback has no external
-  decoder-process dependency.
+- For network playback after building, install the streaming tools listed above.
 
 ```text
 cargo build --release
