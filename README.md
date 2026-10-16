@@ -415,4 +415,14 @@ seek/repeat diagnostic; it does not change application settings.
 
 The project's original code is licensed under the [MIT License](LICENSE).
 Vendored code and other dependencies retain their respective licenses;
-see [CPAL's license](vendor/cpal/LICENSE) for the vendored audio dependency.
+see [third-party notices](THIRD_PARTY_NOTICES.md) for the dependency inventory,
+license texts, additional attributions and source availability. Exact MPL-covered
+source archives are included under `licenses/sources/`. The Rust standard-library
+notices are included too. Vendored CPAL remains Apache-2.0 and carries
+[local modification notices](vendor/cpal/MODIFICATIONS.md).
+
+Every binary distribution must include `LICENSE`, `THIRD_PARTY_NOTICES.md` and
+the complete `licenses/` directory. Windows CI checks the reviewed inventory;
+the [licensing maintenance instructions](licenses/README.md) explain verification
+and staging. External tools such as yt-dlp and FFmpeg are obtained separately;
+their redistribution needs its own review if they are ever bundled.

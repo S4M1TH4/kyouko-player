@@ -1122,6 +1122,7 @@ WM_MOUSEWHEEL (screen lParam) → client coords → renderer.eq_band_at
 
 ```
 cargo fmt --package kyouko-player -- --check
+pwsh -NoProfile -File scripts/check-third-party.ps1
 cargo check --locked              # zero errors AND zero warnings
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked               # offline regressions; environment diagnostics are opt-in
@@ -1132,6 +1133,16 @@ cargo build --locked --release    # zero warnings, clean release binary
 that exact toolchain with Clippy and rustfmt. Apply the standard formatter with
 `cargo +1.99.0 fmt --package kyouko-player`; the package selector excludes
 vendored path dependencies. Check formatting before the compilation gates.
+
+`THIRD_PARTY_NOTICES.md` and `licenses/` accompany every executable distribution.
+The licensing checker compares the reviewed Windows dependency graph/features,
+Cargo.lock, compiler version, notices, exact MPL source archives and vendored
+source against the inventory. Fetch locked dependencies first on a fresh checkout.
+CI also runs `scripts/test-third-party.ps1`, which checks rejection of missing or
+corrupt licenses/sources, lockfile/vendor drift and unsafe staging destinations.
+`scripts/check-third-party.ps1 -StageDirectory target/release-legal` creates a
+new directory containing the complete legal materials for the eventual ZIP.
+See `licenses/README.md` before updating dependencies or changing release scope.
 
 Zero warnings is a hard rule, not a goal. Win32 type conversions in
 particular (`LPARAM` halves, `WPARAM` high words, handle null checks) must

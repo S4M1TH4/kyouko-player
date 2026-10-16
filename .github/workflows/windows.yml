@@ -32,6 +32,13 @@ jobs:
         run: cargo fmt --package kyouko-player -- --check
       - name: Check
         run: cargo check --locked
+      - name: Third-party licenses and source availability
+        run: |
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File scripts/check-third-party.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File scripts/test-third-party.ps1
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Unit tests

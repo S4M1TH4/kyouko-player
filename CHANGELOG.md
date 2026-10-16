@@ -38,6 +38,8 @@ Planned initial Windows release. The version is defined in `Cargo.toml`.
   release compilation and executable resources.
 - MIT license for the project's original code; dependencies retain their own
   licenses.
+- Third-party license/copyright notices, exact MPL source archives and Rust
+  standard-library notices, with CI verification and release staging support.
 
 ### Requirements and limits
 
