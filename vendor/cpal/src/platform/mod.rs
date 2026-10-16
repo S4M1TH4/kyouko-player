@@ -63,43 +63,9 @@ macro_rules! impl_platform_host {
         ///
         /// # Available Host Strings
         ///
-        /// For cross-platform matching, these host strings are available:
-        ///
-        /// - `"aaudio"` - Android Audio
-        /// - `"alsa"` - Advanced Linux Sound Architecture
-        /// - `"asio"` - ASIO
-        /// - `"audioworklet"` - Audio Worklet
-        /// - `"coreaudio"` - CoreAudio
-        /// - `"custom"` - Custom host (requires `custom` feature)
-        /// - `"jack"` - JACK Audio Connection Kit
-        /// - `"null"` - Null host
-        /// - `"wasapi"` - Windows Audio Session API
-        /// - `"webaudio"` - Web Audio API
-        ///
-        /// # Cross-Platform Example
-        ///
-        /// ```
-        /// use cpal::HostId;
-        /// use std::str::FromStr;
-        ///
-        /// fn handle_host_string(host_string: &str) {
-        ///     // String matching works on all platforms
-        ///     match host_string {
-        ///         "alsa" => println!("ALSA host"),
-        ///         "coreaudio" => println!("CoreAudio host"),
-        ///         "jack" => println!("JACK host"),
-        ///         "wasapi" => println!("WASAPI host"),
-        ///         "asio" => println!("ASIO host"),
-        ///         "aaudio" => println!("AAudio host"),
-        ///         _ => println!("Other host"),
-        ///     }
-        ///
-        ///     // Parse host string (may fail if host is not available on this platform)
-        ///     if let Ok(host_id) = HostId::from_str(host_string) {
-        ///         println!("Successfully parsed: {}", host_id);
-        ///     }
-        /// }
-        /// ```
+        /// This local subset recognizes `"wasapi"` on Windows and `"alsa"` on
+        /// Linux, plus `"pipewire"` and `"pulseaudio"` when their features are enabled.
+        /// Parsing a host not compiled for the current platform returns an error.
         #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
         pub enum HostId {
             $(

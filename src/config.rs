@@ -2,7 +2,7 @@
 //! `%LOCALAPPDATA%\kyouko-player\state.cfg` (fallback `./state.cfg` when the
 //! variable is missing, e.g. portable runs).
 //!
-//! Format — human-editable, forward-compatible:
+//! Format — human-editable:
 //!
 //! ```text
 //! # kyouko-player state — rewritten automatically
@@ -12,10 +12,10 @@
 //! last_folder=C:\My Music
 //! ```
 //!
-//! Rules: unknown keys are ignored on read (so future versions round-trip
-//! through older builds harmlessly); a value that fails to parse falls back
-//! to its default per-key, never aborting the load. Writes are atomic — a
-//! temp file + rename, so a crash mid-write can never corrupt the real file.
+//! Unknown keys are ignored on read and omitted on save. Invalid values fall
+//! back to defaults per key. Writes flush a temporary file before an atomic
+//! rename; restoration reads only the committed configuration. Save failures
+//! are logged, and forced termination can lose pending changes.
 //! The instance lock is held for the application lifetime. A dedicated writer
 //! coalesces snapshots and parks between saves; its shutdown drains the last one.
 
@@ -38,7 +38,7 @@ pub struct PersistedState {
     pub eq_gains: [f32; EQ_BANDS],
     /// EQ bypass state; legacy configs default to enabled.
     pub eq_enabled: bool,
-    /// Raw last track: a local file path or a YouTube URL.
+    /// Raw last track: a local file path or a stream URL.
     pub last_track: Option<String>,
     /// Absolute path of the active local folder, rescanned on startup.
     pub last_folder: Option<String>,

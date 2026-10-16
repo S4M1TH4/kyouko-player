@@ -1,7 +1,7 @@
 //! The Windows presentation pump: 80 px layered window, global hotkeys,
 //! and a `GetMessageW` loop that parks in the kernel whenever nothing is
-//! happening. Every channel push from any thread arrives here as exactly one
-//! posted message — data in channels, wake-ups in the window queue.
+//! happening. Channel producers post wake messages; output/background events
+//! may coalesce wakes. Native input uses a thread-local inbox.
 //!
 //! Wake-up routing (`WM_APP`):
 //! * `WM_APP_BROKER` (0x8001) — a Command is waiting in `cmd_rx`
@@ -9,8 +9,7 @@
 //! * `WM_APP_OUTPUT` (0x8003) — CPAL error or endpoint notification
 //!
 //! Timer discipline: the 1 Hz panel timer exists **only** while `Playing`.
-//! Pause/Stop kill it, so a paused player has zero scheduled wake-ups — the
-//! thread sleeps in `GetMessageW` until a real event arrives.
+//! Pause/Stop kill it; the UI then waits in `GetMessageW` for other events.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -938,7 +937,7 @@ fn sync(s: &mut UiState) {
                 let _ = KillTimer(Some(s.hwnd), TIMER_ID);
             }
             s.timer_on = false;
-            log_info!("UI", "1 Hz panel timer OFF — zero wake-ups until resumed");
+            log_info!("UI", "1 Hz panel timer OFF");
         }
         s.last_phase = phase;
     }

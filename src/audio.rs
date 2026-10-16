@@ -3,7 +3,7 @@
 //! ```text
 //!   Source::File    → std::fs::File ─┐
 //!   Source::Youtube → yt-dlp stdout ─┴→ symphonia probe → packets → f32
-//!         → 10-band biquad EQ at source rate (coefficients rebuilt ONLY when eq_dirty)
+//!         → 10-band biquad EQ at source rate (rebuilt on control/format/seek changes)
 //!         → volume scale
 //!         → linear resampler (only when source rate ≠ device rate)
 //!         → channel mix (only when source ≠ device layout)
@@ -21,7 +21,7 @@
 //! * end of track → parks on drain/command interest waiting for the callback to
 //!   drain the buffered tail, so `Finished` never chops audio off the end.
 //!
-//! Orphan-proof yt-dlp lifecycle: the child lives in a shared slot that the
+//! Owned yt-dlp lifecycle: the child lives in a shared slot that the
 //! track's `ChildGuard` kills+reaps on EVERY teardown path (eof, stop, skip,
 //! error, shutdown). `AudioControls::interrupt()` kills it from outside for
 //! the one case the decoder can't handle itself: a network-stalled pipe read
@@ -454,8 +454,8 @@ pub fn spawn(
 // ── Output stream (owned by the main thread; WASAPI event-driven) ───────────
 
 /// Owns the cpal stream and mirrors the playback phase onto WASAPI:
-/// `set_playing(false)` stops the audio engine entirely — the paused player
-/// has zero callbacks, zero wake-ups, zero CPU.
+/// `set_playing(false)` requests WASAPI Stop, suspending steady output callbacks.
+/// Source downloads and pending saves/logging may still run while paused.
 pub struct AudioOut {
     stream: Option<cpal::Stream>,
     playing: bool,
@@ -877,11 +877,7 @@ impl AudioOut {
         log_info!(
             "AUDIO",
             "output {}",
-            if on {
-                "running"
-            } else {
-                "paused — zero CPU until resumed"
-            }
+            if on { "running" } else { "output paused" }
         );
     }
 }
@@ -1160,9 +1156,8 @@ impl PcmOutput {
     }
 }
 
-/// No I/O, heap allocation/free, logging or state locks. All sample storage
-/// was allocated before playback; only bounded nonblocking ring operations,
-/// conversion and atomic playhead/diagnostic updates occur here.
+/// Retire the callback owner and return its partial block. The stream owner
+/// destroys this state outside sample callback invocation.
 impl Drop for PcmOutput {
     fn drop(&mut self) {
         if let Some(chunk) = self.current.take() {
@@ -1175,6 +1170,8 @@ impl Drop for PcmOutput {
     }
 }
 
+/// Build a callback using preallocated storage. Invocation performs no I/O,
+/// heap allocation/free, logging or state locks; ring claims are bounded.
 fn popper<T: OutputSample>(
     chunk_rx: ChunkReceiver,
     drained_tx: DrainSignal,
@@ -1277,7 +1274,7 @@ fn run_decoder_with_output(
     retained: (AudioControls, Option<SuspendedTrack>),
 ) {
     let (controls, mut suspended) = retained;
-    log_info!("DECODER", "online — parked on command channel (zero CPU)");
+    log_info!("DECODER", "online — waiting for commands");
     let mut cache: Option<StreamCache> = None;
     while let Ok(cmd) = cmds.recv() {
         if matches!(cmd, DecoderCmd::Stop | DecoderCmd::Shutdown) {
@@ -1506,8 +1503,8 @@ struct ActiveTrack {
     seekable: bool,
     duration: Option<Duration>,
     title: Option<String>,
-    /// yt-dlp's stderr tail, kept mid-track so decode failures show why.
-    err_tail: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Bounded yt-dlp stderr excerpt retained for decode-failure diagnostics.
+    err_excerpt: Option<Arc<Mutex<Vec<u8>>>>,
     _child: Option<ChildGuard>,
     // Drop order is important: kill the child, then join its pipe reader.
     _download: Option<DownloadWorker>,
@@ -1528,10 +1525,10 @@ impl ActiveTrack {
         }
         false
     }
-    /// Log the last lines of yt-dlp's stderr — the reason it died, if it died.
+    /// Log the end of the bounded stderr excerpt retained for this track.
     fn log_child_stderr(&mut self) {
-        if let Some(tail) = self.err_tail.take() {
-            log_stderr_tail(&tail);
+        if let Some(tail) = self.err_excerpt.take() {
+            log_stderr_excerpt(&tail);
         }
     }
 }
@@ -1611,23 +1608,23 @@ fn open_track(
     buffer_slot: &BufferSlot,
     cached: Option<Arc<StreamBuffer>>,
 ) -> Result<ActiveTrack, String> {
-    let mut err_tail: Option<Arc<Mutex<Vec<u8>>>> = None;
-    match open_track_inner(source, child_slot, buffer_slot, cached, &mut err_tail) {
+    let mut err_excerpt: Option<Arc<Mutex<Vec<u8>>>> = None;
+    match open_track_inner(source, child_slot, buffer_slot, cached, &mut err_excerpt) {
         Ok(t) => Ok(t),
         Err(e) => {
-            if let Some(tail) = err_tail {
-                log_stderr_tail(&tail);
+            if let Some(tail) = err_excerpt {
+                log_stderr_excerpt(&tail);
             }
             Err(e)
         }
     }
 }
 
-fn log_stderr_tail(tail: &Arc<Mutex<Vec<u8>>>) {
-    let buf = tail.lock().unwrap_or_else(|e| e.into_inner());
+fn log_stderr_excerpt(excerpt: &Arc<Mutex<Vec<u8>>>) {
+    let buf = excerpt.lock().unwrap_or_else(|e| e.into_inner());
     let text = String::from_utf8_lossy(&buf);
-    // yt-dlp progress writes carriage returns, not newlines — the "last
-    // line" is simply the tail of the text.
+    // Progress may use carriage returns. Show the last 300 characters of the
+    // captured prefix, which need not include the child's final stderr output.
     let chars: Vec<char> = text.chars().collect();
     let start = chars.len().saturating_sub(300);
     let last: String = chars[start..].iter().collect();
@@ -1642,7 +1639,7 @@ fn open_track_inner(
     child_slot: &Arc<Mutex<Option<Child>>>,
     buffer_slot: &BufferSlot,
     cached: Option<Arc<StreamBuffer>>,
-    err_tail_out: &mut Option<Arc<Mutex<Vec<u8>>>>,
+    err_excerpt_out: &mut Option<Arc<Mutex<Vec<u8>>>>,
 ) -> Result<ActiveTrack, String> {
     let mut download = None;
     let mut stream_buffer = cached;
@@ -1687,11 +1684,11 @@ fn open_track_inner(
             let pid = child.id();
             let stdout = child.stdout.take().expect("yt-dlp stdout piped");
             let stderr = child.stderr.take().expect("yt-dlp stderr piped");
-            // Drain stderr on a transient thread; keep the tail for the
+            // Drain stderr on a transient thread; keep a bounded prefix for the
             // failure log. The thread dies at the next EOF (child exit/kill).
-            let err_tail = Arc::new(Mutex::new(Vec::new()));
+            let err_excerpt = Arc::new(Mutex::new(Vec::new()));
             {
-                let err_tail = Arc::clone(&err_tail);
+                let err_excerpt = Arc::clone(&err_excerpt);
                 thread::spawn(move || {
                     let mut chunk = [0u8; 1024];
                     let mut reader = stderr;
@@ -1699,7 +1696,7 @@ fn open_track_inner(
                         match reader.read(&mut chunk) {
                             Ok(0) | Err(_) => break,
                             Ok(n) => {
-                                let mut buf = err_tail.lock().unwrap_or_else(|e| e.into_inner());
+                                let mut buf = err_excerpt.lock().unwrap_or_else(|e| e.into_inner());
                                 if buf.len() < 8192 {
                                     buf.extend_from_slice(&chunk[..n]);
                                 }
@@ -1712,7 +1709,7 @@ fn open_track_inner(
                 slot: Arc::clone(child_slot),
             };
             *child_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-            *err_tail_out = Some(err_tail);
+            *err_excerpt_out = Some(err_excerpt);
             let producer = DownloadWorker::start_source(stdout, buffer_slot, child_slot, pid)?;
             let mss =
                 MediaSourceStream::new(Box::new(producer.buffer.reader()), Default::default());
@@ -1776,9 +1773,9 @@ fn open_track_inner(
         seekable,
         duration,
         title,
-        // The tail rides on the track so mid-stream decode failures can show
+        // The excerpt rides on the track so mid-stream decode failures can show
         // why yt-dlp died; on the success path it is simply dropped.
-        err_tail: std::mem::take(err_tail_out),
+        err_excerpt: std::mem::take(err_excerpt_out),
         _child: child_guard,
         _download: download,
         stream_buffer,
@@ -1912,16 +1909,16 @@ fn send_command(msg: Result<DecoderCmd, crossbeam_channel::RecvError>) -> SendOu
     }
 }
 
-/// One line, trimmed, control-char-free, capped — source titles must never
-/// smuggle newlines into the panel renderer.
+/// Keep the first line, trim it and cap it at 120 characters. Panel formatting
+/// separately replaces remaining control characters.
 fn clean_title(raw: &str) -> String {
     let line = raw.lines().next().unwrap_or("").trim();
     line.chars().take(120).collect()
 }
 
 /// Single-shot title resolution, run SEQUENTIALLY on the decoder thread
-/// before the audio child is spawned — there is never more than one yt-dlp
-/// process alive per load. The child lives in the shared ChildGuard slot, so
+/// before the audio child is spawned. Playlist metadata has a separate job.
+/// The child lives in the shared ChildGuard slot, so
 /// `AudioControls::interrupt()` (Stop / Skip / Shutdown) kills it mid-fetch;
 /// the parked `read_to_string` unblocks with EOF and it is reaped at once.
 /// Failure of any kind -> None (the panel keeps the URL; playback proceeds).
@@ -2187,7 +2184,7 @@ fn play_source_with_output(
         .as_ref()
         .and_then(|saved| saved.track.stream_buffer.clone())
         .or_else(|| cached.map(|cached| cached.buffer.clone()));
-    // Single-shot, SEQUENTIAL title resolution: one yt-dlp at a time, ever.
+    // Sequential title/audio extraction within this decoder's source pipeline.
     // The prefetch child lives in the same ChildGuard slot as the audio
     // child would, so Stop/Skip/Shutdown kill it mid-fetch (its parked read
     // unblocks with EOF) and it is reaped immediately.
@@ -2240,7 +2237,7 @@ fn play_source_with_output(
         // second device loss cannot kill or discard an incomplete download.
         track._child = saved.track._child.take();
         track._download = saved.track._download.take();
-        track.err_tail = saved.track.err_tail.take();
+        track.err_excerpt = saved.track.err_excerpt.take();
         log_info!(
             "DECODER",
             "audio output recovery: retained source and download (no re-resolution)"
@@ -2840,7 +2837,7 @@ impl Biquad {
         let a = 10f64.powf(gain_db as f64 / 40.0);
         let w0 = 2.0 * std::f64::consts::PI * freq_hz as f64 / sample_rate as f64;
         let (sw, cw) = w0.sin_cos();
-        let alpha = sw / 2.2; // Q = 1.1 — gentle shelves, bands don't fight
+        let alpha = sw / 2.2; // peaking-filter Q = 1.1
         let a0 = 1.0 + alpha / a;
         self.b0 = (1.0 + alpha * a) / a0;
         self.b1 = (-2.0 * cw) / a0;
@@ -2889,8 +2886,8 @@ impl EqChain {
         }
     }
 
-    /// Rebuild coefficients — called only when `eq_dirty` flips (a command
-    /// touched a gain) or on track open. f64 math, then straight back to f32.
+    /// Rebuild coefficients and reset history after control, track, decoded
+    /// format or seek changes. Coefficients/history use f64; output uses f32.
     fn rebuild(&mut self, gains_db: &[f32; EQ_BANDS], sample_rate: u32, channels: usize) {
         for (band, &f0) in EQ_BAND_HZ.iter().enumerate() {
             self.bands[band].set(f0, gains_db[band], sample_rate, channels);
@@ -2926,8 +2923,7 @@ impl EqChain {
 }
 
 /// Streaming linear resampler. Carries the last source frame between calls,
-/// so arbitrary packet sizes chain seamlessly. Quality is honest linear
-/// interpolation — transparent for playback SRC (44.1↔48 k).
+/// using linear interpolation across packet boundaries.
 struct LinearResampler {
     step: f64, // source frames per output frame
     /// Fractional source-frame position relative to `prev` (0.0 = exactly prev).

@@ -44,7 +44,7 @@ fn run_debug(
     log_info!("UI", "headless mode — panel follows on every state change");
     'pump: loop {
         // Blocks until a command or a status arrives. Thread parks in the
-        // kernel between events — this loop *is* the zero-CPU idle state.
+        // kernel between events without periodic polling.
         loop {
             match cmd_rx.try_recv() {
                 Ok(cmd) => {

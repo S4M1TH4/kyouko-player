@@ -1,13 +1,14 @@
-//! The pure core: message vocabulary, lock-free shared state, and the broker
-//! state machine. No platform code, no I/O — this module is the reason a
-//! future Linux port is a presentation-layer change only.
+//! Playback policy, message vocabulary, shared controls and the broker state
+//! machine. Folder scans and shortcut reads are synchronous; Windows playlist
+//! metadata work is delegated to an owned job.
 //!
 //! Threading contract:
 //! * `Broker` lives on the main thread only (single-owner state machine).
-//! * `SharedState` is the only cross-thread data: independent atomics, each an
+//! * `SharedState` contains cross-thread controls/counters: independent atomics, each an
 //!   isolated scalar, `Relaxed` unless a flag carries a payload (then
-//!   Release/Acquire). No locks, no false-sharing-critical writes.
-//! * Every transition goes through the broker and gets logged.
+//!   Release/Acquire). PCM queues and cancellation handles are shared separately.
+//! * The broker owns phase/queue/persistence decisions; the decoder and callback
+//!   update their own generations, metadata and playhead counters.
 
 use crossbeam_channel::{Receiver, Sender};
 use std::fmt;
@@ -21,8 +22,7 @@ use crate::{log_debug, log_error, log_info, log_warn};
 
 // ── Audio/DSP constants ──────────────────────────────────────────────────────
 
-/// Decode granularity: ~85 ms at 48 kHz stereo. Small enough that skip/stop
-/// feel instant, large enough that per-chunk overhead vanishes.
+/// Decode granularity: approximately 85 ms at 48 kHz.
 pub const CHUNK_FRAMES: usize = 4096;
 
 pub const EQ_BANDS: usize = 10;
@@ -61,8 +61,8 @@ impl Source {
         }
     }
 
-    /// Raw string form (path or URL) — exactly what persistence stores and
-    /// what `from_raw` turns back into a `Source`.
+    /// Path or normalized URL for persistence. Playlist index is saved separately;
+    /// restoring derives the site's default format rather than a custom override.
     pub fn raw(&self) -> &str {
         match self {
             Source::File(p) => p,
@@ -70,9 +70,8 @@ impl Source {
         }
     }
 
-    /// Inverse of `raw`: URL-shaped strings stream via yt-dlp, everything
-    /// else opens as a local file. The format id is per-site (YouTube 140,
-    /// Bilibili 30232). YouTube URLs with a nonempty `list=` query parameter
+    /// HTTP(S) strings route to yt-dlp; other strings become file sources.
+    /// Format selectors are per site. YouTube URLs with a nonempty `list=` key
     /// are canonicalized to the playlist URL and start at entry 1.
     pub fn from_raw(raw: &str) -> Source {
         if raw.starts_with("http://") || raw.starts_with("https://") {
@@ -236,7 +235,7 @@ fn default_format_for(url: &str) -> &'static str {
 }
 
 /// What a dropped batch of paths resolves to. A `.url` shortcut for a
-/// yt-dlp site (YouTube, Bilibili) wins over everything else in the same
+/// yt-dlp site (YouTube, Bilibili, Niconico) wins over everything else in the same
 /// drop (spec prioritization); otherwise the surviving media files form
 /// the queue.
 enum DroppedBatch {
@@ -334,8 +333,8 @@ fn source_path(source: &Source) -> &Path {
 }
 
 /// Shallow scan of one folder: files with a recognized media extension,
-/// sorted newest-first (files without a mtime sort last). Single-level by
-/// design — no recursion, so the one-off scan cannot block the broker.
+/// sorted newest-first (files without a mtime sort last). This synchronous
+/// single-level scan occupies the broker until filesystem work completes.
 fn scan_folder(dir: &str) -> Vec<Source> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -380,8 +379,8 @@ fn advance_playlist(source: &Source) -> Option<Source> {
 /// converge here — the broker is the single decision point.
 #[derive(Clone, Debug)]
 pub enum Command {
-    /// `paused: true` stages the source in the decoder (buffered, resume is
-    /// instant) while the output stays stopped — used for last-track restore.
+    /// `paused: true` allows decoder priming while output stays stopped,
+    /// as used for last-track restoration.
     Load {
         source: Source,
         paused: bool,
@@ -531,9 +530,9 @@ impl fmt::Display for Phase {
 
 // ── Cross-thread shared state ────────────────────────────────────────────────
 
-/// The only data shared across threads. Every field is an independent scalar;
-/// the decoder reads volume/EQ, the audio callback writes `frames_played`, and
-/// nothing here ever needs a lock or a CAS.
+/// Atomic playback controls and counters. The decoder reads volume/EQ; the
+/// callback advances `frames_played`, while loads/seeks may reset it. PCM queues
+/// and source cancellation use separate shared objects.
 pub struct SharedState {
     phase: AtomicU8,
     /// Volume as raw f32 bits (lock-free 32-bit store).
@@ -541,7 +540,7 @@ pub struct SharedState {
     /// Written by the WASAPI callback, read by the broker's 1 Hz timer.
     frames_played: AtomicU64,
     /// The OUTPUT device's rate — makes `frames_played` meaningful as time.
-    /// Set once when the stream opens; chunks are already resampled to it.
+    /// Updated when output is prepared; chunks are already resampled to it.
     sample_rate: AtomicU32,
     /// The output device's channel count, for decoder-side layout mixing.
     device_channels: AtomicU32,
@@ -552,9 +551,9 @@ pub struct SharedState {
     load_id: AtomicU64,
     eq_enabled: AtomicBool,
     /// Set (Release) when a gain changes; decoder rebuilds biquad coefficients
-    /// once (Acquire), then clears it. Coeff math only ever runs on change.
+    /// after taking it (Acquire). Track/format/seek changes also rebuild EQ.
     eq_dirty: AtomicBool,
-    /// Band gains in centi-dB: integer, lock-free, 0.1 dB resolution.
+    /// Band gains in centi-dB: integer, lock-free, 0.01 dB resolution.
     eq_gains_cdb: [AtomicI32; EQ_BANDS],
 }
 
@@ -638,7 +637,7 @@ impl SharedState {
     pub fn take_eq_dirty(&self) -> bool {
         self.eq_dirty.swap(false, Ordering::Acquire)
     }
-    /// Device rate — set once by the output stream, read by the decoder as
+    /// Current device rate, updated on output preparation; read by the decoder as
     /// its resampling target and by the broker for time math.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate.load(Ordering::Relaxed)
@@ -1013,7 +1012,7 @@ impl Broker {
     fn persist(&self) {
         if let Some(saver) = &self.saver {
             saver(self.persist_snapshot());
-            log_debug!("BROKER", "state persisted to disk");
+            log_debug!("BROKER", "state snapshot submitted");
         }
     }
 
@@ -1484,8 +1483,7 @@ impl Broker {
         }
     }
 
-    /// Current panel text — read by the Win32 renderer in step 2 (e.g. when
-    /// it needs to repaint from scratch after creation or a resize).
+    /// Current panel text for initial presentation and subsequent refreshes.
     pub fn view(&self) -> &str {
         &self.view
     }
@@ -1501,14 +1499,13 @@ impl Broker {
                 self.restore_startup(last_folder, last_track, last_playlist_index);
             }
             Command::LoadDropped(paths) => {
-                // Classify the batch first: a YouTube .url shortcut wins over
+                // Classify the batch first: a supported stream .url shortcut wins over
                 // everything else in the same drop; otherwise the surviving
                 // media files form the queue (newest first). An unplayable
                 // result leaves the player completely untouched.
                 match classify_dropped(&paths) {
                     DroppedBatch::YouTube(url) => {
-                        // Identical to typing `y <url>`: the playlist flow
-                        // (flat fetch, index jumps, EOF advance) works as-is.
+                        // Use the normal load path, including playlist handling.
                         self.handle_command(Command::Load {
                             source: Source::from_raw(&url),
                             paused: false,
@@ -1541,13 +1538,13 @@ impl Broker {
                 }
             }
             Command::Load { source, paused } => {
-                // Folder expansion: `p <dir>` queues the folder's media files
+                // Folder expansion queues the folder's media files
                 // (shallow scan, newest first) and plays the first one. A
                 // folder with no supported media leaves the player untouched.
                 let mut source = source;
                 let mut queue_managed = false;
                 if let Source::File(path) = &source {
-                    // A typed/dropped .url shortcut: parse it; a YouTube
+                    // A .url file passed directly to Load: a YouTube
                     // target routes to the streaming flow, anything else is
                     // skipped without touching playback.
                     if Path::new(path)
@@ -1962,9 +1959,8 @@ impl Broker {
                 self.pending_source = None; // the track now carries it
                 self.track = Some(track);
                 self.shared.reset_playhead();
-                // A staged load resolves to Paused instead of Playing: the
-                // track is buffered and resume is instant, but the output
-                // stays stopped — 0% CPU until the user asks for sound.
+                // A staged load resolves to Paused with output stopped.
+                // Opened precedes PCM priming, which may continue afterward.
                 let target = if self.stage_paused {
                     self.stage_paused = false;
                     Phase::Paused
@@ -2132,7 +2128,7 @@ impl Broker {
     }
 }
 
-// ── Panel: compact text for the 80 px window (ASCII only) ──────────────────
+// ── Panel: compact text for the 80 px window ────────────────────────────────
 
 /// Bound the requested target before sending a relative seek to the
 /// decoder. Unknown-duration streams still have a zero lower bound.

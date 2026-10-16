@@ -2,7 +2,7 @@
 
 //! kyouko-player — the mountain echo; only heard, never seen.
 //!
-//! # Thread map (the whole program is this picture)
+//! # Playback thread map (transient I/O and save/log workers omitted)
 //!
 //! ```text
 //!                    Command (bounded 32)              DecoderCmd (bounded 8)
@@ -19,26 +19,28 @@
 //! (*headless diagnostics run the same broker on an atomic wake mailbox so the
 //! broker is testable headlessly before any Win32 exists.)
 //!
-//! # Sleep semantics — there is no polling anywhere
+//! # Ordinary Windows playback waits
 //!
 //! | state   | main/broker            | decoder thread                  | WASAPI callback      |
 //! |---------|------------------------|---------------------------------|----------------------|
 //! | stopped | parked in msg loop     | parked in address wait          | not running          |
 //! | playing | parked + 1 Hz WM_TIMER | awake: decode → EQ → push       | ~10 ms event-driven  |
-//! | paused  | parked, NO timer       | parked (PCM capacity is full)   | stopped via pause()  |
+//! | paused  | parked, NO timer       | parked after PCM priming        | stopped via pause()  |
 //!
 //! PCM uses bounded atomic rings; commands publish before an address wake.
+//! Downloads, pending saves/logs and system notifications may still do work
+//! while playback is paused. Finite diagnostics use separate bounded checks.
 //!
 //! # Ownership
 //!
-//! The broker (main thread) alone owns every OS handle: the 80 px layered
-//! window and the cpal `Stream`. Nothing crosses thread
-//! boundaries except messages, so no `Sync` bounds are ever needed on handles.
+//! The UI thread owns the window, cpal `Stream` and broker policy. The decoder
+//! owns active source lifetimes; dedicated workers own settings/log writes.
+//! Messages, shared atomics, PCM blocks and cancellation handles cross threads.
 //!
 //! # Shutdown protocol
 //!
 //! `Quit` → broker sends `DecoderCmd::Shutdown` → decoder kills any yt-dlp
-//! child (never orphaned, network stops) → main joins the decoder → exit.
+//! child and joins source workers → main joins decoder/save/log workers → exit.
 //! Debug-console Ctrl+C / console close use the same graceful shutdown path.
 //! Release builds are GUI overlay processes with no console or stdin reader.
 
@@ -153,7 +155,7 @@ fn main() {
     CMD_TX.set(cmd_tx.clone()).ok();
 
     // An explicit startup file/URL takes precedence. Otherwise the broker rebuilds
-    // the saved folder queue and stages its last track paused (0% CPU idle).
+    // the saved folder queue and stages its last track with output paused.
     if let Some(arg) = std::env::args().nth(1) {
         let source = Source::from_raw(&arg);
         log_info!("MAIN", "launch track: {source} (autoplay)");
@@ -186,7 +188,7 @@ fn main() {
     );
 
     // The kill switch rides along with every Stop/Load/Shutdown so a stalled
-    // yt-dlp pipe read can never defer a command or hang shutdown.
+    // yt-dlp pipe read can be interrupted during replacement or shutdown.
     let controls = audio.controls.clone();
     let link = DecoderLink::with_interrupt(decoder_tx, decoder_rx.clone(), controls.clone().hook())
         .with_suspend(controls.suspend_hook());

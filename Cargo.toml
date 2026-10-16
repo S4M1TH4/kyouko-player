@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99.0"
 license = "MIT"
-description = "The mountain echo; only heard, never seen. A zero-resource, event-driven audio player."
+description = "A compact, event-driven desktop audio player."
 
 # ── Dependency policy ────────────────────────────────────────────────────────
 # No async runtime, no GUI toolkit, no rodio, no tracing. Every dependency must
@@ -37,16 +37,14 @@ windows = { version = "0.62", features = [
 ] }
 
 # Audio output. cpal on Windows = WASAPI in event-driven shared mode: the OS
-# wakes the callback only when it needs samples, and `Stream::pause()` stops
-# the callback entirely (true zero-CPU pause). Cross-platform by construction,
-# so the future Linux port keeps this module untouched.
+# wakes the callback for audio events; `Stream::pause()` requests WASAPI Stop.
 cpal = "0.18.2" # WASAPI failed-worker cleanup and default-device recovery fixes
 
 # Decoding. Defaults off — we ship exactly the codecs we play, nothing else.
 # `isomp4`+`aac` covers yt-dlp's format 140 (m4a); `mkv` covers webm/matroska
 # video pulled in as audio. Video containers decode audio-only by design.
-# Opus is not enabled; network sources select AAC. The local extension filter
-# in broker.rs must match these enabled container readers.
+# Network sources select AAC. The local extension filter in broker.rs must
+# match these enabled container readers.
 # `opt-simd` enables symphonia's SSE/AVX decode paths.
 symphonia = { version = "0.5", default-features = false, features = [
     "mp3",
@@ -73,7 +71,7 @@ windows-core = "0.62"
 winres = "0.1.12" # compile the executable's Windows icon/version resources
 
 [profile.release]
-opt-level = 3        # "z" would starve the decode loop; 3 keeps biquads + symphonia fast
+opt-level = 3        # optimize DSP and decoding throughput
 lto = "fat"
 codegen-units = 1
 panic = "abort"      # no unwind tables anywhere; a panic is a bug, we abort
@@ -83,7 +81,7 @@ strip = "symbols"
 opt-level = 1        # decoder stays usable when debugging from the terminal
 
 [patch.crates-io]
-# Pinned WASAPI startup observation only; never modify the Cargo registry.
+# Pinned WASAPI startup observation and Windows/Linux subset; see vendor/cpal.
 cpal = { path = "vendor/cpal" }
 
 [features]

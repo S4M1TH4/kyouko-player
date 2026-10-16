@@ -93,11 +93,10 @@ failure without overwriting evidence.
 
 Required checks passed: normal check/clippy/test/release build (191 tests),
 diagnostic clippy/test/release build (196 tests), ten environment-dependent tests
-ignored in each configuration. The final default release executable was rebuilt
-without diagnostics before measurements. No speculative production memory fix
-was made. Source/binary hashes, the finite design, schedule, source recipes,
-plans, logs, raw JSON/JSONL, isolated state and offline analysis were collected
-for the study. Those temporary artifacts and Python helpers were later removed.
+ignored in each configuration. Measurement runs used the instrumented release
+build; the ordinary release build was verified separately. Source/binary
+hashes, the finite design, schedule, source recipes, plans, logs, raw JSON/JSONL,
+isolated state and offline analysis were collected for the study.
 
 Real state, current saved Ogg selection and source music were preserved. Generated
 fixture and task-owned isolated state/processes were cleaned up after verification.
@@ -222,11 +221,9 @@ tests remain documented in the earlier report. The application code and binaries
 not modified for this comparison; the preceding normal/diagnostic Rust check
 results remain documented below. No speculative code fix was made.
 
-The temporary design files, schedules, frozen settings, source recipes, binary
-hashes, plans/results, logs, isolated state and analysis tools were later removed.
-Reproduction requires recreating the finite isolated-run helper, paired-analysis
-tools, fixtures and matched binaries. Use a fresh output directory and revalidate
-the active default endpoint, settings and hashes.
+Reproduction requires the finite isolated-run helper, paired-analysis tools,
+fixtures and matched binaries described above. Use a fresh output directory
+and revalidate the active default endpoint, settings and hashes.
 
 The real state and source selection were preserved; isolated state, generated
 fixture and task-owned processes were cleaned up. This covers one host, native
@@ -365,10 +362,7 @@ cargo test --locked --features release-diagnostics
 cargo build --locked --release --features release-diagnostics
 ```
 
-Temporary manifests, source snapshots, binary hashes, diagnostic executables,
-logs, plans/results, isolated state, validated samples and local analysis tools
-were later removed. The source music was read only; no generated media was
-needed. Task-owned processes and isolated state were cleaned up.
+The source music was read only; no generated media was needed.
 
 
 ---
@@ -457,8 +451,10 @@ p **0.06250**. No paused/bypass benefit is
 assumed, and small control readings should not be interpreted using relative
 percentages. The analysis included all raw pairs and the control uncertainty.
 Five of the six bypass pairs increased. The positive bootstrap interval and
-exploratory exact p of 0.0625 leave a possible small bypass cost unresolved;
-this is a focused follow-up item, not evidence that bypass behavior is cost-free.
+exploratory exact p of 0.0625 left a possible small bypass cost unresolved.
+The [longer bypass comparison](#longer-eq-bypass-cpu-comparison--2026-10-16)
+above subsequently did not reproduce the increase at its predeclared +0.10-point
+bound; the cause of the short-window difference and smaller effects remain open.
 
 This comparison estimates the EQ change on BT SPEAKER. Differences from the older
 Realtek tables cannot isolate the cost of Bluetooth: the studies occurred at
@@ -488,7 +484,10 @@ against the original build.
 
 The first/last-five means increased by about 0.44 MiB working set and 0.21 MiB
 private commit. This bounded observation does not establish flat memory use or
-exclude a slower leak; the cause of that drift was not profiled here.
+exclude a slower leak. The later
+[memory-retention controls](#diagnostic-memory-retention-controls--2026-10-16)
+above implicated retained diagnostic snapshots, without attributing every byte
+of this earlier run's growth to that cause.
 
 All 96 CPU windows also passed endpoint/format, phase/generation, PCM storage and
 delivery checks with zero PCM underruns. Paused windows rendered no frames.
@@ -547,8 +546,7 @@ Initial resume → first application PCM was **1524.820 / 46.265 / 32.751 ms** b
 The runs collected plans/results, isolated state, player logs, validated counters,
 binary hashes, source recipes, endpoint inventory, frozen settings and schedules.
 The local analysis reused paired-comparison and tested percentile helpers.
-Those temporary artifacts and tools have since been removed. Reproduction
-requires recreating them, Python, FFmpeg and the same active default endpoint;
+Reproduction requires those local tools, Python, FFmpeg and the same active default endpoint;
 use a fresh output directory and revalidate hashes/settings.
 Two offline calculation tests cover native rate/layout parsing, one-core CPU
 scaling, PCM delivery at 16/44.1/48 kHz and endpoint mismatch rejection. Required
@@ -766,10 +764,8 @@ playlist indexing and cleanup tests passed. The actual saved state was hashed
 before/after and never written; isolated state, generated fixtures and task-owned
 processes were cleaned up.
 
-Temporary manifests, source/binary hashes, matched source copies, plans, raw
-counters, snapshots, logs, isolated state, stage profiles and Python tools were
-removed after completion. Reproduction requires recreating those tools and
-fixtures, building matched variants, finishing builds/tests, running the
+Reproduction requires recreating the local runners and fixtures, building
+matched variants, finishing builds/tests, running the
 comparison and then analysing/exporting. Never
 overwrite an existing result directory; use a new task-owned output directory
 for a new experiment. Source recipes and settings must be revalidated when
@@ -821,9 +817,6 @@ runs have a finite controller which probes only while awaiting milestones;
 No permanent sampler, polling worker or idle timer was added. Commands travel
 through production CMD_TX, WM_APP_BROKER, broker handling and UI sync. No mouse,
 keyboard or manual playback tests were used.
-
-Temporary raw evidence, Python runners and report-generation tools were removed
-after completion. The results and measurement methods remain in this report.
 
 Generated media and temporary LOCALAPPDATA trees were removed after assessment.
 FFmpeg 8.1.1 generated sixteen 60-second
@@ -1487,6 +1480,4 @@ starvation notifications in the healthy traced pair. **Not demonstrated:** a
 general audible-smoothness guarantee, general CPU savings, PCM RAM savings or
 hard real-time scheduling.
 
-The raw logs/CSV, ETLs, provider inventories, TraceEvent exports, correlation
-records and analysis scripts were temporary artifacts and have been removed.
 `state.cfg` was read, not rewritten.

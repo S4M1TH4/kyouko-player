@@ -9,17 +9,18 @@ status, track selection, and equalizer adjustment.
 Initial release in preparation: **0.1.0**. See the [changelog](CHANGELOG.md)
 for release notes.
 
-Execution is event driven. Idle and paused playback park the worker threads and
-stop the audio output; no polling or animation loop runs. An unfinished network
-download continues until its stream buffer is complete.
+Execution is event driven. Idle and paused playback park the decoder and stop
+the audio output; no periodic playback or animation loop runs. An unfinished
+network download continues until its stream buffer is complete. Pending saves,
+logging and system notifications can still do work.
 
 ## Architecture
 
 See the [architecture and developer guide](docs/ARCHITECTURE.md) for development
 details.
 
-The broker owns playback state, queues, and persistence. The Win32 UI receives
-native messages and dispatches commands. A dedicated decoder thread performs
+The broker owns playback policy, queues, and persistence decisions. The Win32 UI
+receives native messages and dispatches commands. A dedicated decoder thread performs
 file and stream reads, Symphonia decoding, equalization, resampling, and volume
 processing before handing prepared samples to CPAL/WASAPI.
 
@@ -43,7 +44,8 @@ then parks using `atomic-wait` (`WaitOnAddress` on Windows). Notifications chang
 the compared atomic before waking it, preventing lost wake-ups. A callback
 coalesces released capacity and EOF into one notification; it issues at most one
 OS wake, only for an interested decoder. Commands also interrupt paused/full
-capacity waits and output loss. No polling, spin loop or additional worker exists.
+capacity waits and output loss. This PCM wait protocol adds no polling, spin
+loop or worker thread.
 
 The ready queue still holds at least 1.5 seconds of audio, plus the existing
 extra block for rendering/production, and primes 500 ms. Short tracks start at
@@ -121,7 +123,7 @@ logging. The application has no terminal command reader or system tray icon.
 | `Alt + =` | Raise volume by 10 percentage points |
 
 Hotkeys use native `RegisterHotKey`. A binding already reserved by another
-application cannot be registered; debug logs report individual conflicts.
+application cannot be registered; application logs report individual conflicts.
 
 ## Usage
 
@@ -151,7 +153,8 @@ lock after exit or a crash; the empty lock file is deliberately retained.
 
 State changes enter a single pending snapshot slot. A parked worker coalesces
 updates, writes a unique temporary file, flushes it, and atomically replaces
-`state.cfg`. Quit and Windows session shutdown wait for the final snapshot.
+`state.cfg`. Quit and Windows session shutdown wait for the final save attempt;
+write failures are logged.
 A forced termination can lose pending changes; an interrupted temporary write
 leaves the last committed configuration intact.
 
@@ -213,8 +216,10 @@ returns. The writer sleeps between records and drains on graceful shutdown.
 Streaming title extraction has a 45-second deadline. A download allows 60
 seconds for its first bytes, then fails after 30 seconds without progress.
 yt-dlp socket requests time out after 15 seconds with one internal retry.
-Title/download timeouts terminate the source process tree and enter the existing
-two-attempt recovery policy. Completed RAM playback has no deadline worker.
+Timeouts terminate the matching source process tree. A title timeout falls back
+to the URL as the title and still attempts the audio download. A failed audio
+download enters the two-attempt playback recovery policy. Completed RAM playback
+has no deadline worker.
 The independent full-playlist metadata fetch allows 310 seconds; replacement,
 Stop, or Quit cancels it without waiting for this deadline. Output is capped at
 8 MiB. A metadata timeout logs the failure and terminates that job without
@@ -257,8 +262,8 @@ storage. Analysis, sorting, formatting, CPU accounting and file writes happen
 outside it. Actual callback-entry intervals, device-clock timestamp intervals,
 application execution time and PCM starvation are separate measurements.
 Long intervals do not prove audible glitches; zero PCM underruns do not prove
-glitch-free output. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for the fresh
-comparison, trace coverage, scheduler evidence and measurement limits, and
+glitch-free output. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for dated
+comparisons, trace coverage, scheduler evidence and measurement limits, and
 [vendor patch notes](vendor/cpal/OUTPUT_STARTUP_PATCH.md) for the exact extension. The
 vendored subset retains WASAPI on Windows and ALSA/PipeWire/PulseAudio for the
 future Linux Wayland port; see [platform scope](vendor/cpal/PLATFORM_SCOPE.md).
@@ -267,13 +272,16 @@ Linux presentation support is still future work.
 ## Verification
 
 The finite full-application release assessment uses the real overlay, UI command
-pump, decoder, output, logging and state writer. Its Rust controller is optional.
+pump, decoder, output, logging and state writer. Its Rust controller is optional:
 
-The completed assessments used local Python runners, generated media, isolated
-state and raw logs. Those temporary artifacts have been removed. Results,
-methods and limitations remain in [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
-Repeating the measurements requires recreating the runners and fixtures.
-Normal tests require none of those tools, media or audio hardware.
+```text
+cargo build --locked --release --features release-diagnostics
+```
+
+Use isolated state for these runs. Historical results, measurement methods and
+limits are in [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md); the original local
+runners, fixtures and raw artifacts are no longer retained. Normal tests need
+none of those tools, media or audio hardware.
 
 The controller requires both `KYOUKO_APP_PLAN`/`KYOUKO_APP_RESULT` and a
 `diagnostic-owned` marker beside isolated state. It sends production commands
@@ -304,32 +312,11 @@ sample-copy, EQ, volume, resampling and channel-mix/copy wall durations, then
 writes them at track teardown. These include preemption and allocation and
 exclude PCM capacity waits and callbacks. Leave profiling unset for process CPU
 comparisons. Native output identity is included in diagnostic UI snapshots.
-The separate matched EQ comparison's local tools and raw evidence have been
-removed; its results remain in the performance report.
 
-The second-endpoint assessment used Headphones (BT SPEAKER) on the same computer,
-with 96 matched CPU windows, about 31 minutes of continuous playback, and separate
-startup/command timing. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for the
-measured active-EQ savings, bypass-control increase, initial-resume outlier and
-limits; this does not establish physical Bluetooth latency or glitch-free output.
-
-A separate BT resume follow-up covers 30 resumes after 1/15/60/120-second pauses
-and fresh launches. With PCM already primed, the measured delay preceded the first
-render callback; PCM copying then took at most 0.004 ms. This localizes the delay
-to the output resumption path without identifying a particular Windows/driver/
-Bluetooth component or measuring audible sound. Normal pause behavior is unchanged.
-
-The bypass CPU follow-up uses eight matched pairs with 120-second windows and
-the exact original binaries. Mean change was +0.039 percentage points of one
-core, with a descriptive 95% interval of −0.005 to +0.083; the earlier increase
-was not reproduced at the predeclared +0.10-point bound. Smaller effects remain
-possible. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
-
-Memory controls found that retaining full diagnostic snapshots caused growth
-even while paused: three matched pairs averaged +498 KiB with retained snapshots
-versus -97 KiB with streaming. A separate six-minute streamed playback check had
-zero PCM underruns and a +28 KiB first-to-last private-commit change. Multi-hour
-stability remains unverified. See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md).
+Completed studies cover the matched EQ CPU optimization, two output endpoints,
+BT resume timing, a longer bypass control and diagnostic memory retention.
+See [PCM_PERFORMANCE.md](docs/PCM_PERFORMANCE.md) for the results and the limits
+on hardware, audible latency and long-duration conclusions.
 
 ```text
 cargo fmt --package kyouko-player -- --check

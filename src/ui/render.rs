@@ -4,12 +4,12 @@
 //! white text onto a zeroed (fully transparent) DIB, then post-process once —
 //! `alpha = luminance`, `rgb = accent × alpha` (premultiplied, as
 //! `UpdateLayeredWindow` requires). That yields per-pixel-alpha antialiased
-//! text with a single pass over ~90 KB. Redraws happen only on state changes
-//! and at 1 Hz while playing; never while paused.
+//! text with a single pass over the small DIB. Redraws happen on visual state
+//! changes and at 1 Hz while playing; paused state changes can also redraw.
 //!
 //! The window is moved/sized by the caller and then purely painted through
-//! `UpdateLayeredWindow` — there is no WM_PAINT path at all. The window is
-//! draggable over panel text (`HTCAPTION`), except Track Info and the quit X.
+//! `UpdateLayeredWindow`; the separate tracklist drawer uses WM_PAINT. The
+//! overlay is draggable over panel text (`HTCAPTION`), except Track Info and X.
 //! Those controls and the Braille EQ strip use `HTCLIENT`.
 
 use std::ffi::c_void;
@@ -31,8 +31,7 @@ use windows::core::{Error, HRESULT, Result, w};
 use crate::broker::{EQ_BANDS, EQ_MAX_GAIN_DB, Phase, TrackList};
 use crate::{log_debug, log_error, log_warn};
 
-/// `Error::from_win32` was folded away in windows-rs 0.62 — rebuild it from
-/// GetLastError so GDI failures carry the real reason.
+/// Capture the current Win32 error for a failed GDI call.
 fn last_error() -> Error {
     unsafe { Error::from_hresult(HRESULT::from_win32(GetLastError().0)) }
 }
@@ -45,7 +44,7 @@ pub const WINDOW_W: i32 = 80;
 /// Braille equalizer rows: two fill rows above the middle baseline and two
 /// below (6 levels per row → the ±12 dB gain range exactly).
 const EQ_ROWS: usize = 4;
-/// Negative = per-em height: the glyph cell stays exact at any DPI.
+/// Negative requests character height rather than the full GDI cell height.
 const FONT_HEIGHT: i32 = -9;
 const QUIT_BUTTON_W: i32 = 8;
 
@@ -410,8 +409,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /// `sample` is the current panel: its line count and the widest line
-    /// determine the DIB (and therefore window) size.
+    /// Fixed-width DIB whose height follows the panel's line count and font.
     pub fn new(sample: &str) -> Result<Renderer> {
         unsafe {
             let screen_dc = GetDC(None);

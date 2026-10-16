@@ -1,28 +1,28 @@
 # kyouko-player — Architecture & Developer Guide
 
-> Primary context source for developing or migrating `kyouko-player` to a new
-> (human or AI) maintainer. Everything here reflects the code as it exists on
-> disk; file names and symbol names are literal. When this document and the
-> code disagree, the code wins — then fix this document.
+This guide describes the current implementation and its ownership boundaries.
+Measured performance and historical experiments are recorded separately in
+[PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
 
 Source paths and shell commands in this guide are relative to the repository root.
 
 ---
 
-## 1. Executive Summary & Core Pillars
+## 1. Overview
 
 ### Project Goal
 
-`kyouko-player` is a minimalist, zero-resource, event-driven desktop media
+`kyouko-player` is a minimalist, event-driven desktop media
 player for Windows, written in Rust (edition 2024). It presents a small
 transparent floating window (80 px wide) and Windows global hotkeys,
 streams audio from local files and from web platforms (YouTube,
-Bilibili, Niconico) through `yt-dlp`, and **consumes 0% CPU whenever nothing
-is happening** — paused, stopped, or idle.
+Bilibili, Niconico) through `yt-dlp`. Its ordinary Windows idle paths park
+without periodic application work; this is not a guarantee of literal zero
+process CPU use.
 
 There is no GUI toolkit. Every pixel is software-rendered through GDI into a
-layered window; every interaction is a Win32 message; every state change is a
-command message through a channel. Release builds use the Windows GUI subsystem
+layered window; native input arrives through Win32 messages and becomes broker
+commands. Release builds use the Windows GUI subsystem
 and launch without a console. Debug builds retain console logging; neither
 profile has an interactive terminal command interface or stdin-reader thread.
 There is no system tray presence. Alt+Shift+/ hides/shows the overlay while
@@ -30,46 +30,47 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
 
 ### The Four Architectural Pillars
 
-1. **Zero-CPU Idle State.** The UI thread parks in `GetMessageW` (kernel
+1. **Event-driven idle.** The UI thread parks in `GetMessageW` (kernel
    sleep). The 1 Hz repaint timer exists *only* while `Phase::Playing` —
    pause/stop kill it (`sync()` in `ui/win32.rs`). A pending stream download
    continues real network work while paused; after its buffer completes,
-   cached/paused playback has no scheduled wake-ups. The decoder registers and
+   cached/paused playback needs no periodic playback work. The decoder registers and
    rechecks work predicates, then parks in an atomic address wait. The WASAPI
    output stream is stopped whenever
-   the phase is not `Playing`. There is **no polling loop anywhere**; every
-   wake-up follows a useful atomic notification or posted message. Active network work may
-   own a one-shot deadline, cancelled at completion; this never schedules idle
-   wake-ups. Sleep-loops and background polling violate this pillar.
+   the phase is not `Playing`. Active network work may own a cancellable
+   deadline. Pending saves, logging, device notifications and Windows messages
+   can still wake workers. Finite opt-in diagnostics have their own inspection
+   loops; they are excluded from ordinary builds.
 
-2. **Single-Process Purity & Process Hygiene (`ChildGuard`).** Web streams
-   are produced by `yt-dlp` child processes. Exactly **one** yt-dlp process is
-   alive in the audio pipeline per load. Title prefetch and audio streaming are sequential,
-   and the child rides in a shared `Arc<Mutex<Option<Child>>>` slot
+2. **Owned source processes.** Web streams
+   are produced by `yt-dlp` child processes. Title prefetch and audio streaming
+   are sequential in the decoder pipeline,
+   and the child rides in a shared `Arc<Mutex<Option<SourceChild>>>` slot
    (`ChildGuard`): Stop / Skip / Shutdown kill it mid-read (the parked pipe
-   read unblocks with EOF) and it is reaped immediately. No orphans, ever —
-   including on debug-console Ctrl+C (`SetConsoleCtrlHandler` in `main.rs`).
+   read unblocks with EOF) and cleanup reaps it.
+   Debug-console Ctrl+C requests the same graceful shutdown.
    Audio/title children use `SourceChild` with a kill-on-close Windows job:
-   interrupts/deadlines terminate inherited ffmpeg/JS helpers too.
+   interrupts/deadlines terminate assigned ffmpeg/JS helpers too. The job is
+   assigned after process creation.
    A playlist may additionally own one flat-metadata process and one parked
    deadline watcher. Its separate lifetime is handled by `PlaylistJob`, which
    terminates/reaps and joins workers on replacement, Stop, Quit and Drop.
 
-3. **Central Broker Pattern.** `src/broker.rs` is the **single owner of all
-   state**. Every control surface — global hotkeys, window mouse
+3. **Central playback policy.** `src/broker.rs` owns playback policy,
+   queues, selection and persistence decisions. Every control surface — global hotkeys, window mouse
    handlers, OLE drag-and-drop — is a *producer* that dispatches a
    `Command` enum variant to the broker. Native UI input uses a thread-local
    inbox drained after message dispatch; background/startup producers use
-   bounded channels and post a wake. Nobody outside
-   `broker.rs` mutates player state. Presentation-only state (window hidden,
-   rendering geometry, timer flag) lives in the UI and is excluded from this
-   rule.
+   bounded channels and post a wake. Main initializes shared controls; the
+   decoder updates metadata, generations and seek position; the callback
+   advances rendered-frame counters. The UI owns windows, presentation state
+   and the output stream, including the shared device rate/layout.
 
-4. **Sequential No-Leak Lifecycle.** Loads are single-shot and ordered: one
+4. **Sequential load lifecycle.** Uncached network loads are ordered: one
    title resolution (`--print title`, tracked in the child slot) → one audio
    stream spawn → decode loop → EOF advance/replay/stop. Interrupts
-   (`DecoderCmd::Load/Stop/Shutdown`) are honored *between* stages, so a
-   superseded load never spawns a doomed child. PCM backpressure parks on the
+   (`DecoderCmd::Load/Stop/Shutdown`) are checked between stages, and process
+   publication rechecks cancellation. PCM backpressure parks on the
    decoder's atomic address; status backpressure uses a bounded channel.
    The broker's decoder sends never block: under saturation, the dispatcher
    coalesces to the latest Load/Stop plus a combined seek (at most two slots).
@@ -82,7 +83,7 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
 |---|---|---|
 | `windows` 0.62.2 | Win32/OLE bindings, feature-gated | see `Cargo.toml` feature list |
 | `windows-core` 0.62 (direct dep) | `#[implement]` COM macro support | keeps notification/OLE interface implementations bound to the matching `windows` version |
-| `symphonia` 0.5.5 | local-file decode/probe | |
+| `symphonia` 0.5.5 | file/stream decode and probe | |
 | `cpal` 0.18.2 | WASAPI output | pinned local source patch exposes worker startup; default `realtime` feature requests MMCSS Audio, then TIME_CRITICAL fallback; joins retired workers |
 | `crossbeam-channel` | cross-thread message arteries | bounded, no async runtime |
 | `atomic-wait` 1.1 | atomic wait/wake | Windows `WaitOnAddress` / `WakeByAddressSingle`; no spinning |
@@ -92,16 +93,6 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
 ---
 
 ## 2. Codebase Architecture & Module Breakdown
-
-### File-name mapping note
-
-Some historical/task names do not exist as separate files. The mapping is:
-
-| Concept | Actual location |
-|---|---|
-| "decoder" / stream routing | `src/audio.rs` |
-| "source.rs" (platform URL detection) | `src/broker.rs` (`Source`, `is_*_url`, `default_format_for`) |
-| "state.rs" (persistence) | `src/config.rs` |
 
 ### `src/main.rs` — entry point & orchestration
 
@@ -123,7 +114,8 @@ Some historical/task names do not exist as separate files. The mapping is:
    queue and selects `last_track` by resolved path (or the first entry if
    absent). Missing/empty folders fall back to the existing `last_track`
    load, including per-platform URL resolution. Restoration is **staged
-   paused** — buffered by the decoder, output stopped, 0% CPU until resumed.
+   paused** — decoder priming is allowed while the output stays stopped.
+   An unfinished network download may continue while paused.
    Streaming playlist restoration also retains the saved one-based entry
    instead of always starting at entry 1.
 5. Selects WASAPI's native rate/layout before allocating the PCM buffer pool,
@@ -140,19 +132,17 @@ Some historical/task names do not exist as separate files. The mapping is:
 7. The header X, Alt+Q and Windows session shutdown drive graceful teardown.
    Debug-only `on_console_ctrl` also posts `Command::Quit` on Ctrl+C.
 
-### `src/broker.rs` (~2200 lines) — the central state engine
+### `src/broker.rs` — the central state engine
 
-The largest module. Owns, via `Broker` + `Arc<SharedState>`:
+`Broker` owns playback policy and shares atomic controls through `Arc<SharedState>`:
 
 - **`Command` enum** (the complete control vocabulary): `Load{source,paused}`,
-  `RestoreState{last_folder,last_track}` (startup only),
+  `RestoreState{last_folder,last_track,last_playlist_index}` (startup only),
   `TogglePause`, `SeekRelative(f64)`, `NextTrack`, `PrevTrack`,
-  `LoadDropped(Vec<String>)`, `YtQueueResolved{url,titles}`,
+  `LoadDropped(Vec<String>)`, `YtQueueResolved{url,request_id,titles}`,
   `JumpToTrack(usize)` (1-based), `Stop`, `SetVolume(f32)`,
   `EqGain{band:Option<usize>,gain_db}` (±12 dB clamp; `None` = all bands),
-  `ToggleEq`, `ToggleLoop` (replay-at-EOF; UI-accessible
-  via the row-5 `repeat` chunk — refreshes the panel and persists to
-  `state.cfg`),
+  `ToggleEq`, `ToggleLoop` (replay-at-EOF, controlled by Alt+L),
   `ToggleOverlay` (global show/hide), `VolumeDown` (-10 percentage points),
   `VolumeStep(i32)` (signed percentage points, clamped to 0..100%), `Quit`.
 - **Queues**: `local_queue: Vec<Source>` + `queue_index` (folder drops /
@@ -189,7 +179,7 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
 - **`Source` enum** — the routing heart:
   - `File(String)`
   - `Youtube { url, format, playlist_index: Option<usize> }` — despite the
-    name this variant covers *every* yt-dlp platform.
+    name this variant represents network sources, including the three supported sites.
   - `from_raw(&str)`: any `http(s)://` becomes `Youtube`. YouTube URLs with a
     nonempty, exact `list=` query key (including watch/mobile/short links) are
     normalized to `https://www.youtube.com/playlist?list=...`, discarding the
@@ -203,8 +193,9 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
     selects the best available AAC-only rendition. A fixed 128 kbps ID fails
     on videos offering 192/64 kbps instead. The same selector goes to title
     resolution and audio download without another probing process. All
-    entry paths (startup argument, OLE drop, `.url` shortcut, state restore) funnel
-    through `from_raw`, so the format override is automatic.
+    accepted URL entry paths funnel through `from_raw`, so the format override
+    is automatic. Dropped `.url` shortcuts accept all three supported sites;
+    a `.url` file passed directly as a startup/file load accepts YouTube only.
   - `is_stream_url` = YouTube ∪ Bilibili ∪ Niconico; used by
     `classify_dropped` to give streamable `.url` shortcuts priority in a
     mixed drop (`DroppedBatch::YouTube(url)` wins over media files).
@@ -238,15 +229,19 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   each step clamps, queues a snapshot and refreshes immediately, without decoder commands.
   EQ bypass persists as `eq_enabled`, separately from unchanged band gains.
   Quit enqueues its final snapshot, interrupts the decoder and waits on the
-  writer's revision barrier before returning. This also covers WM_ENDSESSION;
+  writer's revision barrier before returning. The barrier confirms completion
+  of the save attempt; write failures are logged. This also covers WM_ENDSESSION;
   ordinary controls never wait for disk writes. Main joins the writer before
   logging shutdown and releasing the instance lock.
-- **`SharedState`** (atomics only, lock-free reads from any thread): volume
-  bits, `eq_gains_cdb` (centi-dB `AtomicI32` ×10), `eq_enabled`, `eq_dirty`
-  (audio thread rebuilds biquads when taken), position/duration, phase,
-  loop. `EQ_MAX_GAIN_DB = 12.0`, `EQ_BAND_HZ` = 31…16k.
-- Status handling (`handle_status`): `Opened` / `Progress` / `Finished` /
-  failures; phase machine `Stopped → Loading → Playing ⇄ Paused`.
+- **`SharedState`** (atomics only): volume bits, ten centi-dB band gains
+  (0.01 dB resolution), EQ enable/dirty flags, phase, repeat, output rate/layout,
+  rendered-frame counter, PCM generation and load identity. The decoder takes
+  the EQ dirty flag when rebuilding filters. Position is computed from the
+  frame counter and device rate; duration belongs to the broker's `TrackMeta`.
+  `EQ_MAX_GAIN_DB = 12.0`, `EQ_BAND_HZ` = 31…16k.
+- Status handling (`handle_status`): `OutputReady`, `Opened`, `Seeked`,
+  `SeekFailed`, `Finished` and `Failed`; phase machine
+  `Stopped → Loading → Playing ⇄ Paused`. Progress is read from shared counters.
   A current-generation `Failed` retries the exact source once (two attempts
   total). `retry_used` survives `Opened`, so a subsequent stream drop cannot
   grant another retry. A fresh load/navigation/replay resets the budget.
@@ -308,12 +303,11 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
      the broker sends the retry or next-track load. Retry scheduling adds no
      timers, polling, or background workers.
 - **`ChildGuard`**: RAII wrapper; Drop kills + reaps. The interrupt hook
-  (`DecoderLink::with_interrupt(tx, controls.hook())`) is the kill switch
-  that rides with every Stop/Load/Shutdown so a stalled pipe read can never
-  defer a command.
+  (`DecoderLink::with_interrupt(tx, queued_receiver, controls.hook())`) is the
+  kill switch for Stop/Load/Shutdown, allowing stalled source reads to unblock.
 - **`AudioOut` / `build_output_stream`**: cpal WASAPI stream on the default
   device; the stream is *stopped* unless `Phase::Playing`
-  (`AudioOut::set_playing`) — the zero-CPU paused guarantee. EQ biquads are
+  (`AudioOut::set_playing`), suspending steady output callbacks. EQ biquads are
   rebuilt inside the decoder when `eq_dirty` is taken.
 - **Hot-swap ownership and bounds**: CPAL error callbacks and Windows endpoint
   callbacks only latch bounded events and wake `WM_APP_OUTPUT`; rebuilding and
@@ -338,7 +332,8 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   Superseded pool destruction occurs after releasing the pending-slot mutex.
   Cancellation upgrades the buffer's Weak handle under its slot mutex, then
   cancels outside it. Child cleanup takes ownership under the child-slot mutex
-  and kills/reaps outside it; blocking process waits never hold that mutex.
+  and reaps outside it; the interrupt hook may issue a kill while holding the
+  slot, but blocking process waits never hold that mutex.
   A failed replacement does not create an error-driven rebuild loop: recovery
   waits for another endpoint event, or grants a new attempt after at least
   500 ms of successfully rendered PCM. No retry timer/polling loop exists.
@@ -407,8 +402,6 @@ The largest module. Owns, via `Broker` + `Arc<SharedState>`:
   the original arithmetic order and f32 rounding after each band, with separate
   history for every channel. A test-only original loop verifies sample and
   history bits across rates, layouts, packet boundaries, silence and rebuilds.
-- Title sidecar: `.title` file next to a local media file overrides the
-  display name.
 - **Stream cache**: decoder-owned `StreamCache` retains exactly one successful
   completed compressed buffer and title for the exact `Source` (URL, format,
   playlist index). On looping EOF, cache ownership is installed before
@@ -499,9 +492,6 @@ equilibrium fill, clock calls and buffer release. Callback gaps are not output
 glitch counts and PCM underruns are only decoder/handoff starvation evidence.
 The opt-in harness uses broker state restoration and optional real worker
 replacements with position restoration, without UI input or state saves.
-Trace runs are separate from low-overhead runs; an elevated one-shot helper
-controls only task-owned WPR recordings while builds/player/analysis stay
-unelevated. No tracing helper or recorder remains installed or running.
 See [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
 
 ### Full-application release diagnostics
@@ -530,9 +520,9 @@ priming watermark; this is not an exact queue-depth measurement. These diagnosti
 do not measure native IAudioClient::Start completion or physical audible output.
 No callback allocation, lock, I/O, formatting, retry loop or analysis is added.
 
-Only the finite controller may inspect repeatedly while awaiting a bounded
+The finite controller inspects repeatedly while awaiting a bounded
 milestone. During low-overhead CPU windows, timestamp capture is disabled and
-the controller sleeps; there is no application polling thread or idle timer.
+the controller sleeps; ordinary builds have no diagnostic inspection loop.
 GetProcessTimes and process-memory counters are read at window boundaries.
 By default, the finite controller retains full observation JSON values until
 exit; their growing storage can contaminate memory-drift measurements. An optional
@@ -548,9 +538,6 @@ The generated 5000-entry list uses production parsing and presentation, with
 source output deferred via the existing unavailable-output path. Its selection
 timings are explicitly separate from network/PCM timings. The real metadata
 worker may export indexed stdout in diagnostic builds only, outside callbacks.
-The temporary Python runners and raw assessment artifacts have been removed.
-The documented results, Rust controller and its Cargo feature remain part of
-the repository. Repeating the measurements requires recreating the local tools.
 `src/diagnostics/audio_cpu_profile.rs` is also diagnostic-feature-only. An optional
 `KYOUKO_DSP_PROFILE` destination enables seven decoder-stage wall counters;
 successful packet stages include preemption/allocation and exclude capacity
@@ -580,7 +567,7 @@ readers expose full length/seekability. Replaying creates another cursor on
 the same allocation, with no byte copy or network operation. Dropping the
 last reader/cache/worker owner deallocates the Vec.
 
-### `src/ui/mod.rs` (100 lines) — UI façade & wake-up routing
+### `src/ui/mod.rs` — UI façade & wake-up routing
 
 - `CMD_TX` global (`OnceLock<Sender<Command>>`) — startup/background command
   pipe; `wake_broker()` posts the broker wake message. Native input instead
@@ -626,20 +613,9 @@ coalesce without blocking on a full command pipe. A request ID and URL fence
 results after replacement/cancellation. Drop closes both worker lifetimes and
 all handles. No permanent thread, periodic poll, or idle deadline remains.
 
-The supplied 4,960-entry playlist previously exceeded the 45-second metadata
-limit: an unbounded diagnostic fetch completed in 98.739 seconds, including a
-YouTube HTTP 503 retry, with 456,638 bytes of indexed metadata. The byte/entry
-limits were not responsible. The longer deadline remains a finite network
-budget, not a guarantee that every server/network condition will complete.
-The same playlist also contained 181 missing-title fallbacks at indices
-4,780–4,960. Their unquoted `Unavailable track` values previously made JSON
-parsing reject the whole list even when the fetch completed; these now retain
-their original positions as placeholders.
-With both fixes, the production metadata loader accepted the supplied shared
-watch link, canonicalized it, and loaded all 4,960 entries in 94.298 seconds
-within the 310-second deadline. The captured indexed output also passed broker
-selection/persistence/restoration checks at entry 4,960. Offline process tests
-generate 5,000 entries including the same 181 literal fallbacks.
+Offline process tests generate 5,000 indexed entries, including literal
+missing-title fallbacks. Historical network timings are in
+[PCM_PERFORMANCE.md](PCM_PERFORMANCE.md).
 
 ### `src/ui/win32.rs` — native presentation and input dispatch
 
@@ -763,11 +739,12 @@ never takes focus; interaction relies on hover routing (see wheel note).
   drop target, closes the drawer and posts quit; the pump reclaims `UiState` and pairs
   `OleUninitialize`.
 
-### `src/ui/render.rs` (~410 lines) — software GDI renderer
+### `src/ui/render.rs` — software GDI renderer
 
 Renders the panel into a 32bpp premultiplied-ARGB DIB and composites with
 `UpdateLayeredWindow` (explicit position+size — NULL/NULL is a silent no-op
-on some builds). No `WM_PAINT` path exists.
+on some builds). The overlay only validates `WM_PAINT`; the separate tracklist
+drawer paints through `BeginPaint`/`EndPaint`.
 
 The memory DC/DIB persist for the renderer's lifetime. A successful presentation
 caches its text, phase and EQ snapshot; identical requests skip GDI drawing,
@@ -889,11 +866,8 @@ independent of resource compilation.
 
 ### Release launch and source-process policy
 
-The interactive terminal module (`src/terminal.rs`) was removed completely,
-along with help formatting, command parsing, queue text printing, and
-`ShowQueue`, `DumpState`, and the terminal-only `EqEnabled` command.
-Debug builds retain `println!`-based diagnostic logs and console Ctrl+C;
-release builds run as pure Win32 overlay applications. Startup file/URL
+Debug builds retain console diagnostic logs and Ctrl+C;
+release builds run as Win32 overlay applications. Startup file/URL
 arguments remain supported for launcher/file-association use.
 
 `src/process.rs` creates source-tool commands with null stdin in both profiles.
@@ -902,7 +876,7 @@ title resolution, audio download, and playlist metadata children from opening
 console windows. Existing stdout/stderr pipes and `ChildGuard` lifecycle
 remain intact. Debug children retain normal console inheritance.
 
-### `src/config.rs` — persistence ("state.rs" concept)
+### `src/config.rs` — persistence
 
 NaN and infinity are rejected per numeric configuration field. The broker and
 atomic setters also reject non-finite runtime controls without saving or
@@ -918,7 +892,8 @@ pending snapshot. It writes a PID/counter-specific file with `create_new`,
 calls `sync_all`, closes the handle and renames within the same directory.
 Failure removes its staging file and preserves the previous configuration.
 Interrupted processes may leave staging files, which restoration never reads.
-Shutdown waits for the final requested revision; worker exit/panic wakes any
+Unknown keys are ignored when reading; saving writes only known keys.
+Shutdown waits for the final requested save attempt; worker exit/panic wakes any
 barrier instead of stranding it. The OS file lock excludes writers from other
 player processes without polling or stale PID detection. The locking API was
 introduced in Rust 1.89; this package declares Rust 1.99.0 as its minimum supported
@@ -958,10 +933,12 @@ An owned watchdog parks on a condition variable until completion, progress,
 or expiry. Title extraction has a 45-second fixed deadline. The independent
 download worker permits 60 seconds until first bytes, then resets an idle
 deadline to 30 seconds on each successful append. yt-dlp also receives a
-15-second socket timeout and one internal request/fragment retry. Expiry
+15-second socket timeout and one internal request/fragment retry. Download expiry
 publishes a terminal RAM-reader error and kills the matching process tree;
 pipe EOF cannot overwrite that error with success. The normal broker failure
-path retains its cap of two playback attempts. Drop cancels and joins the
+path retains its cap of two playback attempts. A title timeout kills the title
+process and falls back to the URL, then attempts the audio download; it does not
+itself consume a playback retry. Drop cancels and joins the
 watchdog immediately; local and completed cached playback own no watchdog.
 Recovery seeks waiting for fresh bytes unblock on the same terminal error.
 
@@ -969,24 +946,10 @@ Recovery seeks waiting for fresh bytes unblock on the same terminal error.
 
 ## 3. Data Flow & Command Pipelines
 
-Windows CI (`.github/workflows/windows.yml`) runs rustfmt verification, check, Clippy with denied
-warnings, offline tests, release compilation, native icon loading, release
-logging and duplicate-release-launch verification on Windows 2025/Rust 1.99.0.
-Checkout is pinned to a verified commit with read-only repository permission;
-there are no upload, packaging or publication steps. WAV and AAC/MP4 samples
-are generated in Rust test helpers, without fixture files or external encoders.
-Persistence tests terminate actual helper processes mid-stage, check exclusion
-and automatic lock release, and exercise coalescing/final-flush/panic wake-up.
-No synthetic mouse/keyboard input or OS endpoint disabling is used.
-The inherited-helper cleanup test launches an ignored Rust fixture from the
-current test executable, with no PowerShell or ping dependency. A stdin permit
-orders Windows job assignment before helper creation; an explicit readiness
-marker has a bounded 30-second allowance for loaded CI hosts. Failures retain
-stderr diagnostics and clean up processes before assertions.
+### Playback policy boundary
 
-### The one rule
-
-**Producers only send `Command`s. `broker.rs` alone decides and mutates.**
+Control surfaces send commands; the broker applies playback policy. Shared
+telemetry and device/decoder state have the writer roles described above.
 
 ```
  ┌─────────────┐   ┌──────────────────┐
@@ -1002,7 +965,7 @@ stderr diagnostics and clean up processes before assertions.
  └──────────────────────────┬──────────────────────────────────┘
                             ▼
  ┌─────────────────────────────────────────────────────────────┐
- │  UI pump → broker.rs — the ONLY state owner                 │
+ │  UI pump → broker.rs — playback policy and queues           │
  │  • mutates local_queue / queue_index / yt_queue / SharedState│
  │  • persist() → config save (volume, eq_gains, last_track)    │
  │  • emits DecoderCmd + panel refresh                          │
@@ -1049,6 +1012,11 @@ WM_MOUSEWHEEL (screen lParam) → client coords → renderer.eq_band_at
 | main/UI | `GetMessageW` | all Win32 + OLE + broker drain happens here |
 | decoder | atomic address wait | registered command/capacity/drain predicates; one yt-dlp child at a time |
 | WASAPI (cpal) | audio event/commands | initializes observed priority before callbacks; bounded PCM claims, copy/convert, recycle, counters/drain and useful wake |
+| settings writer | snapshot notification | one in-flight and one pending snapshot; joined at shutdown |
+| release logger | bounded record channel | file writes/rotation outside callbacks |
+| source workers | pipe reads / condition-variable deadline | transient stdout/stderr readers and cancellable watchdogs during network work |
+| playlist job | process output / condition-variable deadline | independent metadata lifetime; can overlap audio extraction |
+| diagnostic controller | finite sleeps / bounded milestone checks | opt-in feature only |
 
 ---
 
@@ -1058,8 +1026,9 @@ WM_MOUSEWHEEL (screen lParam) → client coords → renderer.eq_band_at
 
 1. Add the variant to `Command` in `src/broker.rs` (with a doc comment
    stating units/bounds, e.g. 1-based indices, dB, seconds).
-2. Handle it in `Broker::handle_command` — **never mutate state outside
-   `broker.rs`**. Presentation-only geometry and timer flags remain in the UI.
+2. Handle playback policy in `Broker::handle_command`. Presentation-only
+   commands such as overlay visibility stay in the UI; shared decoder/callback
+   counters retain their existing writer roles.
 3. Wire a producer: global hotkey or mouse path in
    `ui/win32.rs` via `post_command(...)`.
 4. If it changes user-visible state, make the broker emit a panel refresh
@@ -1068,23 +1037,7 @@ WM_MOUSEWHEEL (screen lParam) → client coords → renderer.eq_band_at
 5. Add a broker unit test (`broker_with_sink()` harness observes
    `DecoderCmd`s and the persistence sink without disk I/O).
 
-### 4.2 Supporting a new streaming platform
-
-1. Add `is_<site>_url(&str)` in `src/broker.rs` (match the domain **and**
-   the shortlink host) and include it in `is_stream_url` so `.url` shortcut
-   drops take the stream-priority path.
-2. Add the site's branch to `default_format_for` with the exact yt-dlp
-   format id (measure it with `yt-dlp -F <url>` — the format must exist;
-   YouTube's `140` yields an empty stream on Bilibili, which is the exact
-   bug class this mechanism exists to prevent).
-3. Both spawn passes pick the format up automatically because the format
-   lives on `Source::Youtube`: `fetch_title_blocking` (`--print title -f`)
-   and the audio child (`yt_dlp_args`). Do not introduce a second format
-   constant anywhere in `audio.rs`.
-4. Tests: mirror `bilibili_links_select_their_own_format` and
-   `dropped_bilibili_shortcut_streams_via_yt_dlp`.
-
-### 4.3 Modifying UI / rendering
+### 4.2 Modifying UI / rendering
 
 1. Keep all geometry in `render.rs` as **pure, unit-tested helpers**; expose
    constants such as `WINDOW_W` and expose renderer input helpers so
@@ -1098,19 +1051,16 @@ WM_MOUSEWHEEL (screen lParam) → client coords → renderer.eq_band_at
 4. Any new COM object uses `#[windows::core::implement(...)]` — remember
    `windows-core` must stay a direct dependency (see §1 table).
 
-### 4.4 Universal constraints (violating these is a regression)
+### 4.3 Implementation constraints
 
-- **Zero-CPU idle**: no UI timers while paused, no polling loops, no busy
-  waits. The only repeating UI timer is the 1 Hz `WM_TIMER` while
+- **Idle work**: no periodic playback work while paused and no busy waits.
+  The only repeating UI timer is the 1 Hz `WM_TIMER` while
   `Phase::Playing`. Pending network work may own a cancellable one-shot
   deadline; completing that work cancels/joins it, including while paused.
-- **One yt-dlp at a time**: new async work goes through the decoder's
-  sequential lifecycle and the shared child slot.
+- **Source ownership**: audio/title extraction uses the decoder's sequential
+  lifecycle and shared child slot. Playlist metadata has a separate owned job.
 - **Bounded channels**: new arteries must be bounded; senders may park,
   never spin.
-- **`matches!` guard syntax**, `gen` identifiers (edition 2024), and
-  Windows-path literals in Rust strings (`\\`) have bitten before — see
-  Known Pitfalls below.
 
 ---
 
@@ -1136,181 +1086,37 @@ particular (`LPARAM` halves, `WPARAM` high words, handle null checks) must
 be exact — prefer the local helpers in `win32.rs` over raw bit casts at
 call sites.
 
-### Unit tests
+### Regression coverage
 
-Live in each module (`#[cfg(test)] mod tests`): broker queue/classifier
-harness (`broker_with_sink`), config round-trips, hotkey mapping,
-glyph math, Braille progression/column mapping. Tests avoid disk I/O except
-explicitly-created temp files with unique per-pid directory names (parallel
-test collisions have happened — keep the `-suffix` convention).
+Tests live beside the implementation in each module. The default suite needs
+no network, user media or audio endpoint. It generates WAV and AAC/MP4 data in
+Rust and uses isolated temporary directories for filesystem/process checks.
 
-Failure recovery tests exercise retry→success, retry→next track, queue
-exhaustion, paused restoration, stale generations, repeat bypass on failure,
-and unresolved streaming playlist bounds. A real decoder-thread test feeds
-corrupt and empty local audio through the broker, asserting exactly two
-attempts per entry and graceful queue exhaustion without a UI/audio device
-or network dependency. A subprocess test checks failed/successful stream
-exit classification and child cleanup.
+| Area | Main checks |
+| --- | --- |
+| Broker | Queue ordering, restoration, retry bounds, stale load/status rejection, seek bounds, finite controls, metadata request fencing and persistence snapshots |
+| PCM | Queue wrap/contention, pool ownership, priming/drain, cancellation, paused seeks, integer conversion, output replacement and callback allocation/deallocation counters |
+| Decoder/DSP | Decoded rate/layout, MP4 sample-entry mismatch, resampling duration/pitch, EQ stability and bit-for-bit comparison with the original EQ loop |
+| Stream cache | Progressive reads, downloaded-only seeks, cancellation, bounded allocation, replay equivalence and release on Stop/source replacement |
+| Process/state | Job cleanup, deadlines, lock exclusion/release, atomic staging, save coalescing and final-save/panic barriers |
+| UI/resources | Input geometry and command mapping, drawer lifetime/click state, offscreen GDI pixels, hotkey registration and embedded icon resources |
 
-Stream-buffer tests cover offset arithmetic, progressive reads, cancellation,
-bounded allocation, deallocation on track changes/repeat-off, downloader
-joining, and two identical RAM replays without any source process. An in-memory
-Rust generator builds AAC-LC silence and a fast-start MP4 container to verify playback and
-seeking with only a partial download, immediate refusal of future bytes,
-and seeking after completion. These tests generate their fixtures in memory and
-require no network, audio device or FFmpeg. A decode validation checks all
-twelve generated packets for 48 kHz mono silence, 1024 frames per packet,
-and the complete 256 ms duration.
+Windows CI runs the default checks above, native release-icon loading, release
+logging and duplicate-launch verification on Windows 2025/Rust 1.99.0. Checkout
+is pinned and repository permission is read-only; the workflow does not publish
+packages. When changing diagnostic code, also run Clippy/tests with
+`--features release-diagnostics`; the ordinary feature set excludes that code.
 
-Cancellation tests also check that an incomplete `read_exact` returns promptly.
-Reader-retirement tests distinguish output suspension from permanent download
-cancellation. A production-loop regression swaps rate/layout eight times with
-repeat ON and OFF, checks original partial-download ownership and completion,
-restored position, retired-pool release, no source kill/spawn, and immediate
-compressed-buffer deallocation at Stop. Saturated-pipe tests keep a real Stop
-authoritative and deliver an output wake before coalesced seeks.
-`cargo test live_youtube_decodes_audio -- --ignored --nocapture` explicitly
-enables the network test: resolve and decode a YouTube stream, load another
-URL on the same broker/decoder, then shut down and release the child/buffer.
-For a playlist it also fetches the title list and advances to entry 2,
-checking selection and the persistence snapshot. Each load allows 60 seconds.
-`KYOUKO_TEST_URL` overrides the first URL, including a playlist source. This
-test requires yt-dlp and its supported JavaScript runtime, but no audio device.
+Network, saved-media and WASAPI diagnostics are ignored by default. Their
+commands, prerequisites and bounds are listed in [README](../README.md).
+Historical measurement gates belong in [PCM_PERFORMANCE.md](PCM_PERFORMANCE.md);
+their test counts describe those dated runs.
 
-PCM tests verify capacity at 44.1/48/96/192 kHz, 500 ms priming and producer
-stall tolerance, short tails, stale/paused generations, block reuse, integer
-output with changing callback sizes, interruptible backpressure, correct
-playhead accounting, load/callback race preservation, and zero callback allocations/deallocations using a
-thread-local allocator counter. Decoded-format tests validate rates/channel
-stride and invalid specs; one-second 1 kHz tones at 22.05/24 kHz retain
-duration/pitch after resampling to 44.1/48 kHz. Low-rate EQ tests verify
-unsupported bands do not destabilize audio, and broker tests keep the decoded
-source rate separate from the device clock and container duration.
-An offline AAC/MP4 regression rewrites only its sample-entry rate in RAM and
-requires identical production-decoder PCM samples/frame counts, reported
-decoded rate and container duration, without network or audio hardware.
-Two opt-in local diagnostics read state.cfg
-without saving it: `cargo test saved_folder_full_tracks_decode_through_the_pcm_pool
--- --ignored --nocapture` decodes complete saved-folder tracks through the
-normal decoder/EQ/resampler/pool and checks duration/throughput;
-`cargo test saved_folder_wasapi_output_has_no_underruns -- --ignored --nocapture`
-plays short tracks (up to 30 seconds) to EOF, otherwise ten seconds per track,
-on the actual device and checks its atomic underrun count and wall-clock timing.
-Both diagnostics accept either the saved folder or a single saved local track.
-The full-decode test independently sums decoded frames/rates and compares this
-with device PCM duration, allowing compressed-packet padding relative to
-container duration. These require local media (and an output device for WASAPI),
-so normal unit tests stay independent of user files/hardware. Neither test
-injects UI input or changes persisted state.
+### Manual UI checks
 
-`cargo test saved_track_device_hotswap_cycles_recover_on_wasapi -- --ignored
---nocapture` restores the saved file/folder and controls, starts playback, and
-injects four output-event faults after two-second playback intervals into the same sink
-used by CPAL/Core Audio. Real WASAPI streams are destroyed and reopened; tests
-cover unavailable/invalidated streams and same-ID silent-stall notifications.
-The diagnostic services events during each interval, verifies playback
-continues at 1x without underruns after startup PCM priming, checks restored position, unchanged decoder
-thread identity, deallocation of retired pools, and OLE STA compatibility.
-It disables no OS endpoints, simulates no UI input, and installs no disk saver.
-`KYOUKO_HOTSWAP_TEST_FILE` may select an existing local file for deterministic
-device timing without changing saved history. `KYOUKO_TEST_URL` selects a
-specific network source and resets the playlist entry to 1. Initial load and
-each recovery reload have a 60-second allowance. Failed assertions also shut
-down/join the decoder and release its child processes. An offline partial-MP4
-regression verifies that recovery waits for missing bytes and can be cancelled.
-Offline tests cover stale/coalesced callbacks, notification filtering,
-different device rates/channel counts, superseded-pool deallocation, partial
-block recycling, repeated recovery, stale acknowledgements, queue/selection
-preservation and manual pause/Stop/Quit or failed-seek overrides.
-Hardening regressions cover same-source load identities after Stop/reload,
-stale EOF/seek events, bounded command compaction, simultaneous saturated
-status/command pipes, priority native Quit, non-finite settings, A/B/A metadata
-request fencing, and real owned-child success/cancellation/deadline cleanup.
-
-Track-list tests check title-row hit geometry, outside dismissal, scroll
-bounds, last-entry selection, monitor-edge placement, actual GDI selected-row
-pixels, hidden native popup creation/destruction and layered style/alpha,
-full-surface client hit testing, click consumption through matching button-up,
-unchanged opacity while pressed, and actual deferred destruction through the
-private finish-click message (without synthetic mouse input),
-and immediate jump
-persistence/restoration. `KYOUKO_TRACKLIST_TEST_FILE` optionally supplies the
-real indexed yt-dlp metadata output to the long-playlist broker test; normal
-offline runs use a synthetic list. No simulated desktop mouse input is used.
-
-Hotkey tests validate all eleven ID/command/modifier/OEM-key mappings and unknown
-IDs. Quit-button tests check unchanged dimensions, every hit-box edge, GDI X
-pixels and header clipping, plus the same Quit dispatch as Alt+Q.
-Quit-click tests cover matching release, capture cancellation, single dispatch,
-and a hidden native window that remains alive until the private completion
-message queues Quit and the broker sends Shutdown, without synthetic mouse input.
-Render tests also compare every branded compact header's real GDI pixels against its full
-unclipped rendering, checking left alignment, fixed dimensions and pinned X.
-Hotkey mapping tests retain the Alt+Shift+/ overlay visibility command.
-Right-click tests check every client/caption pixel, X exclusion, negative
-monitor coordinates, out-of-window rejection, release/context suppression
-and retained caption dragging, without injecting mouse input.
-A hidden native echo test executes `WM_CREATE` registration and
-routes the visibility hotkey command through show/hide on an offscreen,
-non-activating window, checking that its hotkeys remain registered. It then
-routes Alt+Q while hidden, verifies decoder shutdown, performs `WM_DESTROY`
-cleanup, and reacquires each available binding to verify its release without
-injecting mouse or keyboard input. Broker tests cover
-volume hotkey bounds, immediate redraw/save while stopped/paused/playing,
-EQ bypass persistence without changing gains, and graceful Quit snapshots/
-decoder shutdown. Config tests cover EQ ON/OFF round-trips and enabled defaults
-for legacy or invalid keys. Broker seek tests cover both
-bounds, zero/no-op/non-finite deltas, missing tracks, unknown durations, and
-playing/paused command forwarding. Source-process tests check EOF stdin and
-working output pipes. Build verification reads each Windows PE subsystem:
-debug = 3 (console), release = 2 (GUI).
-
-### Manual testing protocol (mandatory for UI/drag work)
-
-**Automated synthetic drag/click/wheel scripts (PowerShell, Python, or raw
-Win32 `SendInput`/`DoDragDrop` simulations) are strictly prohibited.** A
-CCW-based `DoDragDrop` simulation was proven to hang (OLE never calls
-`QueryContinueDrag`), and injected-input drags are focus-flaky. The protocol:
-
-1. Build the correct profile (`cargo build --release` for shipped
-   behavior — stale-binary confusion has burned whole debugging sessions;
-   verify the binary actually rebuilt).
-2. For diagnostic logs, launch the debug build with stdout redirected to a
-   log file. Exit gracefully using the header X or Alt+Q; no stdin commands exist.
-3. **Before** starting the observation pause, print explicit numbered
-   step-by-step instructions into the chat so the user knows exactly what
-   to do (drop a file, hover a column, scroll, right-click, etc.).
-4. Allow the requested observation period (45–60 seconds by default) while
-   the user performs the actions on their desktop. Split longer waits into
-   chunks of at most 60 seconds so progress and logs remain observable.
-5. Verify through the debug stdout log (`drop:`, `wheel eq[...]`,
-   `phase:` lines) and, when relevant, the persisted `state.cfg`.
-
-### Known Win32 / environment pitfalls (learned the hard way)
-
-- **Layered-window click-through**: alpha-0 pixels pass mouse input and OLE
-  drops to windows below. The 1/255 ground plane in `render.rs` fixes it.
-- **`UpdateLayeredWindow` with NULL/NULL** position/size silently does
-  nothing on some builds — always pass explicit `pptDst`/`psize`.
-- **windows 0.62**: the `implement` cargo feature does not exist (the macro
-  is `windows::core::implement`); `ReleaseStgMedium` needs
-  `Win32_System_Com_StructuredStorage` + `Win32_Graphics_Gdi` features;
-  `GET_X_LPARAM` & co. don't exist (local helpers).
-- **`OleInitialize` S_FALSE** still pairs with one `OleUninitialize`.
-- **Stale binary trap**: `cargo test` builds a test binary, not the app;
-  always rebuild the exact profile before an E2E session and check log
-  timestamps.
-- **PowerShell 5.1 quirks** (for ad-hoc diagnostics only, never E2E):
-  heredocs mangle `$`/backslashes, `[UIntPtr]` casts from `Int32` throw,
-  `ComTypes.STGMEDIUM` exposes `unionmember` (not `hGlobal`), ComTypes enum
-  members are underscore-named (`TYMED.TYMED_HGLOBAL`), `FindWindowW` may
-  fail where `EnumWindows` succeeds, and piped `tail` buffers output.
-- **windows-core binding**: keep the direct `windows-core = "0.62"` dependency
-  aligned with `windows` so `#[implement]` binds notification/OLE interfaces
-  correctly. CPAL 0.18 now uses the same Windows binding version.
-
----
-
-*Maintainer's note for migrating agents: read `broker.rs` top-to-bottom once
-before changing anything — it is the spec. The UI is an honest producer; the
-decoder is an honest worker; everything else is detail.*
+For changes to dragging, OLE drops or wheel routing, rebuild the application in
+the profile being tested and use real user interaction. Avoid synthetic desktop
+click/drag/wheel injection; offscreen native-window and pure geometry tests cover
+automated regressions without sending input to other applications. Check the
+application log and relevant saved settings after the interaction. The test
+executable built by `cargo test` does not rebuild the normal player executable.

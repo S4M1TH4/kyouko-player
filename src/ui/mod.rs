@@ -1,10 +1,10 @@
 //! Presentation layer.
 //!
-//! Step 2 shape — the Win32 pump:
+//! The Win32 pump:
 //!
 //! ```text
 //! create 80px layered window + global hotkeys
-//! loop { GetMessageW }                        // parks in the kernel, zero CPU
+//! loop { GetMessageW }                        // waits for messages
 //!   WM_APP_BROKER  → drain cmd_rx (try_recv)  → broker.handle_command → sync()
 //!   WM_APP_STATUS  → drain status_rx          → broker.handle_status  → sync()
 //!   WM_APP_OUTPUT  → default-device recovery on the owning/UI thread → sync()
@@ -13,10 +13,11 @@
 //!
 //! Producers push to a channel, then post one wake message (`wake_broker` /
 //! `wake_status`): channels carry the data, a single posted message carries
-//! the wake-up. When not playing the timer is killed, so the main thread
-//! parks in `GetMessageW` with zero scheduled wake-ups.
+//! the wake-up. Native input instead uses a thread-local inbox drained after
+//! message dispatch. When not playing, the panel timer is killed and the main
+//! thread waits for messages in `GetMessageW`.
 //!
-//! `sync()` is the only bridge between the platform and the pure core: it
+//! `sync()` applies platform effects after broker activity: it
 //! starts/stops the timer on phase transitions and repaints when the broker's
 //! panel is dirty. Everything else is message plumbing.
 
@@ -38,9 +39,9 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::audio::AudioOut;
 use crate::broker::{Broker, Command, Status};
 
-/// Write end of the command channel, parked in a static so UI interactions
-/// and the console control handler (both outside the normal producer path)
-/// can inject commands. `main` fills it before spawning any threads.
+/// Startup/background command sender. Native UI input uses its local inbox;
+/// console shutdown has a separate priority flag. Main installs this sender
+/// before starting the decoder or UI pump.
 pub static CMD_TX: OnceLock<Sender<Command>> = OnceLock::new();
 
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -241,7 +242,7 @@ pub fn run(
     status_rx: Receiver<Status>,
     audio_out: AudioOut,
 ) {
-    // Debug escape hatch: the step-1 headless pump, kept for CI-style runs.
+    // Debug escape hatch for runs without a visible window.
     if cfg!(debug_assertions) && std::env::var_os("KYOUKO_HEADLESS").is_some() {
         headless::run(broker, cmd_rx, status_rx, audio_out);
         return;
