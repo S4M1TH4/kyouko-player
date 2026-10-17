@@ -6,11 +6,51 @@ use std::process::{Command, Stdio};
 /// The Child itself remains in the decoder's interruptible shared slot.
 pub struct SourceChild {
     child: std::process::Child,
+    _download_directory: Option<DownloadDirectory>,
     #[cfg(windows)]
     group: std::os::windows::io::OwnedHandle,
 }
 
+/// Native HLS downloads write relative fragment files even with stdout output.
+/// Give each download a writable workspace, and remove leftovers after the
+/// source process tree has been stopped and reaped.
+struct DownloadDirectory(std::path::PathBuf);
+
+impl DownloadDirectory {
+    fn create() -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "kyouko-stream-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for DownloadDirectory {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            crate::log_warn!("AUDIO", "cannot remove download workspace: {error}");
+        }
+    }
+}
+
 impl SourceChild {
+    pub fn spawn_download(command: &mut Command) -> std::io::Result<Self> {
+        let directory = DownloadDirectory::create()?;
+        let mut child = Self::track(command.current_dir(&directory.0).spawn()?)?;
+        child._download_directory = Some(directory);
+        Ok(child)
+    }
+
     pub fn track(mut child: std::process::Child) -> std::io::Result<Self> {
         #[cfg(windows)]
         {
@@ -41,7 +81,11 @@ impl SourceChild {
                 })()
             };
             match group {
-                Ok(group) => Ok(Self { child, group }),
+                Ok(group) => Ok(Self {
+                    child,
+                    group,
+                    _download_directory: None,
+                }),
                 Err(error) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -52,7 +96,10 @@ impl SourceChild {
         #[cfg(not(windows))]
         {
             let _ = &mut child;
-            Ok(Self { child })
+            Ok(Self {
+                child,
+                _download_directory: None,
+            })
         }
     }
 
@@ -146,6 +193,17 @@ mod tests {
         let Ok(role) = std::env::var("KYOUKO_PROCESS_FIXTURE_ROLE") else {
             return;
         };
+        if role == "download" || role == "download-wait" {
+            std::fs::write("--Frag1.part", b"HLS fragment").unwrap();
+            println!("download-ready");
+            std::io::stdout().flush().unwrap();
+            if role == "download-wait" {
+                loop {
+                    std::thread::park();
+                }
+            }
+            return;
+        }
         let pid = match role.as_str() {
             "parent" => {
                 // The test sends this permit only after assigning us to its
@@ -175,6 +233,50 @@ mod tests {
         loop {
             std::thread::park();
         }
+    }
+
+    #[test]
+    fn download_workspaces_are_private_and_cleaned_after_exit_or_interrupt() {
+        use std::io::{BufRead, BufReader};
+        let parent_directory = std::env::current_dir().unwrap();
+        let mut directories = Vec::new();
+        for role in ["download", "download-wait"] {
+            let mut command = fixture_command(role);
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let mut child = SourceChild::spawn_download(&mut command).unwrap();
+            let directory = command.get_current_dir().unwrap().to_path_buf();
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            while !line.contains("download-ready") {
+                line.clear();
+                assert!(
+                    output.read_line(&mut line).unwrap() > 0,
+                    "fixture exited before readiness"
+                );
+            }
+            assert_ne!(directory, parent_directory);
+            assert!(!directories.contains(&directory));
+            assert_eq!(
+                std::fs::read(directory.join("--Frag1.part")).unwrap(),
+                b"HLS fragment"
+            );
+            if role == "download" {
+                assert!(child.wait().unwrap().success());
+                assert!(directory.exists(), "workspace lives as long as its owner");
+            }
+            // The parked fixture must be terminated before its directory is removed.
+            drop(child);
+            assert!(!directory.exists());
+            directories.push(directory);
+        }
+        assert_eq!(std::env::current_dir().unwrap(), parent_directory);
+    }
+
+    #[test]
+    fn failed_download_spawn_cleans_its_workspace() {
+        let mut command = Command::new("kyouko-nonexistent-download-fixture.exe");
+        assert!(SourceChild::spawn_download(&mut command).is_err());
+        assert!(!command.get_current_dir().unwrap().exists());
     }
 
     #[test]

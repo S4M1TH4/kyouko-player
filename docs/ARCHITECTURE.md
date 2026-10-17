@@ -60,9 +60,10 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
    queues, selection and persistence decisions. Every control surface — global hotkeys, window mouse
    handlers, OLE drag-and-drop — is a *producer* that dispatches a
    `Command` enum variant to the broker. Native UI input uses a thread-local
-   inbox drained after message dispatch; background/startup producers use
-   bounded channels and post a wake. Main initializes shared controls; the
-   decoder updates metadata, generations and seek position; the callback
+   inbox drained after message dispatch; background/startup producers and
+   forwarded shell-open requests use bounded channels and post a wake. Main
+   initializes shared controls; the decoder updates metadata, generations and
+   seek position; the callback
    advances rendered-frame counters. The UI owns windows, presentation state
    and the output stream, including the shared device rate/layout.
 
@@ -96,10 +97,14 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
 
 ### `src/main.rs` — entry point & orchestration
 
-1. Claims an OS-held `instance.lock` in the state directory before logging,
-   restoration, audio or UI setup. Duplicate launches exit without changing
-   the running player's state/log/window. The lock releases after normal exit
-   or forced termination; the file remains to preserve lock identity.
+1. Reads the optional startup file/URL, then claims an OS-held `instance.lock`
+   in the state directory before logging, restoration, audio or UI setup. A
+   duplicate Windows launch forwards its source to the running player through
+   `instance::forward` and exits; without a source it simply exits. The duplicate
+   opens no audio device, log, or window. The owner processes accepted opens
+   through the broker and saves the new selection normally. The lock releases
+   after normal exit or forced termination; the file remains to preserve lock
+   identity.
    `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`
    selects the GUI subsystem for release and the default console subsystem
    for debug. `logging::init()` runs in both; UTF-8 console output and the
@@ -131,6 +136,31 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
    fails, the application retains synchronous atomic saves.
 7. The header X, Alt+Q and Windows session shutdown drive graceful teardown.
    Debug-only `on_console_ctrl` also posts `Command::Quit` on Ctrl+C.
+
+### `src/instance.rs` — opening files in the running player
+
+The canonical state directory determines a stable, hashed window class name.
+A second process discovers the owner's overlay by this class, including when
+the overlay is hidden. Separate state directories have separate endpoints.
+
+The sender makes local paths absolute relative to its own working directory,
+then sends the file or URL as UTF-8 through `WM_COPYDATA`. The versioned payload
+is limited to 128 KiB; empty, malformed UTF-8, embedded-NUL and oversized
+messages are rejected. The receiver copies the OS-owned bytes before returning.
+
+The window handler uses `CMD_TX.try_send(Command::Load { source, paused: false })`
+and posts the broker wake. Acknowledgement means the command was queued, not
+that decoding has finished. The bounded FIFO keeps startup/restoration ahead of
+later shell-open requests, so restoration cannot overwrite the new selection.
+The handler does not dispatch the broker recursively or perform source I/O.
+
+Discovery, explicit queue rejection and message acknowledgement share a
+three-second deadline. The duplicate retries missing-window or rejected-queue
+cases at 25 ms intervals, covering the gap between lock acquisition and window
+creation. A send timeout has an ambiguous delivery result and is not retried.
+This work belongs only to the short-lived duplicate process; it adds no idle
+polling or permanent IPC worker to the player. Forwarding failures are reported
+on stderr without opening a second player.
 
 ### `src/broker.rs` — the central state engine
 
@@ -409,7 +439,9 @@ global hotkeys remain active; Alt+Q or the header X quits gracefully.
   bypasses both title resolution and yt-dlp. The cache is cleared before a
   different track, retry after failure, Stop, Shutdown, or repeat-off EOF.
   The broker explicitly sends Stop at final EOF to cover a repeat-toggle
-  race. There is no cache on disk and no cache of whole decoded PCM tracks.
+  race. The compressed replay cache stays in RAM; whole decoded PCM tracks are
+  not cached. yt-dlp may stage HLS fragments on disk in its private temporary
+  working directory, separate from the replay cache.
   Device loss uses a separate `SuspendedTrack` owner for the active reader,
   bytes, title, child guard and downloader. Recovery opens a fresh RAM reader
   and transfers those owners after successful probing. Partial downloads
@@ -868,13 +900,28 @@ independent of resource compilation.
 
 Debug builds retain console diagnostic logs and Ctrl+C;
 release builds run as Win32 overlay applications. Startup file/URL
-arguments remain supported for launcher/file-association use.
+arguments support launcher and file-association use. When the player is already
+running, the duplicate process forwards its source to that player.
 
 `src/process.rs` creates source-tool commands with null stdin in both profiles.
 On Windows release it adds `CREATE_NO_WINDOW` (0x08000000), preventing yt-dlp
 title resolution, audio download, and playlist metadata children from opening
 console windows. Existing stdout/stderr pipes and `ChildGuard` lifecycle
 remain intact. Debug children retain normal console inheritance.
+
+Audio downloads use `SourceChild::spawn_download`, which creates a unique
+`kyouko-stream-{pid}-{counter}` directory under `std::env::temp_dir()` and sets
+only the child's working directory. The player's own working directory stays
+unchanged. Native yt-dlp HLS downloads create relative fragment files such as
+`--Frag1.part` even with `-o -`. The private workspace keeps these writes outside
+the installation directory, which may be read-only.
+
+The download directory belongs to `SourceChild`. Spawn/tracking failures release
+it, and normal source teardown kills/reaps the process tree before removing
+leftover files. Stop, replacement and shutdown retain the existing interruptible
+child-slot ownership. A forced application termination may leave a directory
+behind; cleanup errors are logged. Title and playlist metadata commands do not
+need a download workspace.
 
 ### `src/config.rs` — persistence
 
@@ -980,6 +1027,22 @@ telemetry and device/decoder state have the writer roles described above.
              ▼ status_tx bounded(16): tagged Opened/Seeked/Finished
              ▼ WM_APP_STATUS → broker.handle_status → phase machine
 ```
+
+### Example: Explorer opens a second local file
+
+```text
+Explorer launches kyouko-player.exe "C:\Music\another song.mp3"
+  → instance.lock already held → instance::forward
+  → discover owner window → WM_COPYDATA → copy and validate source
+  → CMD_TX.try_send(Load { source, paused: false }) → acknowledgement
+  → duplicate exits; owner receives WM_APP_BROKER
+  → startup/restore command, if any, precedes the forwarded Load
+  → broker replaces selection → decoder opens file → Playing
+```
+
+The same path starts playback when the previous selection is paused and
+replaces an actively playing track. OLE drag-and-drop retains its native-inbox
+route. A launch without a source does not send an open request.
 
 ### Example: OLE drop of a Bilibili link
 
@@ -1098,7 +1161,8 @@ Rust and uses isolated temporary directories for filesystem/process checks.
 | PCM | Queue wrap/contention, pool ownership, priming/drain, cancellation, paused seeks, integer conversion, output replacement and callback allocation/deallocation counters |
 | Decoder/DSP | Decoded rate/layout, MP4 sample-entry mismatch, resampling duration/pitch, EQ stability and bit-for-bit comparison with the original EQ loop |
 | Stream cache | Progressive reads, downloaded-only seeks, cancellation, bounded allocation, replay equivalence and release on Stop/source replacement |
-| Process/state | Job cleanup, deadlines, lock exclusion/release, atomic staging, save coalescing and final-save/panic barriers |
+| Process/state | Job cleanup, private download directories, fragment cleanup after exit/interruption/spawn failure, deadlines, lock exclusion/release, atomic staging, save coalescing and final-save/panic barriers |
+| Instance forwarding | Cross-process repeated opens, startup readiness/rejection retries, Unicode and relative paths, payload validation/copying and canonical state-directory scoping |
 | UI/resources | Input geometry and command mapping, drawer lifetime/click state, offscreen GDI pixels, hotkey registration and embedded icon resources |
 
 Windows CI runs the default checks above, native release-icon loading, release
@@ -1120,3 +1184,12 @@ click/drag/wheel injection; offscreen native-window and pure geometry tests cove
 automated regressions without sending input to other applications. Check the
 application log and relevant saved settings after the interaction. The test
 executable built by `cargo test` does not rebuild the normal player executable.
+
+For file-association changes, ensure Explorer points to the rebuilt executable
+and close older running builds before testing. Open a second file while the
+first is loaded and paused, then open a third while playing. The new selection
+must play in the existing process. Include spaces and Unicode in filenames;
+check `player.log` for `open request from another launch:` followed by the new
+source opening. Repeated launches without an argument must leave selection
+unchanged. Full steps and streaming regression commands are in the
+[README verification section](../README.md#verification).

@@ -51,7 +51,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow,
     SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     SystemParametersInfoW, TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_CANCELMODE,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_ENDSESSION,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_CONTEXTMENU, WM_COPYDATA, WM_CREATE, WM_DESTROY, WM_ENDSESSION,
     WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
     WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
     WM_NCRBUTTONDOWN, WM_NCRBUTTONUP, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
@@ -417,10 +417,18 @@ pub fn run(
         }
     };
 
+    let window_class = match crate::instance::window_class(&crate::config::path()) {
+        Ok(class) => class,
+        Err(error) => {
+            log_error!("UI", "cannot identify instance window: {error}");
+            super::headless::run(broker, cmd_rx, status_rx, audio_out);
+            return;
+        }
+    };
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wndproc),
         hInstance: hinstance,
-        lpszClassName: w!("kyouko_echo"),
+        lpszClassName: PCWSTR(window_class.as_ptr()),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
         ..Default::default()
     };
@@ -470,7 +478,7 @@ pub fn run(
     let hwnd = match unsafe {
         CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            w!("kyouko_echo"),
+            PCWSTR(window_class.as_ptr()),
             w!("kyouko"),
             WS_POPUP,
             pos_x,
@@ -1343,6 +1351,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_CREATE => {
                 s.hotkeys.register(hwnd);
                 LRESULT(0)
+            }
+            WM_COPYDATA => {
+                if let Some(source) = crate::instance::receive(lp) {
+                    // Keep startup/restore ahead of shell requests, even if
+                    // a sent message arrives while the window is being created.
+                    if super::CMD_TX.get().is_some_and(|tx| {
+                        tx.try_send(Command::Load {
+                            source: source.clone(),
+                            paused: false,
+                        })
+                        .is_ok()
+                    }) {
+                        log_info!("UI", "open request from another launch: {source}");
+                        super::wake_broker();
+                        LRESULT(1)
+                    } else {
+                        LRESULT(0)
+                    }
+                } else {
+                    LRESULT(0)
+                }
             }
             WM_HOTKEY => {
                 if let Some(command) = hotkey_command(wp.0) {

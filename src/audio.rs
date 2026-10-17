@@ -1671,16 +1671,14 @@ fn open_track_inner(
                 "spawning yt-dlp -f {format} (playlist entry {:?})",
                 playlist_index
             );
-            let mut child = Child::track(
+            let mut child = Child::spawn_download(
                 crate::process::command("yt-dlp")
                     .args(yt_dlp_args(format, *playlist_index, url))
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|e| format!("yt-dlp spawn failed ({e}) — is yt-dlp in PATH?"))?,
+                    .stderr(Stdio::piped()),
             )
-            .map_err(|e| format!("source process tracking: {e}"))?;
+            .map_err(|e| format!("yt-dlp download launch failed ({e}) — is yt-dlp in PATH?"))?;
             let pid = child.id();
             let stdout = child.stdout.take().expect("yt-dlp stdout piped");
             let stderr = child.stderr.take().expect("yt-dlp stderr piped");

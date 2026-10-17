@@ -83,6 +83,8 @@ logging. The application has no terminal command reader or system tray icon.
   Bilibili, and Niconico streams through `yt-dlp`.
   Niconico selects the best available AAC audio rendition, accommodating
   videos that offer 192 kbps rather than 128 kbps.
+- File-association and command-line opens switch tracks in the running player,
+  including when the current selection is paused or playing.
 - Local folder queues sorted newest first. The last folder and selected track
   are restored at startup, staged paused until playback is requested.
 - One automatic retry per failed track, then playlist advancement when a next
@@ -135,6 +137,19 @@ onto the overlay. An optional startup argument opens a file or URL immediately:
 .\target\release\kyouko-player.exe "https://www.youtube.com/watch?v=DdUoGjniJ7s"
 ```
 
+To open local files by double-clicking in Windows Explorer, use **Open with →
+Choose another app**, browse to the player executable, and make it the default
+for the desired file type. Repeat for other extensions you want to associate.
+When the player is already running, opening another file replaces its selection
+and starts playback in that same player. File names may contain spaces or
+Unicode characters. Opening another URL through the command line works the
+same way; launching without an argument leaves the running player unchanged.
+
+Point file associations to the executable you intend to use. Quit the player
+before replacing that executable, then start it again. Building
+`target/release/kyouko-player.exe` creates the release binary; installation and
+Windows file-association setup are separate steps.
+
 Scroll over an equalizer column to adjust that band by 1 dB. Left-click the track
 information line to open the tracklist, then select an entry to start it.
 Right-click the overlay outside X to pause/resume. Drag the text area to move the
@@ -147,9 +162,12 @@ PCM and ADPCM within those containers.
 
 Settings are stored in `%LOCALAPPDATA%\kyouko-player\state.cfg`, falling back to
 `state.cfg` in the working directory when `LOCALAPPDATA` is unavailable.
-Only one player can own a state directory. A second launch exits before
-opening audio, logging, or windows. The OS releases the `instance.lock` file
-lock after exit or a crash; the empty lock file is deliberately retained.
+Only one player can own a state directory. On Windows, a second launch with a
+file or URL forwards it to the running player and starts it immediately, including
+when launched through a file association. A launch without an argument simply
+exits. The second process opens no audio device, log, or window. The OS releases
+the `instance.lock` file lock after exit or a crash; the empty lock file is
+deliberately retained.
 
 State changes enter a single pending snapshot slot. A parked worker coalesces
 updates, writes a unique temporary file, flushes it, and atomically replaces
@@ -175,6 +193,12 @@ For streaming:
   Deno is enabled by default; make `deno --version` work on `PATH`. The official
   Windows `yt-dlp.exe` already bundles Python and the EJS scripts, so those need
   no separate installation. Other yt-dlp distributions may require EJS setup.
+- Native HLS downloads may stage fragments on disk even when streaming to stdout.
+  Each audio download uses a private directory under the system temp folder,
+  cleaned up when its source process is released, including on failure or
+  cancellation. This allows Niconico playback when the player starts in a
+  directory such as Program Files that cannot accept fragment writes. A forced
+  application termination can leave temporary files behind.
 - FFmpeg/ffprobe are recommended for yt-dlp operations that need them, such as
   merging or post-processing. The player does not invoke them for local decoding.
 
@@ -340,6 +364,22 @@ The default tests run without network access or an audio device. Diagnostics
 that require saved local media, WASAPI output, or live streaming are opt-in
 ignored tests.
 
+Offline coverage includes cross-process file-open forwarding, startup readiness,
+Unicode and relative paths, payload validation, and temporary-download cleanup.
+To run the forwarding regressions alone:
+
+```text
+cargo test --locked instance::tests
+```
+
+For a manual file-association check, start the rebuilt player with a local file
+loaded and paused. Open a different file from Explorer, then open another while
+it is playing. Each open should replace the track and start playback, with only
+one player process remaining. Include a filename with spaces and Unicode text.
+The running player's release log records each forwarded open as
+`open request from another launch:`. Both launches must use the updated executable
+and the same state directory.
+
 To test a specific YouTube video or playlist in PowerShell:
 
 ```powershell
@@ -376,7 +416,10 @@ and verifies matching PCM, no repeat source process, and cache deallocation.
 It consumes PCM without real-time output; the WASAPI diagnostic separately
 checks playback timing and recovery on the actual audio device.
 `KYOUKO_TEST_FORMAT` optionally forces an exact yt-dlp format for this
-seek/repeat diagnostic; it does not change application settings.
+seek/repeat diagnostic; it does not change application settings. For a
+Niconico playback check, set `KYOUKO_TEST_URL` to
+`https://www.nicovideo.jp/watch/sm18355305` and run the same seek/repeat
+diagnostic and the WASAPI recovery diagnostic above.
 
 ## Source map
 
@@ -393,7 +436,8 @@ seek/repeat diagnostic; it does not change application settings.
 | `src/audio_device.rs` | Windows audio endpoint notifications |
 | `src/stream_buffer.rs` | Bounded compressed stream cache and seeking |
 | `src/config.rs` | State configuration and atomic saves |
-| `src/process.rs` | External process launch policy |
+| `src/instance.rs` | Windows forwarding of file/URL opens to the running player |
+| `src/process.rs` | Source process trees and temporary download workspaces |
 | `src/deadline.rs` | Owned, cancellable source deadlines |
 | `src/playlist.rs` | Owned Windows playlist metadata jobs and deadlines |
 | `src/logging.rs` | Diagnostic logging |

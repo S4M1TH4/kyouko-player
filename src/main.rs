@@ -51,6 +51,8 @@ mod broker;
 mod config;
 mod deadline;
 mod decoder_wake;
+#[cfg(windows)]
+mod instance;
 mod logging;
 mod pcm_queue;
 #[cfg(windows)]
@@ -74,11 +76,19 @@ use crate::ui::CMD_TX;
 fn main() {
     #[cfg(all(windows, feature = "release-diagnostics"))]
     let diagnostic = ui::performance::start();
+    let launch_source = std::env::args().nth(1).map(|arg| Source::from_raw(&arg));
     // Claim the state directory before logging, restoration or device setup.
     // A duplicate launch must not touch another instance's settings/logs/hotkeys.
     let _instance = match config::InstanceGuard::acquire(&config::path()) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
+            #[cfg(windows)]
+            if let Some(source) = launch_source {
+                if let Err(error) = instance::forward(&config::path(), &source) {
+                    eprintln!("cannot open in running player: {error}");
+                }
+                return;
+            }
             eprintln!("kyouko-player is already running");
             return;
         }
@@ -156,8 +166,7 @@ fn main() {
 
     // An explicit startup file/URL takes precedence. Otherwise the broker rebuilds
     // the saved folder queue and stages its last track with output paused.
-    if let Some(arg) = std::env::args().nth(1) {
-        let source = Source::from_raw(&arg);
+    if let Some(source) = launch_source {
         log_info!("MAIN", "launch track: {source} (autoplay)");
         let _ = cmd_tx.send(Command::Load {
             source,

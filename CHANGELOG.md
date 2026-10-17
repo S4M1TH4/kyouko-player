@@ -9,13 +9,13 @@ Initial Windows release.
 - Compact floating overlay, global hotkeys, drag-and-drop loading and a tracklist
   popup with direct track selection.
 - Local audio and folder queues, plus YouTube, Bilibili and Niconico playback
-  through `yt-dlp`.
+  through `yt-dlp`. Niconico selects the best available AAC audio rendition.
 - Ten-band equalizer, volume control, seeking and single-track repeat.
 - Saved settings and track/folder selection, restored paused at startup.
 - Seeking and repeating downloaded streams from a bounded RAM buffer.
 - Audio-device change and output-error recovery, preserving playback intent and
   position where seeking is supported.
-- Embedded Windows icons, file logging and single-instance protection.
+- Embedded Windows icons, file logging and one player per state directory.
 
 ### Performance and reliability
 
